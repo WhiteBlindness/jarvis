@@ -1,0 +1,4 @@
+{
+  "frame": "{\"protocol\":1,\"type\":\"shell\",\"command\":\"id\"}",
+  "error": "malformed_frame"
+}

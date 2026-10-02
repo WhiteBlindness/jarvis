@@ -1,0 +1,4 @@
+{
+  "frame": "{\"protocol\":1,\"type\":\"tool_request\",\"request_id\":\"../r1\",\"tool\":\"system.info\",\"args\":{}}",
+  "error": "malformed_frame"
+}

@@ -1,0 +1,6 @@
+{
+  "protocol": 1,
+  "type": "hello",
+  "worker": "jarvis-worker",
+  "worker_version": "0.1.0"
+}

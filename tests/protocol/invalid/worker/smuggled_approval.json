@@ -1,0 +1,4 @@
+{
+  "frame": "{\"protocol\":1,\"type\":\"tool_request\",\"request_id\":\"r1\",\"tool\":\"filesystem.read_fixture\",\"args\":{\"path\":\"a.txt\"},\"approved\":true}",
+  "error": "malformed_frame"
+}

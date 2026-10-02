@@ -1,0 +1,4 @@
+{
+  "frame": "{\"protocol\":2,\"type\":\"welcome\"}",
+  "error": "unsupported_protocol_version"
+}
