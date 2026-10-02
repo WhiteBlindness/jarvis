@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -103,6 +104,7 @@ fn init_logging(format: LogFormat) {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr);
     match format {
         LogFormat::Text => builder.init(),
@@ -180,10 +182,10 @@ fn print_tasks(config_path: &std::path::Path, limit: u32, json: bool) -> anyhow:
             let decision = task.decision.map_or("-", |d| d.as_str());
             let error = task
                 .error
-                .map(|e| format!("  {}: {}", e.code, e.message))
+                .map(|e| format!("{}: {}", e.code, e.message))
                 .unwrap_or_default();
-            println!(
-                "{}  {}  {:<22} {:<24} {:<20}{}",
+            let line = format!(
+                "{}  {}  {:<21} {:<23} {:<20} {}",
                 task.created_at,
                 task.task_id,
                 task.status.as_str(),
@@ -191,6 +193,7 @@ fn print_tasks(config_path: &std::path::Path, limit: u32, json: bool) -> anyhow:
                 decision,
                 error
             );
+            println!("{}", line.trim_end());
         }
     }
     Ok(())
@@ -213,10 +216,9 @@ fn print_audit(
             }
             let task = event
                 .task_id
-                .map(|id| format!(" task={id}"))
-                .unwrap_or_default();
+                .map_or_else(|| "-".to_owned(), |id| id.to_string());
             println!(
-                "{:>6}  {}  {:<18}{}  {}",
+                "{:>5}  {}  {:<20} {:<36}  {}",
                 event.seq,
                 event.at,
                 event.event.name(),
