@@ -1,0 +1,30 @@
+# JARVIS Core configuration. Relative paths are resolved against the
+# directory that contains this file.
+
+database = "../var/jarvis.db"
+
+[worker]
+# Started directly, never through a shell, with an empty environment apart
+# from PATH and SYSTEMROOT. On Windows the interpreter is usually "python".
+program = "python3"
+args = ["-m", "jarvis_worker", "--goal", "describe the runtime, then read welcome.txt"]
+cwd = "../services/intelligence-python/src"
+handshake_timeout_ms = 5000
+
+[fixtures]
+# The only directory filesystem.read_fixture can read from.
+root = "../tests/fixtures/files"
+max_bytes = 16384
+
+[limits]
+max_frame_bytes = 65536
+tool_timeout_ms = 5000
+max_requests_per_session = 1000
+max_protocol_errors = 16
+shutdown_grace_ms = 2000
+
+# Capabilities not listed here are denied.
+# Decisions: "allow", "require_confirmation", "deny".
+[policy]
+"system.info" = "allow"
+"filesystem.read.fixture" = "allow"
