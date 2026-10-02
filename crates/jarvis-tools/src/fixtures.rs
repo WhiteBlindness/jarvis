@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -70,13 +70,23 @@ fn read_blocking(
         ));
     }
 
-    let file = File::open(&resolved).map_err(|error| io_error(path, &error))?;
-    let metadata = file.metadata().map_err(|error| io_error(path, &error))?;
-    if !metadata.is_file() {
-        return Err(ToolError::new(
+    let not_a_file = || {
+        ToolError::new(
             ToolErrorKind::AccessDenied,
             format!("fixture `{path}` is not a regular file"),
-        ));
+        )
+    };
+    // Check before opening: Windows refuses to open a directory as a file,
+    // which would otherwise surface as an I/O error.
+    let target = fs::metadata(&resolved).map_err(|error| io_error(path, &error))?;
+    if !target.is_file() {
+        return Err(not_a_file());
+    }
+    let file = File::open(&resolved).map_err(|error| io_error(path, &error))?;
+    // Check the opened handle as well, in case the path changed in between.
+    let metadata = file.metadata().map_err(|error| io_error(path, &error))?;
+    if !metadata.is_file() {
+        return Err(not_a_file());
     }
     let too_large = || {
         ToolError::new(
