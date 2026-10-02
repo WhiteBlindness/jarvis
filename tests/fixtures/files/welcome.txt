@@ -1,0 +1,2 @@
+Hello from the JARVIS fixture directory.
+This file is the only kind of thing filesystem.read_fixture can read.
