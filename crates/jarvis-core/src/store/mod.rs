@@ -159,12 +159,16 @@ impl Store {
         // process crashes. Worth an fsync per commit for an audit log.
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        migrate(&mut conn)?;
+        // Without this, `INSERT OR REPLACE` deletes the old row without firing
+        // the DELETE triggers that keep the audit log append-only.
+        conn.pragma_update(None, "recursive_triggers", "ON")?;
+        migrate(&mut conn, path)?;
         Ok(Self::wrap(conn, Some(lock)))
     }
 
     /// Open an existing database for inspection, without taking the lock or
-    /// changing anything. Safe to use while a Core is running.
+    /// writing to it. Safe to use while a Core is running. (SQLite may still
+    /// create its `-wal` and `-shm` side files.)
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
         if !path.is_file() {
             return Err(StoreError::NotInitialised(path.to_path_buf()));
@@ -208,7 +212,8 @@ impl Store {
             .map_err(|_| StoreError::Join)?
     }
 
-    pub fn schema_version(&self) -> Result<i64, StoreError> {
+    #[cfg(test)]
+    fn schema_version(&self) -> Result<i64, StoreError> {
         current_version(&*self.conn()?)
     }
 
@@ -390,7 +395,8 @@ impl Store {
         rows.map(|row| TaskRecord::try_from(row?)).collect()
     }
 
-    /// Audit events in sequence order, optionally for one task.
+    /// The most recent `limit` audit events, in sequence order, optionally
+    /// for one task.
     pub fn audit_events(
         &self,
         task_id: Option<TaskId>,
@@ -398,9 +404,11 @@ impl Store {
     ) -> Result<Vec<AuditEvent>, StoreError> {
         let conn = self.conn()?;
         let mut statement = conn.prepare(
-            "SELECT seq, at, session_id, task_id, kind, detail FROM audit_events
-             WHERE ?1 IS NULL OR task_id = ?1
-             ORDER BY seq LIMIT ?2",
+            "SELECT * FROM (
+                 SELECT seq, at, session_id, task_id, kind, detail FROM audit_events
+                 WHERE ?1 IS NULL OR task_id = ?1
+                 ORDER BY seq DESC LIMIT ?2
+             ) ORDER BY seq",
         )?;
         let rows =
             statement.query_map(params![task_id.map(|id| id.to_string()), limit], |row| {
@@ -486,8 +494,20 @@ fn check_supported(found: i64) -> Result<(), StoreError> {
 }
 
 /// Apply pending migrations, each in its own transaction together with its
-/// `schema_migrations` row. Refuses a database from a newer Core.
-fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+/// `schema_migrations` row. Refuses a database from a newer Core, and a
+/// SQLite file that already holds someone else's tables.
+fn migrate(conn: &mut Connection, path: &Path) -> Result<(), StoreError> {
+    let foreign: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table'
+             AND name NOT LIKE 'sqlite_%' AND name <> 'schema_migrations')
+         AND NOT EXISTS (SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if foreign {
+        return Err(StoreError::NotInitialised(path.to_path_buf()));
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
              version    INTEGER PRIMARY KEY NOT NULL,

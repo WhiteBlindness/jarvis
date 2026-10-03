@@ -155,6 +155,16 @@ fn terminal_tasks_cannot_be_changed_even_by_direct_sql() {
     assert!(error.to_string().contains("terminal tasks are immutable"));
     let error = conn.execute("DELETE FROM tasks", []).unwrap_err();
     assert!(error.to_string().contains("never deleted"));
+    // REPLACE deletes the old row first; recursive triggers make that visible.
+    let error = conn
+        .execute(
+            "INSERT OR REPLACE INTO tasks
+             (task_id, session_id, request_id, tool, args, status, created_at, updated_at)
+             VALUES (?1, ?2, 'r1', 'shell.exec', '{}', 'received', 'now', 'now')",
+            params![task.task_id.to_string(), task.session_id.to_string()],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("never deleted"), "{error}");
 }
 
 #[test]
@@ -174,6 +184,9 @@ fn audit_log_is_append_only() {
     for sql in [
         "UPDATE audit_events SET kind = 'forged'",
         "DELETE FROM audit_events",
+        "INSERT OR REPLACE INTO audit_events (seq, at, kind, detail)
+         VALUES (1, 'now', 'forged', '{}')",
+        "REPLACE INTO audit_events (seq, at, kind, detail) VALUES (1, 'now', 'forged', '{}')",
     ] {
         let error = conn.execute(sql, []).unwrap_err();
         assert!(error.to_string().contains("append-only"), "{sql}: {error}");
@@ -321,6 +334,42 @@ fn newer_schema_is_refused() {
         Store::open_read_only(&path),
         Err(StoreError::SchemaTooNew { .. })
     ));
+}
+
+#[test]
+fn writable_open_refuses_a_foreign_sqlite_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let foreign = dir.path().join("foreign.db");
+    Connection::open(&foreign)
+        .unwrap()
+        .execute_batch("CREATE TABLE t (x INTEGER);")
+        .unwrap();
+    assert!(matches!(
+        Store::open(&foreign),
+        Err(StoreError::NotInitialised(_))
+    ));
+}
+
+#[test]
+fn audit_limit_keeps_the_most_recent_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    for n in 0..5 {
+        let event = AuditEventKind::CoreStopped {
+            reason: n.to_string(),
+        };
+        store.append(None, None, &event).unwrap();
+    }
+    let reasons: Vec<_> = store
+        .audit_events(None, 2)
+        .unwrap()
+        .into_iter()
+        .map(|event| match event.event {
+            AuditEventKind::CoreStopped { reason } => reason,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(reasons, ["3", "4"]);
 }
 
 #[test]
