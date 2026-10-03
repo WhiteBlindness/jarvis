@@ -4,4 +4,4 @@ The worker is a separate process. It speaks the line-delimited JSON protocol des
 ``docs/protocol.md`` over its own stdin and stdout and asks the Core to perform every action.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

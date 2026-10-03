@@ -154,3 +154,49 @@ def test_plans_do_not_share_state_between_calls_or_planners() -> None:
     first = planner.plan("system")
     first[0].args["mutated"] = True
     assert planner.plan("system") == [SYSTEM_INFO]
+
+
+def write(path: str, content: str) -> PlannedCall:
+    return PlannedCall("workspace.write_file", {"path": path, "content": content})
+
+
+def test_write_takes_the_rest_of_the_goal_as_content() -> None:
+    assert plan("write notes/todo.txt: buy milk, then read a.txt") == [
+        write("notes/todo.txt", "buy milk, then read a.txt")
+    ]
+
+
+def test_write_comes_after_earlier_calls() -> None:
+    assert plan("check the system, read a.txt, write out.txt: done") == [
+        SYSTEM_INFO,
+        read("a.txt"),
+        write("out.txt", "done"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("goal", "content"),
+    [
+        ("write a.txt:x", "x"),
+        ("write a.txt: x", "x"),
+        ("write a.txt:  x", " x"),
+        ("write a.txt:", ""),
+    ],
+)
+def test_one_optional_space_after_the_colon_is_dropped(goal: str, content: str) -> None:
+    assert plan(goal) == [write("a.txt", content)]
+
+
+def test_topic_words_inside_the_content_are_not_calls() -> None:
+    assert plan("WRITE status.txt: the system is fine") == [
+        write("status.txt", "the system is fine")
+    ]
+
+
+@pytest.mark.parametrize("goal", ["write a letter", "write", "rewrite a.txt: x", "write : x"])
+def test_write_needs_a_path_and_a_colon(goal: str) -> None:
+    assert [call for call in plan(goal) if call.tool == "workspace.write_file"] == []
+
+
+def test_a_dangerous_write_path_is_passed_through_for_the_core_to_judge() -> None:
+    assert plan("write ../../etc/passwd: x") == [write("../../etc/passwd", "x")]

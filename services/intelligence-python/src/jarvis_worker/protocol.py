@@ -1,9 +1,9 @@
-"""Worker side of the wire protocol, version 1.
+"""Worker side of the wire protocol, version 2.
 
 The reference implementation is the Rust crate ``jarvis-protocol``; the rules here mirror it and
 are checked against the shared fixtures in ``tests/protocol``. A worker encodes the messages a
-worker may send (``hello``, ``tool_request``) and strictly decodes the messages the Core may send
-(``welcome``, ``tool_response``, ``error``).
+worker may send (``hello``, ``tool_request``, ``job_result``) and strictly decodes the messages
+the Core may send (``welcome``, ``job``, ``tool_response``, ``error``).
 
 Decoding follows a fixed order: UTF-8, JSON, object, protocol version, schema. The version is
 checked before the schema because a frame from another version may have a different shape. Any
@@ -14,6 +14,7 @@ malformed; a frame is never partly accepted.
 import json
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import NoReturn, TypeAlias, assert_never
@@ -22,16 +23,21 @@ __all__ = [
     "PROTOCOL_VERSION",
     "TOOL_READ_FIXTURE",
     "TOOL_SYSTEM_INFO",
+    "TOOL_WRITE_FILE",
     "Capability",
     "Completed",
-    "ConfirmationRequired",
     "CoreMessage",
+    "Declined",
     "Denied",
     "ErrorCode",
     "ErrorMessage",
+    "Expired",
     "Failed",
     "FixtureContent",
     "Hello",
+    "Job",
+    "JobOutcome",
+    "JobResult",
     "JsonValue",
     "ProtocolError",
     "Rejected",
@@ -44,19 +50,23 @@ __all__ = [
     "Welcome",
     "WireError",
     "WorkerMessage",
+    "WriteOutcome",
     "decode_core_message",
     "encode_worker_message",
-    "validate_fixture_path",
+    "validate_goal",
     "validate_label",
+    "validate_relative_path",
     "validate_request_id",
+    "validate_summary",
     "validate_tool_name",
     "validate_uuid",
 ]
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 TOOL_SYSTEM_INFO = "system.info"
 TOOL_READ_FIXTURE = "filesystem.read_fixture"
+TOOL_WRITE_FILE = "workspace.write_file"
 
 JsonValue: TypeAlias = "bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None"
 
@@ -85,6 +95,14 @@ class Capability(StrEnum):
 
     SYSTEM_INFO = "system.info"
     FILESYSTEM_READ_FIXTURE = "filesystem.read.fixture"
+    WORKSPACE_WRITE = "workspace.write"
+
+
+class JobOutcome(StrEnum):
+    """How the worker ended a job."""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class ProtocolError(Exception):
@@ -119,11 +137,15 @@ _REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _LABEL = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 _TOOL_NAME = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+")
 _UUID = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
-_FIXTURE_COMPONENT = re.compile(r"[A-Za-z0-9._-]+")
+_PATH_COMPONENT = re.compile(r"[A-Za-z0-9._-]+")
 
 _TOOL_NAME_MAX_LEN = 64
-_FIXTURE_PATH_MAX_LEN = 255
-_FIXTURE_PATH_MAX_COMPONENTS = 16
+_PATH_MAX_LEN = 255
+_PATH_MAX_COMPONENTS = 16
+_GOAL_MIN_CHARS = 1
+_GOAL_MAX_CHARS = 2000
+_SUMMARY_MIN_CHARS = 0
+_SUMMARY_MAX_CHARS = 1000
 _WINDOWS_DEVICE_NAMES = frozenset(
     {"con", "prn", "aux", "nul"} | {f"com{n}" for n in range(10)} | {f"lpt{n}" for n in range(10)}
 )
@@ -165,35 +187,36 @@ def validate_uuid(value: str, name: str) -> str:
     return value
 
 
-def validate_fixture_path(value: str) -> str:
-    """Return ``value`` if it is a syntactically valid fixture path.
+def validate_relative_path(value: str) -> str:
+    """Return ``value`` if it is a syntactically valid path relative to a tool's root directory.
 
     A path is at most 255 characters and 16 components separated by ``/``. A component is made
     of ASCII letters, digits, ``.``, ``_`` and ``-``, starts with a letter or digit, does not end
-    with ``.`` and is not a Windows device name.
+    with ``.`` and is not a Windows device name. The same rules apply to the fixture directory
+    and to the workspace.
     """
-    problem = _fixture_path_problem(value)
+    problem = _path_problem(value)
     if problem is not None:
-        raise _malformed(f"invalid fixture path {_show(value)}: {problem}")
+        raise _malformed(f"invalid path {_show(value)}: {problem}")
     return value
 
 
-def _fixture_path_problem(value: str) -> str | None:
+def _path_problem(value: str) -> str | None:
     if not value:
         return "path must not be empty"
-    if len(value) > _FIXTURE_PATH_MAX_LEN:
-        return f"path must be at most {_FIXTURE_PATH_MAX_LEN} characters"
+    if len(value) > _PATH_MAX_LEN:
+        return f"path must be at most {_PATH_MAX_LEN} characters"
     components = value.split("/")
-    if len(components) > _FIXTURE_PATH_MAX_COMPONENTS:
-        return f"path must have at most {_FIXTURE_PATH_MAX_COMPONENTS} components"
+    if len(components) > _PATH_MAX_COMPONENTS:
+        return f"path must have at most {_PATH_MAX_COMPONENTS} components"
     for component in components:
-        problem = _fixture_component_problem(component)
+        problem = _path_component_problem(component)
         if problem is not None:
             return problem
     return None
 
 
-def _fixture_component_problem(component: str) -> str | None:
+def _path_component_problem(component: str) -> str | None:
     if not component:
         return "path must be relative and must not contain empty components"
     first = component[0]
@@ -201,11 +224,38 @@ def _fixture_component_problem(component: str) -> str | None:
         return f"component {_show(component)} must start with a letter or digit"
     if component.endswith("."):
         return f"component {_show(component)} must not end with '.'"
-    if _FIXTURE_COMPONENT.fullmatch(component) is None:
+    if _PATH_COMPONENT.fullmatch(component) is None:
         return f"component {_show(component)} may contain only letters, digits, '.', '_' and '-'"
     if component.split(".", 1)[0].lower() in _WINDOWS_DEVICE_NAMES:
         return f"component {_show(component)} is a reserved device name"
     return None
+
+
+def _bounded_text(value: str, what: str, min_chars: int, max_chars: int) -> str:
+    """Return ``value`` if it has ``min_chars`` to ``max_chars`` characters and no control ones.
+
+    Length counts characters, not bytes. A control character is one in Unicode category ``Cc``
+    (U+0000 to U+001F and U+007F to U+009F), which is what Rust's ``char::is_control`` means.
+    """
+    if not min_chars <= len(value) <= max_chars:
+        raise _malformed(f"invalid {what}: must be {min_chars} to {max_chars} characters")
+    if any(unicodedata.category(char) == "Cc" for char in value):
+        raise _malformed(f"invalid {what}: must not contain control characters")
+    return value
+
+
+def validate_goal(value: str) -> str:
+    """Return ``value`` if it is a valid goal: 1 to 2000 characters, no control characters."""
+    return _bounded_text(value, "goal", _GOAL_MIN_CHARS, _GOAL_MAX_CHARS)
+
+
+def validate_summary(value: str) -> str:
+    """Return ``value`` if it is a valid summary: 0 to 1000 characters, no control characters.
+
+    Summaries are single-line reports a person may read in a terminal, such as a job summary or
+    the reason a person gave for declining an approval.
+    """
+    return _bounded_text(value, "summary", _SUMMARY_MIN_CHARS, _SUMMARY_MAX_CHARS)
 
 
 # --- Worker messages ---------------------------------------------------------------------------
@@ -225,22 +275,44 @@ class Hello:
 
 @dataclass(frozen=True, slots=True)
 class ToolRequest:
-    """A request to run one tool.
+    """A request to run one tool while working on a job.
 
-    The worker names the tool and its arguments and nothing else. There is deliberately no field
-    for capabilities, approvals or task IDs: the Core derives and decides those.
+    The worker names the job, the tool and its arguments and nothing else. There is deliberately
+    no field for capabilities, approvals or task IDs: the Core derives and decides those.
     """
 
     request_id: str
+    job_id: str
     tool: str
     args: dict[str, JsonValue]
 
     def __post_init__(self) -> None:
         validate_request_id(self.request_id)
+        validate_uuid(self.job_id, "job_id")
         validate_tool_name(self.tool)
 
 
-WorkerMessage: TypeAlias = Hello | ToolRequest
+@dataclass(frozen=True, slots=True)
+class JobResult:
+    """The worker has finished the job it was given.
+
+    ``summary`` is a short single-line report (see ``validate_summary``).
+    """
+
+    job_id: str
+    outcome: JobOutcome
+    summary: str
+
+    def __post_init__(self) -> None:
+        validate_uuid(self.job_id, "job_id")
+        try:
+            JobOutcome(self.outcome)
+        except ValueError:
+            raise _malformed(f"invalid outcome: {_show(self.outcome)}") from None
+        validate_summary(self.summary)
+
+
+WorkerMessage: TypeAlias = Hello | ToolRequest | JobResult
 
 
 # --- Core messages -----------------------------------------------------------------------------
@@ -263,6 +335,14 @@ class Welcome:
     core_version: str
     tools: tuple[str, ...]
     limits: SessionLimits
+
+
+@dataclass(frozen=True, slots=True)
+class Job:
+    """A goal the Core assigns to the worker, which works on one job at a time."""
+
+    job_id: str
+    goal: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,7 +375,16 @@ class FixtureContent:
     content: str
 
 
-ToolResult: TypeAlias = SystemInfo | FixtureContent
+@dataclass(frozen=True, slots=True)
+class WriteOutcome:
+    """Result of ``workspace.write_file``."""
+
+    path: str
+    bytes: int
+    created: bool
+
+
+ToolResult: TypeAlias = SystemInfo | FixtureContent | WriteOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,11 +403,21 @@ class Denied:
 
 
 @dataclass(frozen=True, slots=True)
-class ConfirmationRequired:
-    """A human must confirm the call. Nothing ran; the task expires with the session."""
+class Declined:
+    """A person refused to approve the call. Nothing ran.
 
-    capabilities: tuple[Capability, ...]
+    ``approval_id`` is informational: the worker has no way to act on an approval.
+    """
+
+    approval_id: str
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class Expired:
+    """Nobody decided before the approval expired. Nothing ran."""
+
+    approval_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,7 +434,7 @@ class Failed:
     error: WireError
 
 
-ToolOutcome: TypeAlias = Completed | Denied | ConfirmationRequired | Rejected | Failed
+ToolOutcome: TypeAlias = Completed | Denied | Declined | Expired | Rejected | Failed
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,7 +459,7 @@ class ErrorMessage:
     fatal: bool
 
 
-CoreMessage: TypeAlias = Welcome | ToolResponse | ErrorMessage
+CoreMessage: TypeAlias = Welcome | Job | ToolResponse | ErrorMessage
 
 
 # --- Encoding ----------------------------------------------------------------------------------
@@ -379,8 +478,21 @@ def encode_worker_message(message: WorkerMessage) -> bytes:
                 "worker": worker,
                 "worker_version": worker_version,
             }
-        case ToolRequest(request_id=request_id, tool=tool, args=args):
-            body = {"type": "tool_request", "request_id": request_id, "tool": tool, "args": args}
+        case ToolRequest(request_id=request_id, job_id=job_id, tool=tool, args=args):
+            body = {
+                "type": "tool_request",
+                "request_id": request_id,
+                "job_id": job_id,
+                "tool": tool,
+                "args": args,
+            }
+        case JobResult(job_id=job_id, outcome=outcome, summary=summary):
+            body = {
+                "type": "job_result",
+                "job_id": job_id,
+                "outcome": JobOutcome(outcome).value,
+                "summary": summary,
+            }
         case _:
             assert_never(message)
     envelope = {"protocol": PROTOCOL_VERSION, **body}
@@ -398,6 +510,7 @@ _U64 = 64
 
 _WELCOME_FIELDS = frozenset({"session_id", "core_version", "tools", "limits"})
 _LIMITS_FIELDS = frozenset({"max_frame_bytes", "tool_timeout_ms", "max_requests"})
+_JOB_FIELDS = frozenset({"job_id", "goal"})
 _TOOL_RESPONSE_FIELDS = frozenset({"request_id", "task_id", "outcome"})
 _ERROR_MESSAGE_FIELDS = frozenset({"request_id", "error", "fatal"})
 _WIRE_ERROR_FIELDS = frozenset({"code", "message"})
@@ -413,6 +526,7 @@ _SYSTEM_INFO_FIELDS = frozenset(
     }
 )
 _FIXTURE_CONTENT_FIELDS = frozenset({"path", "bytes", "content"})
+_WRITE_OUTCOME_FIELDS = frozenset({"path", "bytes", "created"})
 
 
 def decode_core_message(frame: bytes) -> CoreMessage:
@@ -428,6 +542,8 @@ def decode_core_message(frame: bytes) -> CoreMessage:
     match message_type:
         case "welcome":
             return _decode_welcome(body)
+        case "job":
+            return _decode_job(body)
         case "tool_response":
             return _decode_tool_response(body)
         case "error":
@@ -542,6 +658,14 @@ def _decode_limits(value: object) -> SessionLimits:
     )
 
 
+def _decode_job(body: dict[str, object]) -> Job:
+    fields = _exact(body, _JOB_FIELDS, "job")
+    return Job(
+        job_id=validate_uuid(_text(fields["job_id"], "job_id"), "job_id"),
+        goal=validate_goal(_text(fields["goal"], "goal")),
+    )
+
+
 def _decode_tool_response(body: dict[str, object]) -> ToolResponse:
     fields = _exact(body, _TOOL_RESPONSE_FIELDS, "tool_response")
     return ToolResponse(
@@ -590,13 +714,27 @@ def _decode_outcome(value: object) -> ToolOutcome:
         case "completed":
             fields = _exact(value, frozenset({"status", "result"}), "outcome")
             return Completed(result=_decode_result(fields["result"]))
-        case "denied" | "confirmation_required":
+        case "denied":
             fields = _exact(value, frozenset({"status", "capabilities", "reason"}), "outcome")
-            capabilities = _decode_capabilities(fields["capabilities"])
-            reason = _text(fields["reason"], "reason")
-            if status == "denied":
-                return Denied(capabilities=capabilities, reason=reason)
-            return ConfirmationRequired(capabilities=capabilities, reason=reason)
+            return Denied(
+                capabilities=_decode_capabilities(fields["capabilities"]),
+                reason=_text(fields["reason"], "reason"),
+            )
+        case "declined":
+            fields = _exact(value, frozenset({"status", "approval_id", "reason"}), "outcome")
+            return Declined(
+                approval_id=validate_uuid(
+                    _text(fields["approval_id"], "approval_id"), "approval_id"
+                ),
+                reason=validate_summary(_text(fields["reason"], "reason")),
+            )
+        case "expired":
+            fields = _exact(value, frozenset({"status", "approval_id"}), "outcome")
+            return Expired(
+                approval_id=validate_uuid(
+                    _text(fields["approval_id"], "approval_id"), "approval_id"
+                )
+            )
         case "rejected" | "failed":
             fields = _exact(value, frozenset({"status", "error"}), "outcome")
             error = _decode_wire_error(fields["error"])
@@ -620,8 +758,14 @@ def _decode_result(value: object) -> ToolResult:
         )
     if fields.keys() == _FIXTURE_CONTENT_FIELDS:
         return FixtureContent(
-            path=validate_fixture_path(_text(fields["path"], "path")),
+            path=validate_relative_path(_text(fields["path"], "path")),
             bytes=_uint(fields["bytes"], "bytes", _U64),
             content=_text(fields["content"], "content"),
+        )
+    if fields.keys() == _WRITE_OUTCOME_FIELDS:
+        return WriteOutcome(
+            path=validate_relative_path(_text(fields["path"], "path")),
+            bytes=_uint(fields["bytes"], "bytes", _U64),
+            created=_flag(fields["created"], "created"),
         )
     raise _malformed("result does not match any tool result schema")

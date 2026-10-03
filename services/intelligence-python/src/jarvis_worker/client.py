@@ -1,4 +1,4 @@
-"""Client side of a worker session: handshake, then one tool call at a time.
+"""Client side of a worker session: handshake, then jobs, one tool call at a time.
 
 The client owns the framing. It reads and writes binary streams, one JSON object per line, and
 flushes after every frame. Everything it does is a request to the Core; it has no other way to
@@ -7,13 +7,17 @@ affect the outside world.
 
 import uuid
 from collections.abc import Callable
-from typing import BinaryIO
+from typing import BinaryIO, assert_never
 
 from jarvis_worker import __version__
 from jarvis_worker.protocol import (
+    CoreMessage,
     ErrorCode,
     ErrorMessage,
     Hello,
+    Job,
+    JobOutcome,
+    JobResult,
     JsonValue,
     ProtocolError,
     ToolRequest,
@@ -74,6 +78,7 @@ class CoreClient:
         self._max_frame_bytes = max_frame_bytes
         self._request_ids = request_ids
         self._welcome: Welcome | None = None
+        self._job: str | None = None
 
     @property
     def welcome(self) -> Welcome | None:
@@ -95,21 +100,37 @@ class CoreClient:
             self._welcome = reply
             self._max_frame_bytes = reply.limits.max_frame_bytes
             return reply
-        if isinstance(reply, ErrorMessage):
-            raise _session_error(reply)
-        raise ProtocolError(ErrorCode.UNEXPECTED_MESSAGE, "expected welcome, got tool_response")
+        raise _unexpected(reply, "welcome")
+
+    def next_job(self) -> Job | None:
+        """Wait for the Core to assign a job.
+
+        Returns ``None`` when the Core closes the session between jobs, which is how it tells an
+        idle worker to exit.
+        """
+        self._require_session("next_job")
+        if self._job is not None:
+            raise ClientStateError(f"job {self._job} has not been finished")
+        frame = self._read_frame()
+        if frame is None:
+            return None
+        reply = decode_core_message(frame)
+        if isinstance(reply, Job):
+            self._job = reply.job_id
+            return reply
+        raise _unexpected(reply, "job")
 
     def call(self, tool: str, args: dict[str, JsonValue]) -> ToolResponse:
-        """Ask the Core to run ``tool`` and return its ``tool_response``.
+        """Ask the Core to run ``tool`` for the current job and return its ``tool_response``.
 
-        Whether the call was allowed, rejected or failed is in the response's outcome; those are
-        normal results, not exceptions. Raises ``SessionError`` if the Core answers with an
-        ``error`` instead, ``ProtocolError`` for any other unexpected reply and
-        ``SessionClosed`` if the Core goes away.
+        Whether the call was allowed, declined, rejected or failed is in the response's outcome;
+        those are normal results, not exceptions. The reply can take as long as a person needs to
+        decide on an approval. Raises ``SessionError`` if the Core answers with an ``error``
+        instead, ``ProtocolError`` for any other unexpected reply and ``SessionClosed`` if the
+        Core goes away.
         """
-        if self._welcome is None:
-            raise ClientStateError("call() requires a completed handshake")
-        request = ToolRequest(request_id=self._request_ids(), tool=tool, args=args)
+        job_id = self._require_job("call")
+        request = ToolRequest(request_id=self._request_ids(), job_id=job_id, tool=tool, args=args)
         self._send(request)
         reply = self._receive()
         if isinstance(reply, ToolResponse):
@@ -119,9 +140,23 @@ class CoreClient:
                     f"response is for request {reply.request_id}, expected {request.request_id}",
                 )
             return reply
-        if isinstance(reply, ErrorMessage):
-            raise _session_error(reply)
-        raise ProtocolError(ErrorCode.UNEXPECTED_MESSAGE, "expected tool_response, got welcome")
+        raise _unexpected(reply, "tool_response")
+
+    def finish(self, outcome: JobOutcome, summary: str) -> None:
+        """Report the end of the current job. ``summary`` must be a valid summary."""
+        job_id = self._require_job("finish")
+        self._send(JobResult(job_id=job_id, outcome=outcome, summary=summary))
+        self._job = None
+
+    def _require_session(self, method: str) -> None:
+        if self._welcome is None:
+            raise ClientStateError(f"{method}() requires a completed handshake")
+
+    def _require_job(self, method: str) -> str:
+        self._require_session(method)
+        if self._job is None:
+            raise ClientStateError(f"{method}() requires a job from next_job()")
+        return self._job
 
     def _send(self, message: WorkerMessage) -> None:
         frame = encode_worker_message(message)
@@ -141,11 +176,14 @@ class CoreClient:
         except OSError as error:
             raise SessionClosed(f"could not write to the Core: {error}") from error
 
-    def _receive(self) -> Welcome | ToolResponse | ErrorMessage:
-        return decode_core_message(self._read_frame())
+    def _receive(self) -> CoreMessage:
+        frame = self._read_frame()
+        if frame is None:
+            raise SessionClosed("the Core closed the connection")
+        return decode_core_message(frame)
 
-    def _read_frame(self) -> bytes:
-        """Read one line and return it without its terminator.
+    def _read_frame(self) -> bytes | None:
+        """Read one line and return it without its terminator, or ``None`` at end of input.
 
         Reads at most two bytes more than the limit (room for ``\\r\\n``), so a Core that never
         sends a newline cannot make the worker buffer an unbounded line.
@@ -156,7 +194,7 @@ class CoreClient:
         except OSError as error:
             raise SessionClosed(f"could not read from the Core: {error}") from error
         if not line:
-            raise SessionClosed("the Core closed the connection")
+            return None
         if not line.endswith(b"\n"):
             if len(line) > limit:
                 raise _frame_too_large(limit)
@@ -169,6 +207,22 @@ class CoreClient:
 
 def _session_error(message: ErrorMessage) -> SessionError:
     return SessionError(message.error, fatal=message.fatal, request_id=message.request_id)
+
+
+def _unexpected(reply: CoreMessage, expected: str) -> Exception:
+    """The exception for a reply that is not ``expected``: the Core's error, or a violation."""
+    match reply:
+        case ErrorMessage():
+            return _session_error(reply)
+        case Welcome():
+            got = "welcome"
+        case Job():
+            got = "job"
+        case ToolResponse():
+            got = "tool_response"
+        case _:
+            assert_never(reply)
+    return ProtocolError(ErrorCode.UNEXPECTED_MESSAGE, f"expected {expected}, got {got}")
 
 
 def _frame_too_large(limit: int) -> ProtocolError:

@@ -1,15 +1,16 @@
-"""Command-line entry point: ``python -m jarvis_worker --goal "<text>"``.
+"""Command-line entry point: ``python -m jarvis_worker``.
 
 The Core spawns this process and talks to it over stdin and stdout, so stdout carries protocol
-frames and nothing else. Diagnostics go to stderr.
+frames and nothing else. Diagnostics go to stderr. After the handshake the worker waits for jobs:
+for each one it plans the goal, asks the Core to run every planned call, and reports a one-line
+summary. It exits when the Core closes its input between jobs.
 
 Exit codes:
 
-- ``0``: the handshake succeeded and every planned call received a ``tool_response``, whatever
-  its outcome (completed, denied, rejected, ...).
+- ``0``: the Core closed the session while the worker was idle.
 - ``2``: usage error.
 - ``3``: session or protocol failure: handshake rejected, error reply from the Core, end of
-  input or a malformed frame. The first failure ends the run.
+  input in the middle of a job or a malformed frame. The first failure ends the run.
 """
 
 import argparse
@@ -25,9 +26,12 @@ from jarvis_worker.client import CoreClient, SessionClosed, SessionError
 from jarvis_worker.planner import Planner, StubPlanner
 from jarvis_worker.protocol import (
     Completed,
-    ConfirmationRequired,
+    Declined,
     Denied,
+    Expired,
     Failed,
+    Job,
+    JobOutcome,
     ProtocolError,
     Rejected,
     ToolOutcome,
@@ -37,7 +41,7 @@ EXIT_OK = 0
 EXIT_SESSION_FAILED = 3
 
 LOG_FORMAT = "%(levelname)s jarvis_worker: %(message)s"
-STATUSES = ("completed", "denied", "confirmation_required", "rejected", "failed")
+STATUSES = ("completed", "denied", "declined", "expired", "rejected", "failed")
 
 logger = logging.getLogger("jarvis_worker")
 
@@ -49,22 +53,15 @@ class _Parser(argparse.ArgumentParser):
         super().print_help(sys.stderr if file is None else file)
 
 
-def _goal(text: str) -> str:
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        raise argparse.ArgumentTypeError("must be valid Unicode text") from None
-    return text
-
-
 def _build_parser() -> argparse.ArgumentParser:
-    parser = _Parser(
+    return _Parser(
         prog="python -m jarvis_worker",
-        description="Plan a goal and ask the Core to run the resulting tool calls.",
+        description=(
+            "Speak the worker protocol over stdin and stdout: wait for jobs from the Core, plan "
+            "each goal and ask the Core to run the resulting tool calls."
+        ),
         allow_abbrev=False,
     )
-    parser.add_argument("--goal", required=True, type=_goal, help="what the worker should do")
-    return parser
 
 
 def _printable(text: str) -> str:
@@ -82,30 +79,53 @@ def _describe(outcome: ToolOutcome) -> tuple[str, str]:
             return "completed", "completed"
         case Denied(reason=reason):
             return "denied", f"denied: {_printable(reason)}"
-        case ConfirmationRequired(reason=reason):
-            return "confirmation_required", f"confirmation_required: {_printable(reason)}"
+        case Declined(reason=reason):
+            return "declined", f"declined by a person: {_printable(reason)}"
+        case Expired():
+            return "expired", "approval expired"
         case Rejected(error=error):
             return "rejected", f"rejected: {error.code}"
         case Failed(error=error):
             return "failed", f"failed: {error.code}"
 
 
-def run_session(client: CoreClient, planner: Planner, goal: str) -> int:
-    """Handshake, plan ``goal``, run every planned call and log the outcomes.
+def run_job(client: CoreClient, planner: Planner, job: Job) -> None:
+    """Plan one job, run every planned call and report the result to the Core.
+
+    The job is ``completed`` if at least one call was planned and every call completed, and
+    ``failed`` otherwise. The summary counts the outcomes.
+    """
+    logger.info("job %s started", job.job_id)
+    calls = planner.plan(job.goal)
+    logger.info("planned %d call(s)", len(calls))
+    tally: Counter[str] = Counter()
+    for call in calls:
+        response = client.call(call.tool, call.args)
+        status, text = _describe(response.outcome)
+        tally[status] += 1
+        logger.info("task %s %s: %s", response.task_id, call.tool, text)
+    counts = " ".join(f"{status}={tally[status]}" for status in STATUSES)
+    summary = f"{len(calls)} call(s): {counts}"
+    if not calls:
+        summary = "nothing in the goal matches a known action"
+    ok = bool(calls) and tally["completed"] == len(calls)
+    outcome = JobOutcome.COMPLETED if ok else JobOutcome.FAILED
+    logger.info("job %s %s: %s", job.job_id, outcome, summary)
+    client.finish(outcome, summary)
+
+
+def run_session(client: CoreClient, planner: Planner) -> int:
+    """Handshake, then work on jobs until the Core closes the session.
 
     Returns the process exit code.
     """
     try:
         welcome = client.handshake()
         logger.info("session %s opened (core %s)", welcome.session_id, welcome.core_version)
-        calls = planner.plan(goal)
-        logger.info("planned %d call(s)", len(calls))
-        tally: Counter[str] = Counter()
-        for call in calls:
-            response = client.call(call.tool, call.args)
-            status, text = _describe(response.outcome)
-            tally[status] += 1
-            logger.info("task %s %s: %s", response.task_id, call.tool, text)
+        jobs = 0
+        while (job := client.next_job()) is not None:
+            run_job(client, planner, job)
+            jobs += 1
     except SessionError as error:
         scope = "fatal" if error.fatal else "non-fatal"
         logger.error("core replied with a %s error: %s", scope, _printable(str(error)))
@@ -116,14 +136,13 @@ def run_session(client: CoreClient, planner: Planner, goal: str) -> int:
     except SessionClosed as error:
         logger.error("session closed: %s", _printable(str(error)))
         return EXIT_SESSION_FAILED
-    counts = " ".join(f"{status}={tally[status]}" for status in STATUSES)
-    logger.info("summary: %d call(s): %s", len(calls), counts)
+    logger.info("session closed by the core after %d job(s)", jobs)
     return EXIT_OK
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse the command line and run one session over stdin and stdout."""
-    goal: str = _build_parser().parse_args(argv).goal
+    _build_parser().parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format=LOG_FORMAT)
     logger.info("jarvis-worker %s starting", __version__)
     # Frames go through an unbuffered binary writer on the stdout descriptor. A buffered one
@@ -131,7 +150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # shutdown would fail and replace the exit code. Nothing else ever writes to sys.stdout.
     stdout = io.FileIO(sys.stdout.fileno(), mode="wb", closefd=False)
     client = CoreClient(sys.stdin.buffer, stdout)
-    return run_session(client, StubPlanner(), goal)
+    return run_session(client, StubPlanner())
 
 
 if __name__ == "__main__":
