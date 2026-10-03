@@ -1,0 +1,7 @@
+{
+  "protocol": 1,
+  "type": "tool_request",
+  "request_id": "req-0001",
+  "tool": "system.info",
+  "args": {}
+}

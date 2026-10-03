@@ -1,0 +1,4 @@
+{
+  "frame": "{\"type\":\"hello\",\"worker\":\"w\",\"worker_version\":\"1\"}",
+  "error": "malformed_frame"
+}

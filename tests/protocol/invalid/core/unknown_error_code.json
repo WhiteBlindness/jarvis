@@ -1,0 +1,4 @@
+{
+  "frame": "{\"protocol\":1,\"type\":\"error\",\"request_id\":null,\"error\":{\"code\":\"teapot\",\"message\":\"x\"},\"fatal\":false}",
+  "error": "malformed_frame"
+}

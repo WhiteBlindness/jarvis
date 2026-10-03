@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/jarvis-protocol", "crates/jarvis-tools", "crates/jarvis-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# File::try_lock (used for the database lock file) is stable since 1.89.
+rust-version = "1.89"
+repository = "https://github.com/WhiteBlindness/jarvis"
+
+[workspace.dependencies]
+jarvis-protocol = { path = "crates/jarvis-protocol" }
+jarvis-tools = { path = "crates/jarvis-tools" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+humantime = "2"
+proptest = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"

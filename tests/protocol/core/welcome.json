@@ -1,0 +1,12 @@
+{
+  "protocol": 1,
+  "type": "welcome",
+  "session_id": "01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b",
+  "core_version": "0.1.0",
+  "tools": ["filesystem.read_fixture", "system.info"],
+  "limits": {
+    "max_frame_bytes": 65536,
+    "tool_timeout_ms": 5000,
+    "max_requests": 1000
+  }
+}
