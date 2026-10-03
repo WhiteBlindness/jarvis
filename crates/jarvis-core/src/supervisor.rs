@@ -1,15 +1,19 @@
-//! Starting, watching and stopping the worker process.
+//! Starting, containing, watching and stopping the worker process.
 //!
 //! The worker is started directly (no shell) with a cleared environment, so
-//! secrets in the Core's environment are not inherited. There is no way to
-//! add variables back from the config. Its stdin and stdout
-//! carry the protocol; its stderr is forwarded to the Core's log, one escaped
-//! and length-limited line at a time.
+//! secrets in the Core's environment are not inherited, and there is no way
+//! to add variables back from the config. OS containment
+//! ([`jarvis_sandbox`]) is applied before the worker runs any code; if it
+//! cannot be applied, the worker is killed and the start fails. Its stdin and
+//! stdout carry the protocol; its stderr is forwarded to the Core's log, one
+//! escaped and length-limited line at a time.
 
 use std::io;
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
+use jarvis_sandbox::{Contained, Limits};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
@@ -26,6 +30,7 @@ const MAX_LOG_LINE: usize = 4096;
 #[derive(Debug)]
 pub struct Worker {
     child: Child,
+    contained: Arc<Contained>,
     stderr: Option<JoinHandle<()>>,
 }
 
@@ -37,8 +42,11 @@ pub struct WorkerExit {
     pub killed: bool,
 }
 
-/// Start the worker and return it with its protocol pipes.
+/// Start and contain the worker; return it with its protocol pipes.
 pub fn spawn(config: &WorkerConfig) -> io::Result<(Worker, ChildStdin, ChildStdout)> {
+    let limits = Limits {
+        memory_bytes: config.memory_limit_bytes,
+    };
     let mut command = Command::new(&config.program);
     command
         .args(&config.args)
@@ -55,14 +63,28 @@ pub fn spawn(config: &WorkerConfig) -> io::Result<(Worker, ChildStdin, ChildStdo
     if let Some(cwd) = &config.cwd {
         command.current_dir(cwd);
     }
+    jarvis_sandbox::prepare(&mut command, &limits);
 
     let mut child = command.spawn()?;
+    let contained = match jarvis_sandbox::contain(&child, &limits) {
+        Ok(contained) => Arc::new(contained),
+        Err(error) => {
+            // Still suspended on Windows: it has run no code.
+            let _ = child.start_kill();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot contain the worker: {error}"),
+            ));
+        }
+    };
     let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
     let (Some(stdin), Some(stdout), Some(stderr)) = pipes else {
+        let _ = contained.kill_all();
         return Err(io::Error::other("worker pipes were not created"));
     };
     let worker = Worker {
         child,
+        contained,
         stderr: Some(tokio::spawn(forward_stderr(stderr))),
     };
     Ok((worker, stdin, stdout))
@@ -73,8 +95,12 @@ impl Worker {
         self.child.id()
     }
 
+    pub fn contained(&self) -> Arc<Contained> {
+        Arc::clone(&self.contained)
+    }
+
     /// Wait up to `grace` for the worker to exit on its own (its stdin
-    /// should already be closed), then kill it.
+    /// should already be closed), then kill it and anything it started.
     pub async fn stop(mut self, grace: Duration) -> io::Result<WorkerExit> {
         let exit = match tokio::time::timeout(grace, self.child.wait()).await {
             Ok(status) => WorkerExit {
@@ -83,6 +109,8 @@ impl Worker {
             },
             Err(_) => self.kill_now().await?,
         };
+        // Nothing the worker started may outlive it.
+        let _ = self.contained.kill_all();
         self.drain_stderr().await;
         Ok(exit)
     }
@@ -97,21 +125,30 @@ impl Worker {
     async fn kill_now(&mut self) -> io::Result<WorkerExit> {
         // The process may exit between the timeout and the kill.
         if let Some(status) = self.child.try_wait()? {
+            let _ = self.contained.kill_all();
             return Ok(WorkerExit {
                 status,
                 killed: false,
             });
         }
-        self.child.kill().await?;
+        self.contained.kill_all()?;
+        let status = match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                self.child.kill().await?;
+                self.child.wait().await?
+            }
+        };
         Ok(WorkerExit {
-            status: self.child.wait().await?,
+            status,
             killed: true,
         })
     }
 
     async fn drain_stderr(&mut self) {
         if let Some(task) = self.stderr.take() {
-            // A grandchild could hold stderr open; do not wait for it forever.
+            // A process that escaped could hold stderr open; do not wait for
+            // it forever.
             if tokio::time::timeout(Duration::from_secs(1), task)
                 .await
                 .is_err()
