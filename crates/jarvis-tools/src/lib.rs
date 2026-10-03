@@ -6,6 +6,7 @@
 
 mod fixtures;
 mod system_info;
+mod workspace;
 
 use std::fmt;
 use std::future::Future;
@@ -15,6 +16,7 @@ use std::time::Instant;
 use jarvis_protocol::{ToolCall, ToolResult};
 
 pub use fixtures::FixtureRoot;
+pub use workspace::WorkspaceRoot;
 
 /// Why a tool could not produce a result. Messages never contain absolute
 /// paths or other details of the host beyond what the caller sent.
@@ -70,14 +72,20 @@ pub struct Toolbox {
     core_version: &'static str,
     started: Instant,
     fixtures: FixtureRoot,
+    workspace: WorkspaceRoot,
 }
 
 impl Toolbox {
-    pub fn new(core_version: &'static str, fixtures: FixtureRoot) -> Self {
+    pub fn new(
+        core_version: &'static str,
+        fixtures: FixtureRoot,
+        workspace: WorkspaceRoot,
+    ) -> Self {
         Self {
             core_version,
             started: Instant::now(),
             fixtures,
+            workspace,
         }
     }
 }
@@ -95,6 +103,11 @@ impl ToolExecutor for Toolbox {
                     .read(&args.path)
                     .await
                     .map(ToolResult::Fixture),
+                ToolCall::WriteFile(args) => self
+                    .workspace
+                    .write(&args.path, &args.content)
+                    .await
+                    .map(ToolResult::Written),
             }
         })
     }

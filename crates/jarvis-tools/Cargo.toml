@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 jarvis-protocol.workspace = true
+cap-std.workspace = true
+uuid.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
