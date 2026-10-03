@@ -125,9 +125,7 @@ _TOOL_NAME_MAX_LEN = 64
 _FIXTURE_PATH_MAX_LEN = 255
 _FIXTURE_PATH_MAX_COMPONENTS = 16
 _WINDOWS_DEVICE_NAMES = frozenset(
-    {"con", "prn", "aux", "nul"}
-    | {f"com{n}" for n in range(1, 10)}
-    | {f"lpt{n}" for n in range(1, 10)}
+    {"con", "prn", "aux", "nul"} | {f"com{n}" for n in range(10)} | {f"lpt{n}" for n in range(10)}
 )
 
 
