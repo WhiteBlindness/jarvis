@@ -7,12 +7,18 @@ pub(crate) fn prepare(command: &mut tokio::process::Command, limits: &Limits) {
     command.process_group(0);
     let parent = std::process::id();
     let memory = limits.memory_bytes;
+    let max_fd = open_file_limit();
     // SAFETY: the closure runs in the child between fork and exec, so it may
-    // only use async-signal-safe functions. It calls prctl, getppid, setrlimit
-    // and _exit, which are all plain system calls, and touches no locks or
-    // heap memory.
+    // only use async-signal-safe functions. It calls prctl, getppid, setrlimit,
+    // close_range, fcntl and _exit, which are all plain system calls, and
+    // touches no locks or heap memory.
     unsafe {
         command.pre_exec(move || {
+            // Only stdin, stdout and stderr may reach the worker. The Core
+            // opens its own descriptors close-on-exec, but it may have
+            // inherited others from whatever started it (a shell, a service
+            // manager, a build tool's jobserver).
+            mark_close_on_exec_from(3, max_fd);
             #[cfg(target_os = "linux")]
             {
                 // Die with the thread that spawned us. Tokio spawns from a
@@ -50,12 +56,57 @@ pub(crate) fn prepare(command: &mut tokio::process::Command, limits: &Limits) {
     }
 }
 
+/// Highest descriptor number worth visiting when `close_range` is missing:
+/// the soft open-file limit, capped.
+fn open_file_limit() -> libc::c_int {
+    const CAP: libc::c_int = 1 << 20;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes into the structure it is given.
+    let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0;
+    if ok && limit.rlim_cur != libc::RLIM_INFINITY {
+        libc::c_int::try_from(limit.rlim_cur).map_or(CAP, |n| n.min(CAP))
+    } else {
+        CAP
+    }
+}
+
+/// Set close-on-exec on every descriptor from `first` up. Runs between fork
+/// and exec, so it only makes system calls. Closing instead would break the
+/// standard library's own close-on-exec pipe that reports exec failures.
+fn mark_close_on_exec_from(first: libc::c_int, max_fd: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: close_range with CLOSE_RANGE_CLOEXEC only changes
+        // descriptor flags (Linux 5.11 and later).
+        let done = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                first as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        } == 0;
+        if done {
+            return;
+        }
+    }
+    for fd in first..max_fd {
+        // SAFETY: setting a descriptor flag; EBADF for unused numbers is
+        // expected and harmless.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+}
+
 pub(crate) fn contain(child: &tokio::process::Child, limits: &Limits) -> io::Result<Contained> {
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("worker exited before it could be contained"))?;
     let mut controls = vec![
         "own process group".to_owned(),
+        "stdio only".to_owned(),
         format!("address space {} MiB", limits.memory_bytes / (1024 * 1024)),
         "no core dumps".to_owned(),
     ];

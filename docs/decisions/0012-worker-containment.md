@@ -14,7 +14,7 @@ Containment lives in one crate, `jarvis-sandbox`, the only crate allowed to cont
 
 **Linux.** The worker gets its own process group (so the whole tree can be killed at once), `PR_SET_PDEATHSIG` (it dies with the Core), `PR_SET_NO_NEW_PRIVS`, an address-space limit and no core dumps.
 
-**Both.** No shell and an environment cleared apart from `PATH` and `SYSTEMROOT`. The Core opens its own files, sockets and pipes as non-inheritable, so only the three stdio pipes reach the worker; a test checks this on Linux, and the Windows validation guide checks it with a handle viewer.
+**Both.** No shell and an environment cleared apart from `PATH` and `SYSTEMROOT`. The Core opens its own files, sockets and pipes as non-inheritable. On Unix every other descriptor, including any the Core itself inherited from whatever started it, is marked close-on-exec in the child before exec, so only the three stdio pipes reach the worker; a test checks this on Linux. On Windows a handle the Core inherited as inheritable would pass on; the Windows validation guide checks the worker's handles.
 
 ## Consequences
 

@@ -16,6 +16,7 @@
 //! | Memory limit | Job per-process commit limit | `RLIMIT_AS` |
 //! | Cannot write to the user's files or the Core's IPC endpoint | Low integrity level | not enforced |
 //! | Privileges | All removed except change-notify | `no_new_privs` |
+//! | Only stdio reaches the worker | Core handles are not inheritable | every other descriptor marked close-on-exec before exec |
 //! | Clipboard, desktop and other UI access | Job UI restrictions, unless the worker is already in a job | not applicable |
 //!
 //! This is not a full sandbox. In particular, nothing here stops the worker
