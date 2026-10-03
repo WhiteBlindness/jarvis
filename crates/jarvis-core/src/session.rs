@@ -259,6 +259,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             {
                 return Ok(end);
             }
+            // Checked here as well as while reading: frames buffered during
+            // an approval are handled without waiting on the reader.
+            if self
+                .job
+                .as_ref()
+                .is_some_and(|job| Instant::now() >= job.deadline)
+            {
+                return self.job_timed_out().await;
+            }
             let frame = match self.backlog.pop_front() {
                 Some(frame) => frame,
                 None => {
@@ -455,6 +464,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             // A limit was broken while the request waited: say so, as for
             // any fatal error.
             Some(SessionEnd::Terminated(error)) => self.terminate(None, error).await,
+            Some(SessionEnd::JobTimedOut(_)) => self.job_timed_out().await.map(Some),
             end => Ok(end),
         }
     }
@@ -616,11 +626,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                 continue;
             }
             let wait = Duration::from_millis(u64::try_from(remaining).unwrap_or(0));
+            let job = self.job.as_ref().map(|job| (job.id, job.deadline));
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => {
                     self.expire(approval_id, "the Core is shutting down").await?;
                     return Ok(Handled::End(SessionEnd::Shutdown, Some(expired)));
+                }
+                () = sleep_until(job.map(|(_, deadline)| deadline)) => {
+                    self.expire(approval_id, "the job exceeded its time limit").await?;
+                    let end = job.map_or(SessionEnd::WorkerGone, |(id, _)| SessionEnd::JobTimedOut(id));
+                    return Ok(Handled::End(end, Some(expired)));
                 }
                 () = notify.notified() => {}
                 () = tokio::time::sleep(wait) => {}

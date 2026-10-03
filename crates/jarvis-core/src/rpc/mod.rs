@@ -88,15 +88,7 @@ pub async fn serve(state: Arc<RpcState>, mut listener: Listener, stop: Cancellat
 async fn connection<S: Stream>(state: &RpcState, stream: S, peer: Peer, stop: &CancellationToken) {
     let (reader, mut writer) = tokio::io::split(stream);
     if let Some(reason) = refusal(state, &peer) {
-        tracing::warn!(client = %peer.describe(), reason, "RPC connection refused");
-        let event = AuditEventKind::RpcClientRejected {
-            client: peer.describe(),
-            reason: reason.to_owned(),
-        };
-        let _ = state
-            .store
-            .call(move |s| s.append(None, None, &event).map(|_| ()))
-            .await;
+        reject(state, &peer, reason).await;
         let _ = write(
             &mut writer,
             &RpcResponse::Error(RpcError::new(RpcErrorCode::Forbidden, reason)),
@@ -128,15 +120,39 @@ async fn connection<S: Stream>(state: &RpcState, stream: S, peer: Peer, stop: &C
                 let _ = write(&mut writer, &RpcResponse::Error(error)).await;
                 return;
             }
-            Frame::Line(bytes) => match decode_rpc_request(&bytes) {
-                Ok(request) => handle(state, request, &peer).await,
-                Err(error) => RpcResponse::Error(decode_error(&error)),
-            },
+            Frame::Line(bytes) => {
+                // Checked again for every request: a connection opened in
+                // the moment between a worker starting and its containment
+                // being registered must not stay usable.
+                if let Some(reason) = refusal(state, &peer) {
+                    reject(state, &peer, reason).await;
+                    let error = RpcError::new(RpcErrorCode::Forbidden, reason);
+                    let _ = write(&mut writer, &RpcResponse::Error(error)).await;
+                    return;
+                }
+                match decode_rpc_request(&bytes) {
+                    Ok(request) => handle(state, request, &peer).await,
+                    Err(error) => RpcResponse::Error(decode_error(&error)),
+                }
+            }
         };
         if write(&mut writer, &response).await.is_err() {
             return;
         }
     }
+}
+
+/// Log and audit a refused peer.
+async fn reject(state: &RpcState, peer: &Peer, reason: &'static str) {
+    tracing::warn!(client = %peer.describe(), reason, "RPC connection refused");
+    let event = AuditEventKind::RpcClientRejected {
+        client: peer.describe(),
+        reason: reason.to_owned(),
+    };
+    let _ = state
+        .store
+        .call(move |s| s.append(None, None, &event).map(|_| ()))
+        .await;
 }
 
 /// Why a peer may not use the interface, if it may not.

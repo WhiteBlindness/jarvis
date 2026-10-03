@@ -1458,3 +1458,77 @@ async fn a_store_failure_after_the_tool_ran_leaves_a_consumed_approval() {
             .is_err()
     );
 }
+
+/// The job time limit also applies while a request waits for a person, so a
+/// worker cannot keep a job alive past it by queueing writes nobody approves.
+#[tokio::test]
+async fn the_job_time_limit_applies_while_waiting_for_a_person() {
+    let mut h = Harness::start(Options {
+        job_timeout: Duration::from_millis(400),
+        approval_ttl: Duration::from_secs(60),
+        ..Options::default()
+    });
+    h.ready().await;
+    let job = h.job_id();
+    h.send_request("w1", "workspace.write_file", write_args("a.txt", "x"))
+        .await;
+    let approval = h.pending_approval().await;
+    assert!(matches!(
+        h.response("w1").await,
+        ToolOutcome::Expired { .. }
+    ));
+    let store = h.store.clone();
+    let session = h.session;
+    let report = tokio::time::timeout(Duration::from_secs(10), session)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.end, SessionEnd::JobTimedOut(job));
+    assert_eq!(
+        store
+            .approval(approval.approval_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ApprovalStatus::Expired
+    );
+    assert_eq!(store.job(job).unwrap().unwrap().status, JobStatus::Failed);
+}
+
+/// Requests buffered while one waited are not a way around the limit either:
+/// each would wait for its own approval, but the job ends at its deadline.
+#[tokio::test]
+async fn buffered_requests_do_not_extend_a_job_past_its_limit() {
+    let mut h = Harness::start(Options {
+        job_timeout: Duration::from_millis(700),
+        approval_ttl: Duration::from_millis(200),
+        ..Options::default()
+    });
+    h.ready().await;
+    let job = h.job_id();
+    for i in 0..5 {
+        h.send_request(
+            &format!("w{i}"),
+            "workspace.write_file",
+            write_args("a.txt", "x"),
+        )
+        .await;
+    }
+    let store = h.store.clone();
+    let session = h.session;
+    let report = tokio::time::timeout(Duration::from_secs(10), session)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.end, SessionEnd::JobTimedOut(job));
+    assert!(
+        store.tasks(10).unwrap().len() < 5,
+        "the job ended before every buffered request was handled"
+    );
+    assert_eq!(store.job(job).unwrap().unwrap().status, JobStatus::Failed);
+    for task in store.tasks(10).unwrap() {
+        assert!(task.status.is_terminal(), "{:?}", task.status);
+    }
+}
