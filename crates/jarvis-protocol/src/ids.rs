@@ -86,11 +86,17 @@ macro_rules! core_id {
         impl TryFrom<String> for $name {
             type Error = InvalidId;
 
+            /// Only the hyphenated form, which is the only form the Core
+            /// emits; the braced, simple and URN spellings are refused.
             fn try_from(value: String) -> Result<Self, Self::Error> {
-                Uuid::parse_str(&value).map(Self).map_err(|_| InvalidId {
+                let invalid = InvalidId {
                     kind: $kind,
-                    reason: "must be a UUID",
-                })
+                    reason: "must be a hyphenated UUID",
+                };
+                if value.len() != 36 {
+                    return Err(invalid);
+                }
+                Uuid::parse_str(&value).map(Self).map_err(|_| invalid)
             }
         }
 
@@ -232,5 +238,9 @@ mod tests {
         let text: String = id.into();
         assert_eq!(TaskId::try_from(text).unwrap(), id);
         assert!(TaskId::try_from("not-a-uuid".to_owned()).is_err());
+        let simple = id.to_string().replace('-', "");
+        assert!(TaskId::try_from(simple.clone()).is_err());
+        assert!(TaskId::try_from(format!("{{{id}}}")).is_err());
+        assert!(TaskId::try_from(format!("urn:uuid:{id}")).is_err());
     }
 }

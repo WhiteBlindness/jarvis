@@ -101,6 +101,8 @@ pub struct ToolResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorMessage {
+    /// Required on the wire; `null` when no request ID could be recovered.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub request_id: Option<RequestId>,
     pub error: WireError,
     pub fatal: bool,

@@ -37,7 +37,7 @@ impl fmt::Display for PolicyDecision {
 ///     │
 ///     └──► executing ──► completed | failed | timed_out | cancelled
 ///
-/// any non-terminal state ──► interrupted   (Core restarted mid-task)
+/// received | executing ──► interrupted     (found open at start-up)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

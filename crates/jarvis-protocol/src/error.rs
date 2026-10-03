@@ -78,8 +78,25 @@ impl WireError {
     /// boundary so that error details cannot inflate frames.
     pub const MAX_MESSAGE_LEN: usize = 512;
 
+    /// Messages often quote text from the worker, such as an unknown field
+    /// name. Control characters are escaped so that such text cannot forge
+    /// lines or terminal sequences in logs, the audit log or the CLI.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        let mut message = message.into();
+        let message = message.into();
+        let mut message = if message.chars().any(char::is_control) {
+            message
+                .chars()
+                .map(|c| {
+                    if c.is_control() {
+                        c.escape_default().to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect()
+        } else {
+            message
+        };
         if message.len() > Self::MAX_MESSAGE_LEN {
             let mut end = Self::MAX_MESSAGE_LEN;
             while !message.is_char_boundary(end) {
@@ -125,6 +142,21 @@ mod tests {
                 format!("\"{}\"", code.as_str())
             );
         }
+    }
+
+    #[test]
+    fn control_characters_are_escaped() {
+        let error = WireError::new(
+            ErrorCode::MalformedFrame,
+            "unknown field `\u{1b}[31mX\nINFO fake\u{7}`",
+        );
+        assert!(
+            !error.message.chars().any(char::is_control),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("\\n"));
+        assert!(error.message.contains("\\u{1b}"));
     }
 
     #[test]
