@@ -131,11 +131,15 @@ async fn low_integrity_cannot_write_user_files() {
 #[cfg(windows)]
 #[tokio::test]
 async fn dropping_the_guard_kills_the_worker() {
-    let (child, contained) = spawn("import time\ntime.sleep(60)");
+    let (mut child, contained) = spawn("import time\ntime.sleep(60)");
     let pid = child.id().unwrap();
     drop(contained);
-    let code = exit_code(child).await;
-    assert_ne!(code, Some(0));
+    // Kill-on-close terminates the process with exit code 0, so check that
+    // it ended long before its sleep would have.
+    tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("the worker outlived its job")
+        .unwrap();
     assert!(!process_exists(pid));
 }
 
@@ -187,6 +191,8 @@ async fn the_worker_cannot_open_an_owner_only_pipe() {
     drop(client);
     drop(server);
 
+    // A fresh name: the first one may linger until its handles are closed.
+    let name = format!("{name}-low");
     let _server = jarvis_sandbox::create_owner_only_pipe(&options, &name).unwrap();
     let code = format!(
         "import sys\ntry:\n    open(r'{name}', 'r+b')\nexcept PermissionError:\n    sys.exit(45)\nsys.exit(0)"
