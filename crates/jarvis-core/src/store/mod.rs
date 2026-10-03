@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use jarvis_protocol::{
-    AuditEvent, AuditEventKind, Capability, ErrorCode, PolicyDecision, RequestId, SessionId,
+    AuditEvent, AuditEventKind, Capability, ErrorCode, JobId, PolicyDecision, RequestId, SessionId,
     TaskId, TaskStatus, ToolName, WireError,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -26,11 +26,24 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: include_str!("migrations/0001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: include_str!("migrations/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "jobs_and_approvals",
+        sql: include_str!("migrations/0002_jobs_and_approvals.sql"),
+    },
+];
+
+mod approvals;
+mod jobs;
+
+pub use approvals::{ApprovalError, ApprovalRecord, NewApproval};
+pub use jobs::JobRecord;
 
 const OPEN_STATES: [TaskStatus; 3] = [
     TaskStatus::Received,
@@ -76,6 +89,7 @@ pub enum StoreError {
 pub struct NewTask {
     pub task_id: TaskId,
     pub session_id: SessionId,
+    pub job_id: Option<JobId>,
     pub request_id: RequestId,
     pub tool: ToolName,
     pub args: serde_json::Value,
@@ -104,11 +118,26 @@ impl TaskChange {
     }
 }
 
+/// What start-up recovery closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Recovery {
+    pub tasks: u32,
+    pub approvals: u32,
+    pub jobs: u32,
+}
+
+impl Recovery {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// A task as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
     pub task_id: TaskId,
     pub session_id: SessionId,
+    pub job_id: Option<JobId>,
     pub request_id: RequestId,
     pub tool: String,
     pub args: String,
@@ -238,11 +267,13 @@ impl Store {
         let tx = conn.transaction()?;
         let now = now();
         let inserted = tx.execute(
-            "INSERT INTO tasks (task_id, session_id, request_id, tool, args, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'received', ?6, ?6)",
+            "INSERT INTO tasks (task_id, session_id, job_id, request_id, tool, args, status,
+                                created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'received', ?7, ?7)",
             params![
                 task.task_id.to_string(),
                 task.session_id.to_string(),
+                task.job_id.map(|id| id.to_string()),
                 task.request_id.as_str(),
                 task.tool.as_str(),
                 task.args.to_string(),
@@ -302,6 +333,7 @@ impl Store {
             params![session_id.to_string()],
         )?;
         for &task_id in &ids {
+            approvals::expire_open_for_task(&tx, task_id, session_id, reason)?;
             let change = TaskChange {
                 error: Some(WireError::new(ErrorCode::Cancelled, reason)),
                 ..TaskChange::to(TaskStatus::Expired)
@@ -320,12 +352,18 @@ impl Store {
         Ok(u32::try_from(ids.len()).unwrap_or(u32::MAX))
     }
 
-    /// Close every task left open by a previous run. Tasks that were received
-    /// or executing become `interrupted`; tasks waiting for confirmation
-    /// become `expired`. Returns how many tasks were closed.
-    pub fn recover(&self) -> Result<u32, StoreError> {
+    /// Close everything a previous run left open. Nothing that carries
+    /// authority survives a restart:
+    ///
+    /// - pending and granted approvals become `expired`;
+    /// - tasks that were received or executing become `interrupted`, tasks
+    ///   waiting for confirmation become `expired`;
+    /// - running jobs become `interrupted`, queued jobs `cancelled`.
+    pub fn recover(&self) -> Result<Recovery, StoreError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
+        let approvals = approvals::expire_all_open(&tx, "the Core restarted")?;
+        let jobs = jobs::close_all_open(&tx)?;
         let open: Vec<(TaskId, SessionId, TaskStatus)> = {
             let mut statement = tx.prepare(
                 "SELECT task_id, session_id, status FROM tasks
@@ -370,7 +408,11 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(u32::try_from(open.len()).unwrap_or(u32::MAX))
+        Ok(Recovery {
+            tasks: count(open.len()),
+            approvals,
+            jobs,
+        })
     }
 
     pub fn task(&self, task_id: TaskId) -> Result<Option<TaskRecord>, StoreError> {
@@ -620,7 +662,7 @@ fn task_ids(
 }
 
 const TASK_COLUMNS: &str = "SELECT task_id, session_id, request_id, tool, args, status, decision,
-    capabilities, result, error_code, error_message, created_at, updated_at FROM tasks";
+    capabilities, result, error_code, error_message, created_at, updated_at, job_id FROM tasks";
 
 type RawTask = (
     String,
@@ -636,6 +678,7 @@ type RawTask = (
     Option<String>,
     String,
     String,
+    Option<String>,
 );
 
 fn raw_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTask> {
@@ -653,6 +696,7 @@ fn raw_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTask> {
         row.get(10)?,
         row.get(11)?,
         row.get(12)?,
+        row.get(13)?,
     ))
 }
 
@@ -674,6 +718,7 @@ impl TryFrom<RawTask> for TaskRecord {
             error_message,
             created_at,
             updated_at,
+            job_id,
         ) = raw;
         let decision = decision
             .map(|value| serde_json::from_value(serde_json::Value::String(value)))
@@ -694,6 +739,7 @@ impl TryFrom<RawTask> for TaskRecord {
         Ok(Self {
             task_id: parse(&task_id)?,
             session_id: parse(&session_id)?,
+            job_id: job_id.as_deref().map(parse).transpose()?,
             request_id: RequestId::try_from(request_id)
                 .map_err(|error| StoreError::Corrupt(error.to_string()))?,
             tool,
@@ -721,6 +767,25 @@ where
 
 fn now() -> String {
     humantime::format_rfc3339_millis(SystemTime::now()).to_string()
+}
+
+/// Milliseconds since the Unix epoch, the unit of approval expiry.
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// RFC 3339 form of a Unix time in milliseconds.
+pub fn format_ms(ms: i64) -> String {
+    let at = SystemTime::UNIX_EPOCH + Duration::from_millis(u64::try_from(ms).unwrap_or(0));
+    humantime::format_rfc3339_millis(at).to_string()
+}
+
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
