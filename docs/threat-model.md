@@ -1,84 +1,85 @@
 # Threat model
 
-This document defines what JARVIS protects, where the trust boundaries are, and which controls exist today. It covers the Phase 1 system: a Rust Core that supervises one Python worker and executes typed tools under a capability policy. It was written before any model integration, and it is the reference for every new tool.
+This document defines what JARVIS protects, where the trust boundaries are, and which controls exist today. It covers the Phase 2 system: a long-lived Rust Core that supervises one contained Python worker, executes typed tools under a capability policy, asks a person before any class B action, and serves local clients over RPC. It was written before any model integration, and it is the reference for every new tool.
 
 Each threat lists its current mitigation and the test that proves it, or states plainly that the mitigation is planned.
 
 ## System in scope
 
 ```
-            user (config file, CLI)
-                     |
-                     v
-+--------------------------------------------+
-| Rust Core (trusted, enforcement point)      |
-|  session -> validation -> capability        |
-|  extraction -> policy -> Tool Gateway       |
-|  SQLite: tasks, audit_events                |
-+--------------------------------------------+
+   person ── CLI (or a future dashboard)
+                 |  local RPC: Unix socket (0700 dir) or named pipe
+                 |  same user only; the worker is refused
+                 v
++--------------------------------------------------+
+| Rust Core (trusted, enforcement point)            |
+|  RPC server -> jobs, approvals                    |
+|  session -> validation -> capability extraction   |
+|  -> policy -> [approval] -> Tool Gateway          |
+|  SQLite: jobs, tasks, approvals, audit_events     |
+|  supervisor: spawn, contain, restart, kill        |
++--------------------------------------------------+
         ^  stdio pipe, line-delimited JSON
-        |  (the worker's only channel)
+        |  (the worker's only channel to the Core)
         v
-+--------------------------------------------+
-| Python worker (untrusted at the protocol)   |
-|  deterministic planner today; models later  |
-+--------------------------------------------+
++--------------------------------------------------+
+| Python worker (untrusted)                         |
+|  OS containment: job object + low integrity       |
+|  (Windows), process group + pdeathsig (Linux)     |
+|  deterministic planner today; models later        |
++--------------------------------------------------+
 ```
-
-The Core starts the worker as a child process. The worker has no network listener and no channel to the Core other than its own stdin and stdout. There is no other IPC endpoint in Phase 1.
 
 ## Assets
 
-| Asset | Why it matters | Phase 1 exposure |
+| Asset | Why it matters | Phase 2 exposure |
 | --- | --- | --- |
-| Filesystem | Personal files, project files, system files | Read access only inside one configured fixture directory |
+| Filesystem | Personal files, project files, system files | Tools read inside one fixture directory and write inside one workspace directory, writes only after a person approves |
 | Credentials | API keys, tokens, SSH keys, password stores | None through tools; the worker starts with a cleared environment |
-| Private documents | Notes, mail, documents on the PC | None |
-| Browser and session data | Cookies, profiles, saved sessions | None |
-| Processes | Ability to start, stop or control programs | The Core starts only the configured worker; no tool starts processes |
-| Network access | Exfiltration, remote actions | No tool performs network I/O |
-| Local services | Databases, home automation, other daemons | None |
+| Private documents | Notes, mail, documents on the PC | None through tools. A compromised worker can read what the user can read (see known gaps) |
+| Browser and session data | Cookies, profiles, saved sessions | As above |
+| Processes | Ability to start, stop or control programs | No tool starts processes. On Windows the worker cannot start any |
+| Network access | Exfiltration, remote actions | No tool performs network I/O. The worker is not blocked from the network (known gap) |
+| The approval channel | Whoever can approve can trigger class B actions | Local RPC, same user only, worker refused |
 | User identity | Hostname, username, account names | `system.info` deliberately omits them |
-| The Core's own state | Policy, config, audit log, task history | Not reachable through the protocol |
+| The Core's own state | Policy, config, audit log, task and approval history | Not reachable through the worker protocol or the RPC interface |
 
 ## Actors and trust levels
 
 | Actor | Trust | Notes |
 | --- | --- | --- |
-| User | Trusted | Owns the machine, writes the config and policy |
+| Person at the machine | Trusted | Owns the machine, writes the config and policy, decides on approvals |
+| Local client (CLI) | Trusted as the person | Any process of the same user that can open the RPC endpoint, except the worker |
 | Model (future) | Untrusted | Its output is data. It may be steered by content it reads (prompt injection) |
-| Python worker | Untrusted at the protocol boundary | Hosts the model and processes untrusted content. Its requests are validated as if hostile |
+| Python worker | Untrusted | Its requests are validated as if hostile, and it runs under OS containment |
 | Rust Core | Trusted | The only component that decides and executes |
-| Tool Gateway and tools | Trusted code, bounded | Receive typed arguments only after policy allows them |
-| Operating system | Trusted | The Core relies on OS process isolation and file permissions |
-| Remote services (future) | Untrusted | Not reachable in Phase 1 |
+| Tool Gateway and tools | Trusted code, bounded | Receive typed arguments only after policy (and, for class B, a person) allows them |
+| Other local users | Untrusted | Cannot reach the RPC endpoint |
+| Operating system | Trusted | The Core relies on OS process isolation, file permissions, peer credentials and job objects |
 
 ## Trust boundaries
 
-1. **Model → worker.** Model output never becomes code. The worker turns it into typed tool requests or discards it. This boundary does not exist yet in code because no model is integrated.
-2. **Worker → Core (stdio protocol).** This is the enforcement boundary in Phase 1. Every frame is size-bounded, decoded strictly, version-checked and validated before it can create a task.
-3. **Core → tools.** The Gateway calls a tool only with a typed, validated call that policy has allowed, under a timeout and a cancellation signal. Tool output is verified before it is stored or returned.
-4. **Core → OS.** The Core touches the OS through the SQLite file, the lock file, the fixture directory, and the worker process it spawns. Nothing else.
-5. **Core → remote services.** None in Phase 1.
+1. **Model → worker.** Model output never becomes code. This boundary does not exist yet in code because no model is integrated.
+2. **Worker → Core (stdio protocol).** Every frame is size-bounded, decoded strictly, version-checked, tied to the current job and validated before it can create a task.
+3. **Client → Core (local RPC).** The OS identifies every peer before a request is read. Requests are size-bounded and decoded strictly; there are nine typed operations and none runs a tool directly.
+4. **Core → tools.** The Gateway calls a tool only with a typed, validated call that policy has allowed and, for class B, whose approval was consumed in the same transaction that started execution.
+5. **Worker → OS.** OS containment limits what worker code can do outside the protocol. It is not a sandbox (see known gaps).
 
 ## Security invariants
 
 These rules hold in the current code. Changes that break one of them need an ADR.
 
-1. **The worker never names capabilities.** The Core derives the required capabilities from the typed tool call through an exhaustive match. A request that tries to carry capabilities, approvals or task IDs is rejected as malformed.
-2. **Default deny.** A capability that the policy does not list is denied.
-3. **No generic execution interface.** No tool accepts a command line, a script, a URL or an arbitrary path. The tool set is a closed enum compiled into the Core.
-4. **Decide, record, then act.** The policy decision and the start of execution are committed to SQLite before a tool runs. If that write fails, the tool does not run.
-5. **One task, one terminal state.** Every tool request that decodes, arrives after the handshake, is within the request cap and does not reuse a `request_id` creates exactly one task record. Each task reaches exactly one terminal state, and a database trigger rejects later changes to terminal tasks.
-6. **Append-only audit.** Database triggers reject `UPDATE` and `DELETE` on `audit_events`.
-7. **Approvals do not carry over.** There is no approval token in the protocol. A request that needs confirmation is not executed in Phase 1, and its task expires when the session ends.
-8. **Everything is bounded.** Frame size, result size, fixture size, tool time, requests per session and protocol errors per session all have limits.
-9. **The worker does not inherit secrets.** The Core clears the worker's environment and passes through only what the interpreter needs to start.
-10. **Strict decoding.** Unknown fields, unknown message types and other protocol versions are rejected, never ignored.
+1. **The worker never names capabilities or approvals.** The Core derives the capabilities through an exhaustive match. A request that carries capabilities, approvals, approval IDs, fingerprints or task IDs is rejected as malformed.
+2. **Default deny, with a ceiling per class.** A capability the policy does not list is denied. A class B capability cannot be set to `allow`; loading such a config fails.
+3. **No generic execution interface.** No tool accepts a command line, a script, a URL or an unrestricted path. The tool set is a closed enum compiled into the Core.
+4. **Decide, record, then act.** The policy decision (and for class B, the consumption of the approval) and `execution_started` are committed before a tool runs. If that write fails, the tool does not run.
+5. **One approval, one request, one use.** An approval is bound by fingerprint to one task, request, tool, argument set and capability set. It is granted only by a local client that presents that fingerprint, and consumed at most once. It never survives its session or a restart.
+6. **One task, one terminal state; append-only audit.** Task and approval transitions commit with their audit events. Triggers reject changes to terminal tasks, decided approvals, finished jobs and any audit event.
+7. **Everything is bounded.** Frames, results, fixture and workspace sizes, tool time, job time, approval time, requests and protocol errors per session, frames buffered while waiting for a person, RPC request size, RPC connections, long-poll time, worker memory and worker restarts.
+8. **The worker does not inherit secrets or authority.** Cleared environment, no inherited descriptors besides stdio, no shell, OS containment applied before it runs any code.
+9. **Strict decoding on every interface.** Unknown fields, unknown message types and other versions are rejected on the worker protocol and the RPC interface.
 
 ## Action classes
-
-Every capability belongs to one class. Today every capability is class A, so the policy file may set any decision for it. A ceiling per class, checked when the config is loaded, arrives with the first class B capability.
 
 ### A. Allow automatically
 
@@ -87,70 +88,98 @@ Read-only, side-effect free, bounded output, no personal data.
 - `system.info`: OS family, architecture, logical CPU count, Core version, protocol version and Core uptime.
 - `filesystem.read.fixture`: read a UTF-8 text file inside the configured fixture directory, up to a size limit.
 
-Planned examples: status of an approved application, listing an approved directory.
-
 ### B. Require confirmation
 
-Actions with side effects that can be undone, or reads of personal data.
+Side effects that stay inside an approved area and can be undone.
 
-Planned examples: reading a document outside approved roots, writing inside an approved directory, launching an application from an allowlist, sending a notification, a request to an allowlisted host.
+- `workspace.write`: `workspace.write_file` creates or replaces one UTF-8 text file inside the configured workspace directory, up to a size limit. It cannot create directories, delete files, follow symlinks or junctions out of the workspace, write through an existing link, or write anywhere else. Every call needs a person's approval; the policy may also deny it, but not allow it.
 
-Phase 1 has no class B tool. The policy engine already returns `require_confirmation`, and a test proves that such a request is recorded and not executed. The approval channel itself (a human confirming a specific task) is Phase 2 work.
+Planned examples: launching an application from an allowlist, sending a notification, a request to an allowlisted host.
 
 ### C. Prohibited
 
-No policy can allow these. They are enforced structurally: no tool exists for them, and the protocol has no generic variant that could express them.
+No policy can allow these. They are enforced structurally: no tool exists for them, and neither protocol has a generic variant that could express them.
 
 - Arbitrary shell or command execution, generic process launch.
 - Unrestricted filesystem write or delete.
 - Reading credential stores, browser profiles, SSH keys or password managers.
 - Unrestricted network access.
 - Changing the Core's own policy, config, database or audit log.
-- Disabling or bypassing audit.
-
-The policy file cannot name a capability that the Core does not know. Loading such a config fails.
+- Disabling or bypassing audit or approvals.
 
 ## Threats and mitigations
 
 Status: **Implemented** means the mitigation exists in code and a test covers it. **Partial** means part of it exists. **Planned** means it is not built.
 
+### Requests from the worker
+
 | Threat | Mitigation | Status | Evidence |
 | --- | --- | --- | --- |
-| Prompt injection | Model output can only become typed requests. Policy is evaluated on derived capabilities, not on the model's stated intent. Class B needs a human, class C does not exist. Residual risk: an injected model can still call any class A tool, so class A must stay harmless | Partial (no model yet) | Architecture; `rogue_worker` end-to-end test |
-| Tool injection (invented tools such as `shell.exec`) | Closed tool set. A well-formed but unknown tool name creates a `rejected` task and nothing runs | Implemented | `unknown_tool_is_rejected_and_recorded` |
-| Malformed arguments | Each tool has a typed argument struct that rejects unknown fields and wrong types, followed by semantic checks | Implemented | `invalid_arguments_are_rejected_before_policy` |
-| Path traversal | Fixture paths must be relative and contain only normal components (no `..`, no root, no drive prefix, bounded length). The tool then checks that the canonical target stays under the canonical fixture root, which also catches symlinks that point outside | Implemented | `fixture_path` unit tests; `path_traversal_is_rejected` |
-| Arbitrary process execution | No tool starts processes. The only child process is the configured worker, started from config with an argument vector and no shell | Implemented | No such tool exists; `worker_environment_is_cleared` |
-| Capability escalation | Capabilities are derived by the Core. A request field such as `capabilities` or `approved` is rejected. The policy cannot reference unknown capabilities. Default deny | Implemented | `worker_cannot_smuggle_authority`; `denied_capability_never_executes`; config tests |
-| Confused deputy | The Core evaluates the worker's grants, not its own authority. Tools receive typed arguments only, and the fixture reader is bound to the configured root. Phase 1 has a single principal; per-principal grants come with more workers | Partial | Policy tests |
-| Stale approvals | No approval token exists. Confirmation-required tasks expire at session end and again during startup recovery | Implemented | `confirmation_required_is_not_executed`; recovery tests |
-| Replayed requests | `request_id` is unique per session, enforced by a database constraint. A duplicate is rejected without re-execution. Session IDs are generated by the Core | Implemented | `duplicate_request_id_is_rejected` |
-| Runaway jobs | Per-tool timeout, one tool in flight per worker, per-session request cap, protocol error budget | Implemented | `tool_timeout_is_recorded`; `request_cap_closes_session` |
-| Worker crash or hang | The Core detects EOF and process exit, records the exit status, expires pending confirmations, kills a worker that does not finish the handshake or does not exit after shutdown, and ends the session when a worker stops reading its replies. A worker that stays connected but idle after the handshake is not timed out; only the operator's shutdown ends it | Partial | `worker_crash_is_recorded`; `handshake_timeout_kills_worker`; `worker_that_stops_reading_cannot_stall_the_core`; `signal_triggers_graceful_shutdown` |
-| Core crash mid-task | WAL with `synchronous=FULL`. On startup, non-terminal tasks become `interrupted` or `expired`, with an audit event for each | Implemented | `recovery_marks_unfinished_tasks` |
-| Resource exhaustion | Frame limit enforced while reading (no unbounded buffering), result size limit, fixture size limit, write timeout towards the worker, truncated worker log lines | Implemented | Framing tests; `oversized_result_is_rejected`; `worker_that_stops_reading_cannot_stall_the_core` |
-| Malformed IPC | Bounded line framing, strict JSON decoding, per-frame version check, error budget. A property test feeds arbitrary bytes to the decoder | Implemented | `malformed_frames_*`; `decode_never_panics` property test |
-| Protocol version mismatch | Exact version match on every frame. A mismatch closes the session | Implemented | `protocol_version_mismatch_closes_session` |
-| Forged or oversized tool results | The Gateway checks that the result variant matches the call and that its size is within limits before storing it | Implemented | `mismatched_result_is_rejected` |
-| Credential leakage to the worker | Cleared environment, with no config option to add variables back; `system.info` excludes hostname, username, environment variables and paths | Implemented | `worker_environment_is_cleared` |
-| Audit tampering by Core bugs | Append-only triggers, with `recursive_triggers` on so that `REPLACE` cannot bypass them; terminal tasks immutable; transitions checked against the expected source state | Implemented | `audit_log_is_append_only`; `terminal_tasks_cannot_be_changed_even_by_direct_sql` |
-| Audit tampering with file access | Not addressed. Anyone with write access to the database file can rewrite it. A hash chain or external log sink is planned | Planned | None |
-| Two Cores on one database | Exclusive lock file held for the Core's lifetime, so recovery cannot mark another live Core's tasks as interrupted | Implemented | `second_core_cannot_open_same_database` |
-| Log or terminal injection | Error messages often quote worker text, such as an unknown field name; control characters are escaped before the message reaches the wire, the audit log, the logs or the CLI. Worker stderr is forwarded escaped and truncated per line | Implemented | `worker_text_in_errors_is_escaped`; `control_characters_are_escaped` |
+| Prompt injection | Model output can only become typed requests. Policy is evaluated on derived capabilities. Class B needs a person who sees the exact arguments; class C does not exist. Residual risk: an injected model can call any class A tool, and can ask for class B actions a person might approve without reading | Partial (no model yet) | Architecture; rogue worker test |
+| Tool injection (invented tools such as `shell.exec`) | Closed tool set. An unknown tool creates a `rejected` task and nothing runs | Implemented | `unknown_tool_is_rejected_and_recorded` |
+| Malformed arguments | Typed argument structs that reject unknown fields and wrong types, then semantic checks | Implemented | `invalid_arguments_are_rejected_before_policy` |
+| Path traversal, absolute paths | Paths must be relative with plain components (no `..`, root, drive, device names, streams). Reads check the canonical target stays under the fixture root. Writes resolve every component beneath an open directory handle (`cap-std`), which refuses to leave the root | Implemented | `path_traversal_is_rejected_for_reads_and_writes`; `RelativePath` tests |
+| Symlink or junction escape on write | Handle-based resolution refuses links that lead outside; a link at the target is refused; a hard link at the target is replaced, not written through | Implemented (junction: Windows CI) | `symlinked_directory_leading_outside_is_refused`; `symlink_at_the_target_is_refused`; `hard_link_at_the_target_is_replaced_not_written_through`; `junction_leading_outside_is_refused` |
+| Race: a directory swapped for a link during a write | Each component is opened relative to the handle of the previous one, so no interleaving can redirect the write | Implemented (Unix test) | `swapping_a_directory_for_a_symlink_mid_write_cannot_escape` |
+| Capability escalation | Capabilities derived by the Core; authority fields rejected; unknown capabilities refused in config; class ceiling enforced at load | Implemented | `worker_cannot_smuggle_authority`; config tests |
+| Requests outside the current job | Every request names its job; any other job is refused and creates no task | Implemented | `requests_and_results_must_belong_to_the_current_job` |
+| Replayed requests | `request_id` unique per session (database constraint). A duplicate is rejected without re-execution | Implemented | `duplicate_request_id_is_rejected` |
+| Flooding while a request waits for a person | At most 16 frames are buffered; more ends the session and expires the approval | Implemented | `too_many_frames_while_waiting_end_the_session` |
+
+### Approvals
+
+| Threat | Mitigation | Status | Evidence |
+| --- | --- | --- | --- |
+| Worker grants itself approval | No approval field exists in the worker protocol; the worker never sees an approval it could act on | Implemented | `worker_cannot_smuggle_authority`; rogue worker test |
+| Worker approves through the RPC interface | Peers are identified by the OS. The worker, its process group and descendants (Linux) or job (Windows) are refused; on Windows its low integrity level also blocks the pipe. Refusals are audited | Implemented (with the Linux gap below) | `a_rogue_worker_cannot_bypass_policy_or_approve_its_own_request`; `a_descendant_that_leaves_the_process_group_is_still_recognised` |
+| Approving something other than what was shown | The client must present the fingerprint of the exact request it displayed; the session consumes the approval only if the fingerprint still matches the call it is about to run | Implemented | `a_wrong_fingerprint_grants_nothing`; `consuming_for_a_different_call_is_refused_and_changes_nothing`; `a_write_runs_only_after_a_person_approves_it_through_another_client` |
+| Approval reused, replayed or used twice | Conditional state transitions in one transaction, enforced again by triggers; consumed approvals are terminal | Implemented | `an_approval_is_used_at_most_once_even_across_restarts`; `approval_rows_are_protected_by_triggers` |
+| Stale approvals | Time-to-live checked at grant and at use; expiry on session end and on restart | Implemented | `an_approval_nobody_decides_on_expires`; `no_approval_or_queued_job_survives_a_restart`; `no_approval_can_be_used_after_the_core_restarts` |
+| Crash between approval and execution | Consumption and `execution_started` commit together. If that commit fails nothing runs and recovery expires the approval; if it succeeds the approval is spent whatever happens next | Implemented | `a_store_failure_before_consumption_never_runs_the_tool`; `a_store_failure_after_the_tool_ran_leaves_a_consumed_approval` |
+| Terminal injection in what the person reviews | Arguments are shown through a display-safe description: control characters escaped, long values cut, file content summarised by size, SHA-256 and a short escaped preview | Implemented | `description_is_safe_to_print` |
+| Approval fatigue | Out of scope for code; every approval shows the full request and expires. A person can still approve without reading | Accepted risk | — |
+
+### The RPC interface
+
+| Threat | Mitigation | Status | Evidence |
+| --- | --- | --- | --- |
+| Other local users | Socket in a `0700` directory and `0600` itself, peer UID check; named pipe with an explicit DACL for the current user only, remote clients rejected | Implemented | `the_rpc_socket_is_private_to_the_user`; `the_worker_cannot_open_an_owner_only_pipe` (Windows) |
+| Network exposure | No TCP listener exists | Implemented | Architecture |
+| Endpoint squatting | Unix: refuse a directory others can enter, refuse to start if another Core answers on the socket. Windows: first-instance flag, start fails if the name is taken | Implemented | `the_rpc_socket_is_private_to_the_user`; `a_second_core_cannot_use_the_same_database` |
+| Malformed or oversized requests | Strict decoding, 16 KiB limit (connection closed when exceeded), version check | Implemented | `the_rpc_interface_is_strict_and_bounded`; RPC decoding tests and fixtures |
+| Resource exhaustion by clients | At most 16 connections, idle timeout, long polls capped at 60 s, write timeout | Implemented | `the_rpc_interface_is_strict_and_bounded` |
+| Remote shutdown by any client | `shutdown` is refused unless the configuration allows it | Implemented | `shutdown_over_rpc_can_be_disabled` |
+
+### Supervision and durability
+
+| Threat | Mitigation | Status | Evidence |
+| --- | --- | --- | --- |
+| Worker crash or hang | Exit detected and recorded; pending approvals expired; job marked interrupted; handshake and job timeouts kill a stuck worker | Implemented | `a_crashing_worker_is_restarted_until_the_budget_is_spent`; `a_silent_worker_is_killed_at_the_handshake_timeout`; `a_job_that_runs_too_long_ends_the_session`; `a_worker_that_dies_while_waiting_for_approval_leaves_nothing_usable` |
+| Restart loops | Exponential backoff and a restart budget per time window; after that the Core reports itself unhealthy and refuses jobs | Implemented | `RestartPolicy` unit tests; `a_crashing_worker_is_restarted_until_the_budget_is_spent` |
+| Worker outliving the Core | Job object kill-on-close (Windows), `PR_SET_PDEATHSIG` (Linux) | Implemented | `the_worker_dies_with_the_core` |
+| Core crash mid-task | WAL with `synchronous=FULL`; start-up recovery closes tasks, approvals and jobs left open | Implemented | `recovery_marks_unfinished_tasks`; `start_up_recovers_what_a_previous_run_left_open` |
+| Two Cores on one database | Exclusive lock file | Implemented | `second_core_cannot_open_same_database`; `a_second_core_cannot_use_the_same_database` |
+| Audit tampering by Core bugs | Append-only triggers with `recursive_triggers` on; immutable terminal rows | Implemented | `audit_log_is_append_only`; trigger tests |
+| Audit tampering with file access | Not addressed. Anyone with write access to the database file can rewrite it | Planned | — |
+| Log or terminal injection | Worker and client text is escaped before it reaches the wire, the audit log, the logs or the CLI | Implemented | `worker_text_in_errors_is_escaped`; `error_messages_are_sanitised` |
+| Credential leakage to the worker | Cleared environment with no config option to add variables; no inherited descriptors | Implemented (descriptors: Linux test) | `the_worker_environment_is_cleared` |
+
+## Durability semantics
+
+The Core guarantees that **authority is used at most once**: an approval is consumed in the same transaction that starts execution, and can never be consumed again. It does **not** guarantee that a side effect happens exactly once. If the Core dies after that transaction and before the result is recorded, the write may or may not have happened; the task is marked `interrupted` and the approval stays consumed. A person decides whether to ask again.
 
 ## Known gaps
 
-These are stated so that nobody mistakes the Phase 1 controls for more than they are.
-
-- **The worker is not sandboxed by the OS.** It is an ordinary process with the user's privileges. The policy cannot be bypassed through the protocol, but compromised worker code could call OS APIs directly. Today the mitigation is that the worker code is fixed and never executes model output. OS containment is planned: Job Objects and restricted tokens on Windows, namespaces, Landlock or seccomp on Linux.
-- **A local attacker running as the same user** can edit the config, the policy and the database. JARVIS does not defend against that account.
-- **Fixture reads have a time-of-check to time-of-use window** between canonicalisation and open. The fixture root is controlled by the user, so this is accepted for Phase 1. Reads of user data will need handle-based checks.
-- **A hard link inside the fixture directory** to a file elsewhere is read like any other fixture; canonicalisation cannot tell it apart. Again, the fixture directory is the user's to populate.
+- **The worker is contained, not sandboxed.** On both platforms it can read any file the user can read and open network connections. On Linux it can also write the user's files and start processes. A separate account, AppContainer, or namespaces with Landlock and seccomp are the next step (ADR 0012).
+- **The Linux worker check relies on ancestry.** A worker process that leaves its process group *and* is re-parented away from the worker (by double forking) is indistinguishable from any other process of the user, and can use the RPC interface, including to approve requests.
+- **Processes the Linux worker starts and detaches can survive it.** Killing the process group does not reach a process that left the group.
+- **A local attacker running as the same user** can edit the config, the policy and the database, and can approve requests. JARVIS does not defend against that account.
+- **Some Windows controls are verified only on a real desktop:** UI restrictions, the low-integrity token against the user's profile, and handle inheritance. See [`windows-validation.md`](windows-validation.md).
+- **Fixture reads have a time-of-check to time-of-use window** between canonicalisation and open; the fixture root is the user's to populate. Writes do not have this problem.
 - **Dependencies are pinned by lockfiles** but not yet audited in CI.
-- **No authentication on the stdio channel.** None is needed while the pipe is private to the parent and child. Any future socket or remote endpoint needs authentication before it ships.
 
 ## When to revisit this document
 
 - Before adding any tool or capability.
 - Before integrating a model, a speech pipeline or any remote access.
-- Before adding a second worker or any IPC endpoint other than the worker pipe.
+- Before adding a second worker, a dashboard or any other client of the RPC interface.

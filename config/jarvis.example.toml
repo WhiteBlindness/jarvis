@@ -6,15 +6,22 @@ database = "../var/jarvis.db"
 [worker]
 # Started directly, never through a shell, with an empty environment apart
 # from PATH and SYSTEMROOT; there is no option to add variables back.
-# On Windows the interpreter is usually "python".
+# On Windows use the real interpreter ("python", or its full path), not the
+# "py" launcher: the worker may not start child processes there.
 program = "python3"
-args = ["-m", "jarvis_worker", "--goal", "describe the runtime, then read welcome.txt"]
+args = ["-m", "jarvis_worker"]
 cwd = "../services/intelligence-python/src"
 handshake_timeout_ms = 5000
+memory_limit_mb = 512
 
 [fixtures]
 # The only directory filesystem.read_fixture can read from.
 root = "../tests/fixtures/files"
+max_bytes = 16384
+
+[workspace]
+# The only directory workspace.write_file can write into. Created if missing.
+root = "../var/workspace"
 max_bytes = 16384
 
 [limits]
@@ -25,8 +32,32 @@ max_requests_per_session = 1000
 max_protocol_errors = 16
 shutdown_grace_ms = 2000
 
+[approvals]
+# How long a person has to decide on a request before it expires.
+ttl_ms = 300000
+
+[supervisor]
+# At most `restart_budget` worker restarts within `restart_window_ms`; after
+# that the Core stops restarting the worker and reports itself unhealthy.
+restart_budget = 5
+restart_window_ms = 300000
+backoff_initial_ms = 500
+backoff_max_ms = 30000
+# Longest a job may run, including time spent waiting for approvals.
+job_timeout_ms = 600000
+
+[rpc]
+# Unix: a socket in a directory only this user can enter (created with mode
+# 0700). Windows: a named pipe that refuses remote clients.
+socket = "../var/rpc/jarvis.sock"
+pipe = "jarvis"
+# Lets `jarvis-core shutdown` stop the Core. Off by default.
+allow_shutdown = true
+
 # Capabilities not listed here are denied.
 # Decisions: "allow", "require_confirmation", "deny".
+# Class B capabilities (workspace.write) cannot be set to "allow".
 [policy]
 "system.info" = "allow"
 "filesystem.read.fixture" = "allow"
+"workspace.write" = "require_confirmation"
