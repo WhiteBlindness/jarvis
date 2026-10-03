@@ -42,9 +42,6 @@ pub struct WorkerConfig {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
-    /// Extra environment variables. The worker otherwise starts with an
-    /// empty environment apart from `PATH` and `SYSTEMROOT`.
-    pub env: BTreeMap<String, String>,
     pub handshake_timeout: Duration,
 }
 
@@ -58,6 +55,9 @@ pub struct FixturesConfig {
 pub struct Limits {
     pub max_frame_bytes: usize,
     pub tool_timeout: Duration,
+    /// How long a write to the worker may block. A worker that stops
+    /// reading its input must not stall the Core.
+    pub write_timeout: Duration,
     pub max_requests_per_session: u32,
     pub max_protocol_errors: u32,
     pub shutdown_grace: Duration,
@@ -78,6 +78,7 @@ impl Default for Limits {
         Self {
             max_frame_bytes: 64 * 1024,
             tool_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
             max_requests_per_session: 1000,
             max_protocol_errors: 16,
             shutdown_grace: Duration::from_secs(2),
@@ -103,8 +104,6 @@ struct RawWorker {
     #[serde(default)]
     args: Vec<String>,
     cwd: Option<PathBuf>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
     #[serde(default = "default_handshake_timeout_ms")]
     handshake_timeout_ms: u64,
 }
@@ -130,6 +129,7 @@ fn default_fixture_max_bytes() -> u64 {
 struct RawLimits {
     max_frame_bytes: Option<usize>,
     tool_timeout_ms: Option<u64>,
+    write_timeout_ms: Option<u64>,
     max_requests_per_session: Option<u32>,
     max_protocol_errors: Option<u32>,
     shutdown_grace_ms: Option<u64>,
@@ -174,6 +174,14 @@ impl Config {
                 1,
                 600_000,
             )?),
+            write_timeout: Duration::from_millis(within(
+                "limits.write_timeout_ms",
+                raw.limits
+                    .write_timeout_ms
+                    .unwrap_or(millis(defaults.write_timeout)),
+                1,
+                60_000,
+            )?),
             max_requests_per_session: within(
                 "limits.max_requests_per_session",
                 raw.limits
@@ -209,7 +217,6 @@ impl Config {
             program: raw.worker.program,
             args: raw.worker.args,
             cwd: raw.worker.cwd.map(resolve),
-            env: raw.worker.env,
             handshake_timeout: Duration::from_millis(within(
                 "worker.handshake_timeout_ms",
                 raw.worker.handshake_timeout_ms,

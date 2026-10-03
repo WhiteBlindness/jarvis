@@ -128,10 +128,15 @@ fn run(config_path: &std::path::Path) -> anyhow::Result<bool> {
     })
 }
 
+/// The first signal starts a graceful shutdown. Every step of it is bounded,
+/// but a second signal exits at once for an operator who will not wait.
 async fn cancel_on_signal(shutdown: CancellationToken) {
     wait_for_signal().await;
-    tracing::info!("shutdown requested");
+    tracing::info!("shutdown requested; send the signal again to exit immediately");
     shutdown.cancel();
+    wait_for_signal().await;
+    tracing::warn!("second signal: exiting without a clean shutdown");
+    std::process::exit(130);
 }
 
 #[cfg(unix)]

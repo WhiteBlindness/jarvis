@@ -27,7 +27,6 @@ pub struct Policy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evaluation {
     pub decision: PolicyDecision,
-    pub capabilities: Vec<Capability>,
     pub reason: String,
 }
 
@@ -70,11 +69,7 @@ impl Policy {
                 format!("policy denies capability {capability}"),
             ),
         };
-        Evaluation {
-            decision,
-            capabilities: capabilities.to_vec(),
-            reason,
-        }
+        Evaluation { decision, reason }
     }
 }
 

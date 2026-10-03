@@ -42,8 +42,6 @@ pub enum CoreError {
 
 #[derive(Debug)]
 pub struct RunReport {
-    /// Tasks closed during startup recovery.
-    pub recovered: u32,
     pub session: SessionReport,
     pub worker: WorkerExit,
 }
@@ -124,28 +122,14 @@ pub async fn run_with_executor(
 
     // The session owns the worker's stdin and drops it when it ends, which
     // tells the worker to exit.
-    let session = run_session(&ctx, stdout, stdin, &shutdown).await;
-
-    let (exit, kill_reason) = match &session {
-        Ok(report) if report.end == SessionEnd::HandshakeTimeout => {
-            (worker.kill().await, Some("handshake timeout".to_owned()))
-        }
-        Ok(_) => {
-            let exit = worker.stop(config.limits.shutdown_grace).await;
-            let reason = format!(
-                "did not exit within {} ms after the session closed",
-                config.limits.shutdown_grace.as_millis()
-            );
-            (exit, Some(reason))
-        }
-        Err(_) => (worker.kill().await, Some("Core error".to_owned())),
-    };
-    let exit = exit.map_err(CoreError::Worker)?;
-
-    let session = match session {
+    let session = match run_session(&ctx, stdout, stdin, &shutdown).await {
         Ok(report) => report,
         Err(error) => {
-            // The store may be the thing that failed; try to leave a trace.
+            // The store may be what failed, so every write below is best
+            // effort, and the original error is what the caller sees.
+            if let Err(kill) = worker.kill().await {
+                tracing::error!(error = %kill, "could not kill the worker");
+            }
             let reason = format!("stopped after an internal error: {error}");
             if let Err(audit) = record(&store, AuditEventKind::CoreStopped { reason }).await {
                 tracing::error!(error = %audit, "could not record core_stopped");
@@ -154,10 +138,26 @@ pub async fn run_with_executor(
         }
     };
 
+    let (exit, kill_reason) = if session.end == SessionEnd::HandshakeTimeout {
+        (worker.kill().await, "handshake timeout".to_owned())
+    } else {
+        let reason = format!(
+            "did not exit within {} ms after the session closed",
+            config.limits.shutdown_grace.as_millis()
+        );
+        (worker.stop(config.limits.shutdown_grace).await, reason)
+    };
+    let exit = exit.map_err(CoreError::Worker)?;
+
     if exit.killed {
-        let reason = kill_reason.unwrap_or_default();
-        tracing::warn!(reason, "worker killed");
-        record(&store, AuditEventKind::WorkerKilled { reason }).await?;
+        tracing::warn!(reason = kill_reason, "worker killed");
+        record(
+            &store,
+            AuditEventKind::WorkerKilled {
+                reason: kill_reason,
+            },
+        )
+        .await?;
     }
     record(
         &store,
@@ -177,7 +177,6 @@ pub async fn run_with_executor(
     tracing::info!("core stopped");
 
     Ok(RunReport {
-        recovered,
         session,
         worker: exit,
     })

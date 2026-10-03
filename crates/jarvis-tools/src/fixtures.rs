@@ -30,10 +30,6 @@ impl FixtureRoot {
         Ok(Self { root, max_bytes })
     }
 
-    pub fn max_bytes(&self) -> u64 {
-        self.max_bytes
-    }
-
     /// Read a fixture on Tokio's blocking pool, so filesystem latency never
     /// stalls the async runtime.
     pub async fn read(&self, path: &FixturePath) -> Result<FixtureContent, ToolError> {

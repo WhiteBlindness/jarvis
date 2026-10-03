@@ -109,9 +109,26 @@ where
         requests: 0,
         errors: 0,
     };
-    let end = match session.handshake(shutdown).await? {
-        Some(end) => end,
-        None => session.serve(shutdown).await?,
+    let result = async {
+        match session.handshake(shutdown).await? {
+            Some(end) => Ok(end),
+            None => session.serve(shutdown).await,
+        }
+    }
+    .await;
+    let end = match result {
+        Ok(end) => end,
+        Err(error) => {
+            // Tell the worker why the session is ending; the details stay in
+            // the Core's log.
+            let internal = CoreMessage::Error(ErrorMessage {
+                request_id: None,
+                error: WireError::new(ErrorCode::Internal, "the Core cannot continue safely"),
+                fatal: true,
+            });
+            let _ = session.send(&internal).await;
+            return Err(error);
+        }
     };
     session.close(&end).await?;
     Ok(SessionReport {
@@ -493,15 +510,24 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         Ok(())
     }
 
+    /// Write one frame. A worker that stops reading would otherwise block
+    /// this write forever once the pipe fills, so the write is bounded by
+    /// `write_timeout`; running out of time ends the session.
     async fn send(&mut self, message: &CoreMessage) -> Result<Step, SessionError> {
         let mut bytes = encode_core_message(message)?;
         bytes.push(b'\n');
-        let written = async {
+        let write = async {
             self.writer.write_all(&bytes).await?;
             self.writer.flush().await
+        };
+        match tokio::time::timeout(self.ctx.limits.write_timeout, write).await {
+            Ok(Ok(())) => Ok(None),
+            Ok(Err(_)) => Ok(Some(SessionEnd::WorkerGone)),
+            Err(_) => {
+                tracing::warn!(session = %self.id, "worker stopped reading; closing the session");
+                Ok(Some(SessionEnd::WorkerGone))
+            }
         }
-        .await;
-        Ok(written.err().map(|_| SessionEnd::WorkerGone))
     }
 
     async fn audit(

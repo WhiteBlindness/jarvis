@@ -15,7 +15,6 @@ use std::time::Instant;
 use jarvis_protocol::{ToolCall, ToolResult};
 
 pub use fixtures::FixtureRoot;
-pub use system_info::collect as system_info;
 
 /// Why a tool could not produce a result. Messages never contain absolute
 /// paths or other details of the host beyond what the caller sent.

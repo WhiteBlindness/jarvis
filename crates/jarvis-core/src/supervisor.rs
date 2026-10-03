@@ -1,7 +1,8 @@
 //! Starting, watching and stopping the worker process.
 //!
 //! The worker is started directly (no shell) with a cleared environment, so
-//! secrets in the Core's environment are not inherited. Its stdin and stdout
+//! secrets in the Core's environment are not inherited. There is no way to
+//! add variables back from the config. Its stdin and stdout
 //! carry the protocol; its stderr is forwarded to the Core's log, one escaped
 //! and length-limited line at a time.
 
@@ -51,7 +52,6 @@ pub fn spawn(config: &WorkerConfig) -> io::Result<(Worker, ChildStdin, ChildStdo
             command.env(key, value);
         }
     }
-    command.envs(&config.env);
     if let Some(cwd) = &config.cwd {
         command.current_dir(cwd);
     }

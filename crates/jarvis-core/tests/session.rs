@@ -44,6 +44,8 @@ struct Options {
     limits: Limits,
     hang: bool,
     handshake_timeout: Duration,
+    /// Capacity of the pipe from the Core to the worker.
+    reply_buffer: usize,
 }
 
 impl Default for Options {
@@ -59,6 +61,7 @@ impl Default for Options {
             },
             hang: false,
             handshake_timeout: Duration::from_secs(10),
+            reply_buffer: 1 << 20,
         }
     }
 }
@@ -103,7 +106,7 @@ impl Harness {
         };
 
         let (to_core, core_reader) = tokio::io::duplex(1 << 20);
-        let (core_writer, from_core) = tokio::io::duplex(1 << 20);
+        let (core_writer, from_core) = tokio::io::duplex(options.reply_buffer);
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
         let session =
@@ -704,6 +707,8 @@ async fn no_audit_means_no_action() {
         "tool": "system.info", "args": {}
     }))
     .await;
+    // The worker is told the Core cannot continue, without the details.
+    h.expect_error(ErrorCode::Internal, true).await;
     h.to_core.take();
     let result = tokio::time::timeout(Duration::from_secs(10), h.session)
         .await
@@ -763,5 +768,84 @@ async fn every_task_reaches_exactly_one_terminal_state() {
             })
             .count();
         assert_eq!(finals, 1, "task {} ({:?})", task.task_id, task.status);
+    }
+}
+
+/// A worker that stops reading must not stall the Core: once the pipe is
+/// full, the write times out and the session ends.
+#[tokio::test]
+async fn worker_that_stops_reading_cannot_stall_the_core() {
+    let mut h = Harness::start(Options {
+        reply_buffer: 1024,
+        limits: Limits {
+            write_timeout: Duration::from_millis(200),
+            ..Limits::default()
+        },
+        ..Options::default()
+    });
+    h.hello().await;
+    for i in 0..50 {
+        h.send(json!({
+            "protocol": 1, "type": "tool_request", "request_id": format!("r{i}"),
+            "tool": "system.info", "args": {}
+        }))
+        .await;
+    }
+    // Never read the replies. The session must end on its own.
+    let session = h.session;
+    let report = tokio::time::timeout(Duration::from_secs(10), session)
+        .await
+        .expect("the Core stalled on a worker that does not read")
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.end, SessionEnd::WorkerGone);
+    assert!(report.requests < 50);
+    for task in h.store.tasks(100).unwrap() {
+        assert!(task.status.is_terminal(), "{:?}", task.status);
+    }
+}
+
+/// Worker-supplied text (here an unknown field name) is quoted in error
+/// messages; control characters in it must not reach logs, the audit log or
+/// the CLI unescaped.
+#[tokio::test]
+async fn worker_text_in_errors_is_escaped() {
+    let mut h = Harness::start(Options::default());
+    h.hello().await;
+    let hostile = "\u{1b}[31mX\nINFO forged line\u{7}";
+
+    let outcome = h.request("r1", "system.info", json!({ hostile: 1 })).await;
+    let ToolOutcome::Rejected { error } = outcome else {
+        panic!("expected rejection");
+    };
+    assert!(
+        !error.message.chars().any(char::is_control),
+        "{}",
+        error.message
+    );
+    let stored = h.store.tasks(1).unwrap().remove(0).error.unwrap();
+    assert!(
+        !stored.message.chars().any(char::is_control),
+        "{}",
+        stored.message
+    );
+
+    let mut frame = json!({"protocol": 1, "type": "tool_request", "request_id": "r2",
+        "tool": "system.info", "args": {}});
+    frame[hostile] = json!(1);
+    h.send(frame).await;
+    h.expect_error(ErrorCode::MalformedFrame, false).await;
+
+    let (_, store, _) = h.finish().await;
+    for event in store.audit_events(None, 1000).unwrap() {
+        if let AuditEventKind::FrameRejected { error, .. }
+        | AuditEventKind::RequestRejected { error } = &event.event
+        {
+            assert!(
+                !error.message.chars().any(char::is_control),
+                "{}",
+                error.message
+            );
+        }
     }
 }
