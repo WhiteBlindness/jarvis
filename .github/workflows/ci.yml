@@ -43,6 +43,16 @@ jobs:
         env:
           JARVIS_TEST_PYTHON: python
 
+  msrv:
+    name: Minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Keep in step with `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
+
   python:
     name: Python worker
     runs-on: ubuntu-latest

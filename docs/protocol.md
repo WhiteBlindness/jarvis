@@ -8,6 +8,7 @@ This is the wire contract between the Rust Core and a worker process. The Rust t
 - Each frame is one JSON object encoded as UTF-8, followed by `\n`. A trailing `\r` before the newline is tolerated.
 - The Core enforces a maximum frame size (64 KiB by default, announced in `welcome`). It stops buffering an oversized frame as soon as it passes the limit, discards the rest of the line, and replies with `frame_too_large`.
 - Requests are handled one at a time, in order. A worker may write several requests without waiting, but each reply arrives only after the previous request has finished.
+- A worker must keep reading its stdin. If a reply cannot be written within the Core's write timeout (5 s by default), the Core ends the session.
 
 ## Versioning
 
@@ -15,7 +16,9 @@ Every frame carries `"protocol": 1`. The Core checks the version before the sche
 
 ## Strictness
 
-Both sides reject unknown message types, unknown fields, missing fields and values of the wrong type. A frame is never partly accepted.
+Both sides reject unknown message types, unknown fields, missing fields and values of the wrong type. A frame is never partly accepted. Fields whose value may be `null`, such as `request_id` in `error`, must still be present.
+
+Duplicate keys inside one object are not rejected: as in most JSON parsers, the last value wins. Identifiers that must be UUIDs use the hyphenated form only.
 
 ## Session
 
@@ -29,7 +32,7 @@ worker                                   core
   | (close stdout or exit)                 |   session closed, worker reaped
 ```
 
-The first frame must be `hello`. Anything else before it gets a fatal `handshake_required` error. A worker that does not send `hello` within the handshake timeout is killed. The Core ends the session by closing the worker's stdin; the worker should then exit.
+The first frame must be `hello`. Before it, every error is fatal: a `tool_request` gets `handshake_required`, and a malformed, oversized or other-version frame gets its own code with `fatal: true`. A worker that does not send `hello` within the handshake timeout is killed. The Core ends the session by closing the worker's stdin; the worker should then exit.
 
 ## Worker messages
 
@@ -71,7 +74,7 @@ There is no field for capabilities, approvals, task IDs or policy. Adding one ma
 
 ### `tool_response`
 
-Sent for every well-formed `tool_request`. `task_id` is the durable task the Core created for it.
+Sent for every `tool_request` that becomes a task: one that decodes, arrives after the handshake, is within the request cap and does not reuse a `request_id`. `task_id` is the durable task the Core created for it.
 
 ```json
 {"protocol": 1, "type": "tool_response", "request_id": "req-0001",
@@ -100,8 +103,8 @@ Sent for frames that did not create a task. `request_id` is filled in when the f
 
 | Code | Reply | Fatal |
 | --- | --- | --- |
-| `malformed_frame` | `error` | No, until the session's error budget is spent |
-| `frame_too_large` | `error` | No, until the error budget is spent |
+| `malformed_frame` | `error` | Before the handshake; afterwards once the error budget is spent |
+| `frame_too_large` | `error` | Before the handshake; afterwards once the error budget is spent |
 | `unsupported_protocol_version` | `error` | Yes |
 | `handshake_required` | `error` | Yes |
 | `unexpected_message` | `error` | No, until the error budget is spent |

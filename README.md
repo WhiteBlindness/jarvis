@@ -16,7 +16,7 @@ JARVIS starts from the opposite end: the model never gets operating system acces
 - **Decide, record, then act.** The policy decision and `execution_started` are committed to SQLite before a tool runs. If that write fails, nothing runs. A test injects that failure to prove it.
 - **Integrity in the schema, not only in code.** Triggers make the audit log append-only and terminal tasks immutable. A task transition and its audit events commit in one transaction.
 - **An untrusted worker by design.** The Python worker talks over a strict, versioned, line-delimited JSON protocol on its own stdin and stdout. Unknown fields such as `"approved": true` are rejected rather than ignored. Contract fixtures are checked by both the Rust and the Python test suites.
-- **Supervision and limits.** No shell, a cleared environment, a handshake timeout, a per-tool timeout with real cancellation, contained panics, a frame-size limit enforced while reading, a request cap, an error budget, and a kill after the shutdown grace period.
+- **Supervision and limits.** No shell, a cleared environment, a handshake timeout, a per-tool timeout that aborts the tool's task, contained panics, a frame-size limit enforced while reading, a write timeout for a worker that stops reading, a request cap, an error budget, and a kill after the shutdown grace period.
 - **Crash recovery.** WAL with `synchronous=FULL`, an exclusive lock file, and start-up recovery that marks tasks left open by a crash as `interrupted`.
 - **Adversarial tests.** A hostile worker process tries smuggled approvals, path traversal, invented tools and replays against the real binary, and must see every attempt refused.
 

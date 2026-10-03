@@ -57,7 +57,7 @@ Every request follows one path. The step that records the decision comes before 
 | 9. Execute under timeout and cancellation | `gateway` | Task `timed_out`, `cancelled` or `failed` |
 | 10. Verify the result | `gateway` | Task `failed` with `result_rejected` |
 | 11. Record the outcome and `execution_finished` | `store`, one transaction | Store error stops the Core |
-| 12. Send `tool_response` | `session` | Worker gone: session ends |
+| 12. Send `tool_response` | `session` | Worker gone, or not reading within the write timeout: session ends |
 
 ## Task state machine
 
@@ -78,7 +78,7 @@ The store checks the expected source state of every transition, inside the same 
 ## Process model
 
 - `jarvis-core run` starts one supervised worker session and exits when it ends. A long-lived daemon with an RPC endpoint for a dashboard is planned, not built.
-- The worker is started directly from the config's program and argument list, with no shell. Its environment is cleared apart from `PATH` and `SYSTEMROOT`, plus any variables the config names explicitly.
+- The worker is started directly from the config's program and argument list, with no shell. Its environment is cleared apart from `PATH` and `SYSTEMROOT`, and the config has no way to add variables back.
 - The worker's stdout carries protocol frames, its stdin carries replies, and its stderr is forwarded to the Core's log as escaped, length-limited lines.
 - A worker that does not complete the handshake in time is killed. At the end of a session the Core closes the worker's stdin, waits for the configured grace period, and then kills it if it is still running. The exit status is recorded either way.
 - On `SIGINT` or `SIGTERM` (Ctrl+C on Windows) the Core cancels the running tool, records it as `cancelled`, ends the session and goes through the same stop sequence.
@@ -93,7 +93,8 @@ The Core runs on Tokio. A session handles one request at a time, which keeps ord
 - A task's state change and its audit events commit in one transaction.
 - On start-up, tasks left in `received` or `executing` become `interrupted`, and tasks left in `awaiting_confirmation` become `expired`. Each gets a `task_recovered` event.
 - A lock file next to the database stops a second Core from opening it, so recovery never closes another live Core's tasks. `jarvis-core tasks` and `jarvis-core audit` open the database read-only and do not need the lock.
-- Migrations are embedded SQL files applied in order and recorded in `schema_migrations`. A database from a newer Core is refused.
+- `recursive_triggers` is on, so `INSERT OR REPLACE` fires the delete triggers and cannot rewrite audit events or terminal tasks.
+- Migrations are embedded SQL files applied in order and recorded in `schema_migrations`. A database from a newer Core is refused, and so is a SQLite file that already holds other tables.
 
 ## Observability
 

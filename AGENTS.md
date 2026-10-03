@@ -45,7 +45,7 @@ Do not weaken these without an ADR in `docs/decisions/` and an update to the thr
 5. Decide, record, then act: the decision and `execution_started` are committed before a tool runs.
 6. A task transition and its audit events commit in one transaction. Audit events are append-only; terminal tasks are immutable.
 7. Decoding is strict on both sides: unknown fields, unknown types and other protocol versions are rejected.
-8. Every input from the worker is bounded: frame size, request count, error count, tool time, result size.
+8. Everything the worker can influence is bounded: frame size, request count, error count, tool time, result size, and how long a write to the worker may block.
 9. The worker starts with a cleared environment and is never started through a shell.
 10. The worker package never performs privileged operations itself (`tests/test_boundaries.py` guards this).
 
