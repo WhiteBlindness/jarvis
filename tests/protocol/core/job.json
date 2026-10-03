@@ -1,0 +1,6 @@
+{
+  "protocol": 2,
+  "type": "job",
+  "job_id": "01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b",
+  "goal": "describe the runtime, then read welcome.txt"
+}

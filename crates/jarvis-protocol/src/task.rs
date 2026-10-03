@@ -29,13 +29,18 @@ impl fmt::Display for PolicyDecision {
     }
 }
 
-/// Lifecycle of a durable task. Every well-formed tool request creates one
-/// task, and every task ends in exactly one terminal state.
+/// Lifecycle of a durable task. Every tool request that passes decoding, the
+/// handshake, the request cap and the replay check creates one task, and
+/// every task ends in exactly one terminal state.
 ///
 /// ```text
-/// received ──► rejected | denied | awaiting_confirmation ──► expired
+/// received ──► rejected | denied
 ///     │
-///     └──► executing ──► completed | failed | timed_out | cancelled
+///     ├──► awaiting_confirmation ──► denied | expired     (person declined / no decision)
+///     │            │
+///     │            └── approval consumed ──┐
+///     ▼                                    ▼
+///     └──────────────────────────────► executing ──► completed | failed | timed_out | cancelled
 ///
 /// received | executing ──► interrupted     (found open at start-up)
 /// ```
@@ -154,5 +159,155 @@ mod tests {
                 &TaskStatus::AwaitingConfirmation
             ]
         );
+    }
+}
+
+/// Lifecycle of a job: one goal submitted by a local client and worked on by
+/// the worker.
+///
+/// ```text
+/// queued ──► running ──► completed | failed | interrupted
+///    │
+///    └──► cancelled      (the Core stopped before the job started)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl JobStatus {
+    pub const ALL: &'static [JobStatus] = &[
+        Self::Queued,
+        Self::Running,
+        Self::Completed,
+        Self::Failed,
+        Self::Cancelled,
+        Self::Interrupted,
+    ];
+
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Queued | Self::Running)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for JobStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|status| status.as_str() == value)
+            .ok_or_else(|| format!("unknown job status `{value}`"))
+    }
+}
+
+/// Lifecycle of an approval request. Only `granted` can become `consumed`,
+/// exactly once, and only by the Core immediately before execution.
+///
+/// ```text
+/// pending ──► granted ──► consumed
+///    │           │
+///    │           └──► expired
+///    └──► denied | expired
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    Pending,
+    Granted,
+    Denied,
+    Expired,
+    Consumed,
+}
+
+impl ApprovalStatus {
+    pub const ALL: &'static [ApprovalStatus] = &[
+        Self::Pending,
+        Self::Granted,
+        Self::Denied,
+        Self::Expired,
+        Self::Consumed,
+    ];
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Denied | Self::Expired | Self::Consumed)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Granted => "granted",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::Consumed => "consumed",
+        }
+    }
+}
+
+impl fmt::Display for ApprovalStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ApprovalStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|status| status.as_str() == value)
+            .ok_or_else(|| format!("unknown approval status `{value}`"))
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn job_and_approval_statuses_round_trip() {
+        for status in JobStatus::ALL {
+            assert_eq!(status.as_str().parse::<JobStatus>().unwrap(), *status);
+            assert_eq!(
+                serde_json::to_string(status).unwrap(),
+                format!("\"{}\"", status.as_str())
+            );
+        }
+        for status in ApprovalStatus::ALL {
+            assert_eq!(status.as_str().parse::<ApprovalStatus>().unwrap(), *status);
+            assert_eq!(
+                serde_json::to_string(status).unwrap(),
+                format!("\"{}\"", status.as_str())
+            );
+        }
+        assert!(!ApprovalStatus::Granted.is_terminal());
+        assert!(ApprovalStatus::Consumed.is_terminal());
+        assert!(!JobStatus::Running.is_terminal());
     }
 }

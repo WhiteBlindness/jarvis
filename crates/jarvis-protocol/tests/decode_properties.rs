@@ -2,16 +2,22 @@
 //! from an untrusted worker.
 
 use jarvis_protocol::{
-    ErrorCode, Hello, Label, RequestId, ToolName, ToolRequest, WorkerMessage,
-    decode_worker_message, encode_worker_message,
+    ErrorCode, Hello, JobId, Label, RequestId, ToolName, ToolRequest, WorkerMessage,
+    decode_rpc_request, decode_worker_message, encode_worker_message,
 };
 use proptest::prelude::*;
 
 proptest! {
-    /// Arbitrary bytes never panic the decoder and always produce either a
+    /// Arbitrary bytes never panic the decoders and always produce either a
     /// message or a classified error.
     #[test]
     fn decode_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+        if let Err(error) = decode_rpc_request(&bytes) {
+            prop_assert!(matches!(
+                error.code(),
+                ErrorCode::MalformedFrame | ErrorCode::UnsupportedProtocolVersion
+            ));
+        }
         if let Err(error) = decode_worker_message(&bytes) {
             prop_assert!(matches!(
                 error.code(),
@@ -27,7 +33,7 @@ proptest! {
         fields in proptest::collection::btree_map("[a-z_]{1,12}", any_json(), 0..6),
     ) {
         let mut object = serde_json::Map::new();
-        object.insert("protocol".into(), 1.into());
+        object.insert("protocol".into(), 2.into());
         object.extend(fields);
         let bytes = serde_json::to_vec(&object).unwrap();
         if let Ok(message) = decode_worker_message(&bytes) {
@@ -46,6 +52,7 @@ proptest! {
     ) {
         let message = WorkerMessage::ToolRequest(ToolRequest {
             request_id: RequestId::try_from(id).unwrap(),
+            job_id: JobId::new(),
             tool: ToolName::try_from(tool).unwrap(),
             args: serde_json::json!({ key: number }),
         });

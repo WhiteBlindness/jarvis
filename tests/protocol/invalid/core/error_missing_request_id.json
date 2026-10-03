@@ -1,4 +1,4 @@
 {
-  "frame": "{\"protocol\":1,\"type\":\"error\",\"error\":{\"code\":\"internal\",\"message\":\"x\"},\"fatal\":true}",
+  "frame": "{\"protocol\":2,\"type\":\"error\",\"error\":{\"code\":\"internal\",\"message\":\"x\"},\"fatal\":true}",
   "error": "malformed_frame"
 }

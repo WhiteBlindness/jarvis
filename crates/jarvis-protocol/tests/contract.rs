@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use jarvis_protocol::{
-    DecodeError, decode_core_message, decode_worker_message, encode_core_message,
+    DecodeError, decode_core_message, decode_rpc_request, decode_rpc_response,
+    decode_worker_message, encode_core_message, encode_rpc_request, encode_rpc_response,
     encode_worker_message,
 };
 use serde_json::Value;
@@ -52,6 +53,35 @@ fn core_fixtures_decode_and_reencode_identically() {
             serde_json::from_slice(&encode_core_message(&message).unwrap()).unwrap();
         assert_eq!(encoded, value, "{}", path.display());
     }
+}
+
+#[test]
+fn rpc_request_fixtures_decode_and_reencode_identically() {
+    for path in fixtures("rpc/request") {
+        let (value, bytes) = compact(&path);
+        let message = decode_rpc_request(&bytes)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let encoded: Value =
+            serde_json::from_slice(&encode_rpc_request(&message).unwrap()).unwrap();
+        assert_eq!(encoded, value, "{}", path.display());
+    }
+}
+
+#[test]
+fn rpc_response_fixtures_decode_and_reencode_identically() {
+    for path in fixtures("rpc/response") {
+        let (value, bytes) = compact(&path);
+        let message = decode_rpc_response(&bytes)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let encoded: Value =
+            serde_json::from_slice(&encode_rpc_response(&message).unwrap()).unwrap();
+        assert_eq!(encoded, value, "{}", path.display());
+    }
+}
+
+#[test]
+fn invalid_rpc_requests_are_rejected_with_expected_code() {
+    check_invalid("invalid/rpc", |frame| decode_rpc_request(frame).map(|_| ()));
 }
 
 fn check_invalid(subdir: &str, decode: fn(&[u8]) -> Result<(), DecodeError>) {

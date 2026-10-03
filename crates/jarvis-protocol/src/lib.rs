@@ -14,22 +14,30 @@ mod capability;
 mod error;
 mod ids;
 mod message;
+mod rpc;
 mod task;
+mod text;
 mod tools;
 
 pub use audit::{AuditEvent, AuditEventKind};
-pub use capability::{Capability, UnknownCapability};
+pub use capability::{ActionClass, Capability, UnknownCapability};
 pub use error::{ErrorCode, WireError};
-pub use ids::{InvalidId, RequestId, SessionId, TaskId, ToolName};
+pub use ids::{ApprovalId, Fingerprint, InvalidId, JobId, RequestId, SessionId, TaskId, ToolName};
 pub use message::{
-    CoreMessage, DecodeError, ErrorMessage, Hello, Label, SessionLimits, ToolOutcome, ToolRequest,
-    ToolResponse, Welcome, WorkerMessage, decode_core_message, decode_worker_message,
-    encode_core_message, encode_worker_message,
+    CoreMessage, DecodeError, ErrorMessage, Hello, JobAssignment, JobOutcome, JobResult, Label,
+    SessionLimits, ToolOutcome, ToolRequest, ToolResponse, Welcome, WorkerMessage,
+    decode_core_message, decode_worker_message, encode_core_message, encode_worker_message,
 };
-pub use task::{PolicyDecision, TaskStatus};
+pub use rpc::{
+    ApprovalView, HealthReport, JobView, RpcError, RpcErrorCode, RpcRequest, RpcResponse,
+    RpcVersion, WorkerState, WorkerView, decode_rpc_request, decode_rpc_response,
+    encode_rpc_request, encode_rpc_response,
+};
+pub use task::{ApprovalStatus, JobStatus, PolicyDecision, TaskStatus};
+pub use text::{Goal, Summary};
 pub use tools::{
-    CallError, FixtureContent, FixturePath, ReadFixtureArgs, SystemInfo, SystemInfoArgs, ToolCall,
-    ToolResult,
+    CallError, FixtureContent, ReadFixtureArgs, RelativePath, SystemInfo, SystemInfoArgs, ToolCall,
+    ToolResult, WriteFileArgs, WriteOutcome,
 };
 
 /// Version of the wire protocol. Every frame carries it, and the Core accepts
@@ -40,7 +48,7 @@ pub use tools::{
 pub struct ProtocolVersion(pub u32);
 
 impl ProtocolVersion {
-    pub const CURRENT: Self = Self(1);
+    pub const CURRENT: Self = Self(2);
 }
 
 impl std::fmt::Display for ProtocolVersion {

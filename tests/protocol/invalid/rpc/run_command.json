@@ -1,0 +1,4 @@
+{
+  "frame": "{\"rpc\":1,\"type\":\"run_command\",\"command\":\"id\"}",
+  "error": "malformed_frame"
+}

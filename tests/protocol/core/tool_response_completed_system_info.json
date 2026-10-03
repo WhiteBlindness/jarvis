@@ -1,5 +1,5 @@
 {
-  "protocol": 1,
+  "protocol": 2,
   "type": "tool_response",
   "request_id": "req-0001",
   "task_id": "01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c",
@@ -10,8 +10,8 @@
       "os_family": "unix",
       "arch": "x86_64",
       "logical_cpus": 8,
-      "core_version": "0.1.0",
-      "protocol_version": 1,
+      "core_version": "0.2.0",
+      "protocol_version": 2,
       "core_uptime_ms": 42
     }
   }

@@ -1,0 +1,4 @@
+{
+  "frame": "{\"rpc\":1,\"type\":\"submit_job\",\"goal\":\"x\\n\\u001b[2J\"}",
+  "error": "malformed_frame"
+}

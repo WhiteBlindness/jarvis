@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::message::Label;
 use crate::{
-    Capability, PolicyDecision, ProtocolVersion, RequestId, SessionId, TaskId, TaskStatus,
-    ToolName, WireError,
+    ApprovalId, Capability, Fingerprint, JobId, JobStatus, PolicyDecision, ProtocolVersion,
+    RequestId, SessionId, TaskId, TaskStatus, ToolName, WireError,
 };
 
 /// One entry of the append-only audit log.
@@ -84,6 +84,60 @@ pub enum AuditEventKind {
     TaskExpired {
         reason: String,
     },
+    /// The worker exited unexpectedly and will be started again.
+    WorkerRestartScheduled {
+        attempt: u32,
+        delay_ms: u64,
+    },
+    /// The worker failed too often; the Core stops restarting it.
+    WorkerRestartAbandoned {
+        restarts: u32,
+        window_ms: u64,
+    },
+    /// A local client asked for a job. The goal itself is kept in the jobs
+    /// table, not repeated here.
+    JobSubmitted {
+        job_id: JobId,
+        client: String,
+    },
+    JobStarted {
+        job_id: JobId,
+    },
+    JobFinished {
+        job_id: JobId,
+        status: JobStatus,
+    },
+    ApprovalRequested {
+        approval_id: ApprovalId,
+        tool: ToolName,
+        capabilities: Vec<Capability>,
+        fingerprint: Fingerprint,
+        expires_at: String,
+    },
+    /// A person approved the request through the local RPC interface.
+    ApprovalGranted {
+        approval_id: ApprovalId,
+        client: String,
+    },
+    ApprovalDenied {
+        approval_id: ApprovalId,
+        client: String,
+    },
+    ApprovalExpired {
+        approval_id: ApprovalId,
+        reason: String,
+    },
+    /// Committed together with `execution_started`: the approval has been
+    /// used and can never be used again.
+    ApprovalConsumed {
+        approval_id: ApprovalId,
+    },
+    /// A connection to the RPC interface was refused, for example because
+    /// it came from the worker process.
+    RpcClientRejected {
+        client: String,
+        reason: String,
+    },
 }
 
 impl AuditEventKind {
@@ -105,6 +159,17 @@ impl AuditEventKind {
             Self::ExecutionStarted { .. } => "execution_started",
             Self::ExecutionFinished { .. } => "execution_finished",
             Self::TaskExpired { .. } => "task_expired",
+            Self::WorkerRestartScheduled { .. } => "worker_restart_scheduled",
+            Self::WorkerRestartAbandoned { .. } => "worker_restart_abandoned",
+            Self::JobSubmitted { .. } => "job_submitted",
+            Self::JobStarted { .. } => "job_started",
+            Self::JobFinished { .. } => "job_finished",
+            Self::ApprovalRequested { .. } => "approval_requested",
+            Self::ApprovalGranted { .. } => "approval_granted",
+            Self::ApprovalDenied { .. } => "approval_denied",
+            Self::ApprovalExpired { .. } => "approval_expired",
+            Self::ApprovalConsumed { .. } => "approval_consumed",
+            Self::RpcClientRejected { .. } => "rpc_client_rejected",
         }
     }
 }
@@ -125,6 +190,17 @@ mod tests {
             },
             AuditEventKind::ExecutionStarted {
                 tool: "system.info".into(),
+            },
+            AuditEventKind::ApprovalConsumed {
+                approval_id: ApprovalId::new(),
+            },
+            AuditEventKind::WorkerRestartScheduled {
+                attempt: 1,
+                delay_ms: 500,
+            },
+            AuditEventKind::JobFinished {
+                job_id: JobId::new(),
+                status: JobStatus::Completed,
             },
         ];
         for event in events {

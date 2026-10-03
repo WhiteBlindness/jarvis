@@ -1,9 +1,13 @@
 {
-  "protocol": 1,
+  "protocol": 2,
   "type": "welcome",
-  "session_id": "01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b",
-  "core_version": "0.1.0",
-  "tools": ["filesystem.read_fixture", "system.info"],
+  "session_id": "01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8c",
+  "core_version": "0.2.0",
+  "tools": [
+    "filesystem.read_fixture",
+    "system.info",
+    "workspace.write_file"
+  ],
   "limits": {
     "max_frame_bytes": 65536,
     "tool_timeout_ms": 5000,
