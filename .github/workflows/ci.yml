@@ -51,10 +51,11 @@ jobs:
         run: cargo test --workspace --locked
         env:
           JARVIS_TEST_PYTHON: python
-      # Prints interpreter start-up time with and without isolation and the
-      # resident memory of an idle confined interpreter.
+      # Prints interpreter start-up time with and without isolation, the
+      # resident memory of an idle confined interpreter, and the environment
+      # the confined worker sees.
       - name: Isolation overhead
-        run: cargo test -p jarvis-sandbox --test contain --locked -- --ignored --nocapture measure_isolation_overhead
+        run: cargo test -p jarvis-sandbox --test contain --locked -- --include-ignored --nocapture measure_isolation_overhead only_the_given_environment_reaches_the_worker
         env:
           JARVIS_TEST_PYTHON: python
 

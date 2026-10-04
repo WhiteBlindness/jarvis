@@ -3,8 +3,8 @@
 //! Landlock gives the filesystem boundary; this filter closes what Landlock
 //! on this kernel cannot: it denies creating any socket (so there is no
 //! network of any kind, and the worker cannot open the Core's Unix socket),
-//! denies creating child processes, and denies a group of escape and
-//! metadata syscalls. The program is assembled in the parent and installed by
+//! denies creating child processes, denies signalling other processes, and
+//! denies a group of escape and metadata syscalls. The program is assembled in the parent and installed by
 //! the child with one `seccomp` syscall as its last pre-exec step, so only
 //! the final `execve` of the interpreter runs afterwards. See ADR 0014.
 
@@ -93,6 +93,9 @@ impl Filter {
             p.deny(libc::SYS_clone3, errno(libc::ENOSYS));
         }
         for nr in ESCAPE {
+            p.deny(*nr, eperm);
+        }
+        for nr in SIGNAL {
             p.deny(*nr, eperm);
         }
         for nr in METADATA {
@@ -223,6 +226,21 @@ const ESCAPE: &[libc::c_long] = &[
     libc::SYS_open_by_handle_at,
     libc::SYS_name_to_handle_at,
     libc::SYS_memfd_create,
+    libc::SYS_process_madvise,
+    libc::SYS_process_mrelease,
+];
+
+// Sending signals. The kernel lets a process signal every other process of
+// the same user, so without this the worker could kill the Core (or anything
+// else the user runs). Its own fatal errors still end it: glibc's abort()
+// falls back to a direct exit when raising the signal fails.
+const SIGNAL: &[libc::c_long] = &[
+    libc::SYS_kill,
+    libc::SYS_tkill,
+    libc::SYS_tgkill,
+    libc::SYS_rt_sigqueueinfo,
+    libc::SYS_rt_tgsigqueueinfo,
+    libc::SYS_pidfd_send_signal,
 ];
 
 // File-metadata syscalls Landlock does not mediate, so a confined worker

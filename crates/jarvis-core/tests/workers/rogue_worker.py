@@ -168,6 +168,11 @@ def env() -> None:
     # Python itself may set LC_CTYPE (PEP 538), and macOS adds one variable
     # to every process. Everything else must come from the Core's allowlist.
     allowed = {"PATH", "SYSTEMROOT", "LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+    # Starting a Windows AppContainer needs the profile variables, and
+    # Windows may point TEMP and TMP into the container's own folder.
+    if os.name == "nt":
+        allowed |= {"APPDATA", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "USERPROFILE"}
+        allowed |= {"TEMP", "TMP"}
     # Windows keeps per-drive working directories in variables named "=C:".
     leaked = sorted(
         key for key in os.environ if key.upper() not in allowed and not key.startswith("=")

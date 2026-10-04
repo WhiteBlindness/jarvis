@@ -130,9 +130,9 @@ fn prepare(command: &mut tokio::process::Command, confinement: &Confinement) -> 
 
     // SAFETY: the closure runs in the child between fork and exec, so it may
     // only use async-signal-safe functions. It calls prctl, getppid,
-    // setrlimit, close_range, fcntl, the landlock and seccomp syscalls, and
-    // _exit, which are all plain system calls over memory prepared in the
-    // parent; it allocates nothing and takes no locks.
+    // geteuid, capset, setrlimit, close_range, fcntl, the landlock and
+    // seccomp syscalls, and _exit, which are all plain system calls over
+    // memory prepared in the parent; it allocates nothing and takes no locks.
     unsafe {
         command.pre_exec(move || {
             // Only stdin, stdout and stderr may reach the worker. The Core
@@ -184,6 +184,12 @@ fn prepare(command: &mut tokio::process::Command, confinement: &Confinement) -> 
                         return Err(io::Error::last_os_error());
                     }
                 }
+                // A Core running as root must not hand root's capabilities
+                // to the worker. After the limits above, which root may set
+                // above the current hard limit.
+                if libc::geteuid() == 0 {
+                    drop_capabilities()?;
+                }
                 // Filesystem boundary, then the syscall filter last: once the
                 // filter is installed, only the final execve of the worker
                 // may run.
@@ -192,6 +198,67 @@ fn prepare(command: &mut tokio::process::Command, confinement: &Confinement) -> 
             }
             Ok(())
         });
+    }
+    Ok(())
+}
+
+/// `struct __user_cap_header_struct` and `__user_cap_data_struct`.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// Remove every capability from the bounding, ambient, effective, permitted
+/// and inheritable sets, so the interpreter runs with none even as root.
+/// Runs between fork and exec: system calls only.
+#[cfg(target_os = "linux")]
+fn drop_capabilities() -> io::Result<()> {
+    for cap in 0..64 {
+        // SAFETY: PR_CAPBSET_DROP only narrows this process's bounding set;
+        // EINVAL marks a capability number this kernel does not know.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINVAL) {
+                return Err(error);
+            }
+        }
+    }
+    // SAFETY: clearing the ambient set only removes capabilities; kernels
+    // without ambient capabilities answer EINVAL, which is harmless.
+    unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    };
+    let header = CapHeader {
+        version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+        pid: 0,
+    };
+    let none = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: a valid version-3 header and two data words; capset with all
+    // zeroes only drops capabilities from the calling thread.
+    let rc = unsafe { libc::syscall(libc::SYS_capset, &header as *const CapHeader, none.as_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -253,6 +320,8 @@ fn describe(pid: u32, confinement: &Confinement) -> Contained {
     if cfg!(target_os = "linux") {
         controls.push("dies with the Core".to_owned());
         controls.push("no_new_privs".to_owned());
+        controls.push("no capabilities".to_owned());
+        controls.push("no signals to other processes".to_owned());
         if !confinement.filesystem.is_empty() {
             controls.push("landlock filesystem".to_owned());
         }

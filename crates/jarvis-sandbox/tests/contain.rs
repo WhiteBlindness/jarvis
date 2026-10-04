@@ -204,11 +204,15 @@ async fn the_confined_interpreter_runs_and_reads_its_runtime() {
 
 #[tokio::test]
 async fn only_the_given_environment_reaches_the_worker() {
+    // On Windows, starting an AppContainer also needs the profile variables
+    // (and Windows may add its own); they name directories the worker
+    // cannot open, which other probes check.
     let outcome = run(
-        "import os, sys\nallowed = {'PATH', 'SYSTEMROOT', 'LC_CTYPE', '__CF_USER_TEXT_ENCODING'}\nextra = sorted(k for k in os.environ if k.upper() not in allowed and not k.startswith('='))\nprint(extra)\nsys.exit(1 if extra else 0)",
+        "import os, sys\nallowed = {'PATH', 'SYSTEMROOT', 'LC_CTYPE', '__CF_USER_TEXT_ENCODING'}\nif os.name == 'nt':\n    allowed |= {'APPDATA', 'HOMEDRIVE', 'HOMEPATH', 'LOCALAPPDATA', 'USERPROFILE', 'TEMP', 'TMP'}\nfor key in sorted(os.environ):\n    print(key, '=', os.environ[key])\nextra = sorted(k for k in os.environ if k.upper() not in allowed and not k.startswith('='))\nprint('unexpected:', extra)\nsys.exit(1 if extra else 0)",
     )
     .await;
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    println!("{}", outcome.stdout);
 }
 
 #[tokio::test]
@@ -482,6 +486,39 @@ async fn reading_another_process_is_denied() {
         &format!("open('/proc/{parent}/mem', 'rb').read(1)"),
     )
     .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn signalling_another_process_is_denied() {
+    // Signal 0 checks permission without delivering anything.
+    let parent = std::process::id();
+    assert_denied(
+        "signalling the Core",
+        &format!("import os\nos.kill({parent}, 0)"),
+    )
+    .await;
+    assert_denied("signalling every process", "import os\nos.kill(-1, 0)").await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_worker_has_no_capabilities() {
+    // Read by the test, from outside: the worker itself cannot open /proc.
+    // Meaningful when the tests run as root, and trivially true otherwise.
+    let Spawned {
+        process, contained, ..
+    } = start("import time\ntime.sleep(30)");
+    let status = std::fs::read_to_string(format!("/proc/{}/status", process.id())).unwrap();
+    contained.kill_all().unwrap();
+    for set in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
+        let line = status
+            .lines()
+            .find(|line| line.starts_with(set))
+            .unwrap_or_else(|| panic!("{set} missing"));
+        let value = u64::from_str_radix(line.split_whitespace().nth(1).unwrap(), 16).unwrap();
+        assert_eq!(value, 0, "{line}");
+    }
 }
 
 #[cfg(windows)]

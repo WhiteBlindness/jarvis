@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::watch;
 use windows_sys::Win32::Foundation::{
-    GENERIC_READ, GENERIC_WRITE, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0,
+    ERROR_ENVVAR_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -132,7 +132,7 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
 
     let application = wide(command.program.as_os_str());
     let mut command_line = command_line(&command.program, &command.args)?;
-    let environment = environment_block(&command.env)?;
+    let environment = environment_block(&with_profile_variables(&command.env))?;
     let cwd = command.cwd.as_ref().map(|dir| wide(dir.as_os_str()));
     let flags = CREATE_SUSPENDED
         | DETACHED_PROCESS
@@ -160,7 +160,19 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
             &mut info,
         )
     };
-    let created = check(created, "CreateProcessW");
+    let created = check(created, "CreateProcessW").map_err(|error| {
+        if error.raw_os_error() == Some(ERROR_ENVVAR_NOT_FOUND as i32) {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; starting an AppContainer needs {} in the Core's environment",
+                    PROFILE_VARIABLES.join(", ")
+                ),
+            )
+        } else {
+            error
+        }
+    });
     // The child holds its own copies now. Ours must close, or the Core would
     // never see end-of-file on the worker's output.
     drop(attributes);
@@ -413,8 +425,37 @@ fn append_argument(line: &mut Vec<u16>, arg: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
+/// Profile variables `CreateProcessW` reads from the supplied environment
+/// block to set up an AppContainer process; without them it fails with
+/// `ERROR_ENVVAR_NOT_FOUND`. They name directories in the user's profile,
+/// which the worker cannot open.
+const PROFILE_VARIABLES: [&str; 5] = [
+    "APPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+];
+
+/// `env` plus the profile variables an AppContainer launch needs, taken
+/// from the Core's environment when `env` does not set them.
+fn with_profile_variables(
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut env = env.to_vec();
+    for name in PROFILE_VARIABLES {
+        let present = env
+            .iter()
+            .any(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name));
+        if !present && let Some(value) = std::env::var_os(name) {
+            env.push((name.into(), value));
+        }
+    }
+    env
+}
+
 /// A sorted, double-NUL-terminated UTF-16 environment block holding exactly
-/// `env`: nothing is inherited from the Core.
+/// `env`: nothing else is inherited from the Core.
 fn environment_block(env: &[(std::ffi::OsString, std::ffi::OsString)]) -> io::Result<Vec<u16>> {
     let mut pairs: Vec<(Vec<u16>, Vec<u16>)> = Vec::with_capacity(env.len());
     for (key, value) in env {
