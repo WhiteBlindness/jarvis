@@ -1,6 +1,6 @@
 # 0012. OS containment of the worker, without claiming a sandbox
 
-**Status:** Accepted
+**Status:** Accepted; superseded in part by [0013](0013-windows-appcontainer.md) (Windows) and [0014](0014-linux-landlock-seccomp.md) (Linux), which replace the low-integrity token with an AppContainer and add Landlock and seccomp. The process-lifetime controls described here remain.
 
 ## Context
 

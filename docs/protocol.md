@@ -165,8 +165,9 @@ There is no field for capabilities, approvals, task IDs or policy. Adding one ma
 ### Transport
 
 - Unix: a Unix domain socket (mode `0600`) inside a directory that only the owner can open (mode `0700`). The Core checks the peer's user ID, and refuses to start if another Core already answers on the socket.
-- Windows: a named pipe that only the current user can open, that refuses remote clients and that fails to start if another process already owns the name. The worker runs at low integrity and cannot open the pipe.
-- On both, the Core identifies the peer process through the OS, when the connection opens and again before every request, and refuses connections it cannot identify and connections from the worker: the worker itself, any process in its process group or descended from it (Linux), or any process in its job object (Windows). Refusals are recorded as `rpc_client_rejected`.
+- Windows: a named pipe that only the current user can open, that refuses remote clients and that fails to start if another process already owns the name. The worker's AppContainer package SID is not in the pipe's DACL, so the worker cannot open it.
+- The isolated worker cannot reach either endpoint: on Linux it cannot create a socket at all (ADR 0014), on Windows the pipe refuses its identity (ADR 0013).
+- On both, the Core also identifies the peer process through the OS, when the connection opens and again before every request, and refuses connections it cannot identify and connections from the worker: the worker itself, any process in its process group or descended from it (Linux), or any process in its job object (Windows). On Windows it also refuses any client whose token is an AppContainer token or below medium integrity, and any client it cannot inspect. Refusals are recorded as `rpc_client_rejected`.
 - One request at a time per connection, each answered by one response. Requests are limited to 16 KiB; a connection that stays idle for 30 s is closed; at most 16 connections are served at once.
 
 ### Requests
