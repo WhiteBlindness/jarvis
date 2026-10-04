@@ -65,13 +65,21 @@ use windows_sys::Win32::System::Threading::{
     THREAD_SUSPEND_RESUME,
 };
 
-use crate::{Contained, Limits};
+use crate::{Confinement, Contained};
 
-pub(crate) fn prepare(command: &mut tokio::process::Command, _limits: &Limits) {
+pub(crate) fn prepare(
+    command: &mut tokio::process::Command,
+    _confinement: &Confinement,
+) -> io::Result<()> {
     command.creation_flags(CREATE_SUSPENDED | DETACHED_PROCESS);
+    Ok(())
 }
 
-pub(crate) fn contain(child: &tokio::process::Child, limits: &Limits) -> io::Result<Contained> {
+pub(crate) fn contain(
+    child: &tokio::process::Child,
+    confinement: &Confinement,
+) -> io::Result<Contained> {
+    let limits = &confinement.limits;
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("worker exited before it could be contained"))?;

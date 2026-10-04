@@ -9,6 +9,7 @@
 
 pub mod approval;
 pub mod config;
+pub mod confinement;
 pub mod daemon;
 pub mod framing;
 pub mod gateway;

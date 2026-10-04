@@ -241,6 +241,11 @@ async fn supervise(
     shutdown: &CancellationToken,
 ) -> Result<ServeReport, CoreError> {
     let hub = &ctx.hub;
+    let confinement = crate::confinement::for_worker(&config.worker);
+    tracing::info!(
+        grants = confinement.filesystem.len(),
+        "worker confinement built"
+    );
     let mut policy = RestartPolicy::new(config.supervisor);
     let mut report = ServeReport {
         sessions: 0,
@@ -253,7 +258,7 @@ async fn supervise(
             worker.pid = None;
         });
         let started = Instant::now();
-        match supervisor::spawn(&config.worker) {
+        match supervisor::spawn(&config.worker, &confinement) {
             Err(error) => {
                 tracing::error!(%error, program = %config.worker.program, "worker failed to start");
                 record(

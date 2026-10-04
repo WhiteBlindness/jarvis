@@ -175,18 +175,23 @@ def env() -> None:
     if leaked:
         failures.append(f"environment leaked into the worker: {leaked}")
     # On Linux, no descriptor of the Core (database, lock file, RPC socket)
-    # may be open in the worker: only stdin, stdout and stderr.
-    if os.path.isdir("/proc/self/fd"):
-        inherited = []
-        for fd in os.listdir("/proc/self/fd"):
-            try:
-                target = os.readlink(f"/proc/self/fd/{fd}")
-            except OSError:
-                continue  # the descriptor listdir itself used, now closed
-            if int(fd) > 2 and not target.startswith("/proc/"):
-                inherited.append(target)
-        if inherited:
-            failures.append(f"descriptors leaked into the worker: {inherited}")
+    # may be open in the worker: only stdin, stdout and stderr. Under Phase 3
+    # confinement the worker cannot even read /proc, which is itself the
+    # stronger guarantee; fall back to the fd scan only when /proc is open.
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError:
+        names = []
+    inherited = []
+    for fd in names:
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue  # the descriptor listdir itself used, now closed
+        if int(fd) > 2 and not target.startswith("/proc/"):
+            inherited.append(target)
+    if inherited:
+        failures.append(f"descriptors leaked into the worker: {inherited}")
     wait_for_end_of_input()
 
 

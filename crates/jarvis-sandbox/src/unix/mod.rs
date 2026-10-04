@@ -1,17 +1,51 @@
+//! Linux (and other Unix) containment of the worker.
+//!
+//! The process-lifetime controls (own process group, death with the Core,
+//! `no_new_privs`, resource limits, stdio-only descriptors) are applied on
+//! every Unix. On Linux the worker is additionally confined by Landlock (a
+//! filesystem boundary, see [`landlock`]) and seccomp (no network, no child
+//! processes, no escape syscalls, see [`seccomp`]). Everything that must run
+//! in the child is built in the parent and applied with raw syscalls between
+//! fork and exec, so the pre-exec step allocates nothing and is
+//! async-signal-safe.
+
 use std::io;
 
-use crate::{Contained, Limits};
+use crate::{Confinement, Contained};
 
-pub(crate) fn prepare(command: &mut tokio::process::Command, limits: &Limits) {
+#[cfg(target_os = "linux")]
+mod landlock;
+#[cfg(target_os = "linux")]
+mod seccomp;
+
+pub(crate) fn prepare(
+    command: &mut tokio::process::Command,
+    confinement: &Confinement,
+) -> io::Result<()> {
     // Own process group: the whole tree can be signalled at once.
     command.process_group(0);
     let parent = std::process::id();
-    let memory = limits.memory_bytes;
+    let memory = confinement.limits.memory_bytes;
     let max_fd = open_file_limit();
+
+    // Built in the parent so the child only makes single syscalls.
+    #[cfg(target_os = "linux")]
+    let ruleset = landlock::Ruleset::build(&confinement.filesystem)?;
+    #[cfg(target_os = "linux")]
+    let filter = seccomp::Filter::build(confinement);
+    // A coarse backstop behind the seccomp child-process denial.
+    #[cfg(target_os = "linux")]
+    let max_procs = if confinement.deny_child_processes {
+        Some(1)
+    } else {
+        None
+    };
+
     // SAFETY: the closure runs in the child between fork and exec, so it may
-    // only use async-signal-safe functions. It calls prctl, getppid, setrlimit,
-    // close_range, fcntl and _exit, which are all plain system calls, and
-    // touches no locks or heap memory.
+    // only use async-signal-safe functions. It calls prctl, getppid,
+    // setrlimit, close_range, fcntl, the landlock and seccomp syscalls, and
+    // _exit, which are all plain system calls over memory prepared in the
+    // parent; it allocates nothing and takes no locks.
     unsafe {
         command.pre_exec(move || {
             // Only stdin, stdout and stderr may reach the worker. The Core
@@ -30,7 +64,8 @@ pub(crate) fn prepare(command: &mut tokio::process::Command, limits: &Limits) {
                 if libc::getppid() != parent as libc::pid_t {
                     libc::_exit(1);
                 }
-                // No privilege gain through setuid binaries or file capabilities.
+                // No privilege gain through setuid binaries or file
+                // capabilities. Landlock and seccomp both require this.
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -51,9 +86,27 @@ pub(crate) fn prepare(command: &mut tokio::process::Command, limits: &Limits) {
             if libc::setrlimit(libc::RLIMIT_AS, &address_space) != 0 {
                 return Err(io::Error::last_os_error());
             }
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(max) = max_procs {
+                    let procs = libc::rlimit {
+                        rlim_cur: max,
+                        rlim_max: max,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NPROC, &procs) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                // Filesystem boundary, then the syscall filter last: once the
+                // filter is installed, only the final execve of the worker
+                // may run.
+                ruleset.restrict_self()?;
+                filter.install()?;
+            }
             Ok(())
         });
     }
+    Ok(())
 }
 
 /// Highest descriptor number worth visiting when `close_range` is missing:
@@ -100,19 +153,34 @@ fn mark_close_on_exec_from(first: libc::c_int, max_fd: libc::c_int) {
     }
 }
 
-pub(crate) fn contain(child: &tokio::process::Child, limits: &Limits) -> io::Result<Contained> {
+pub(crate) fn contain(
+    child: &tokio::process::Child,
+    confinement: &Confinement,
+) -> io::Result<Contained> {
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("worker exited before it could be contained"))?;
     let mut controls = vec![
         "own process group".to_owned(),
         "stdio only".to_owned(),
-        format!("address space {} MiB", limits.memory_bytes / (1024 * 1024)),
+        format!(
+            "address space {} MiB",
+            confinement.limits.memory_bytes / (1024 * 1024)
+        ),
         "no core dumps".to_owned(),
     ];
     if cfg!(target_os = "linux") {
         controls.push("dies with the Core".to_owned());
         controls.push("no_new_privs".to_owned());
+        if !confinement.filesystem.is_empty() {
+            controls.push("landlock filesystem".to_owned());
+        }
+        if confinement.deny_network {
+            controls.push("no network".to_owned());
+        }
+        if confinement.deny_child_processes {
+            controls.push("no child processes".to_owned());
+        }
     }
     Ok(Contained {
         inner: Guard { pgid: pid },

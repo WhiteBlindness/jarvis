@@ -592,11 +592,8 @@ fn a_rogue_worker_cannot_bypass_policy_or_approve_its_own_request() {
     let daemon = setup.serve();
     setup.submit("anything");
     let approval = setup.pending_approval();
-    // Give the rogue time to attack the RPC endpoint while its request waits.
-    #[cfg(unix)]
-    setup.wait_for_kind("rpc_client_rejected", 1);
-    #[cfg(windows)]
-    std::thread::sleep(Duration::from_secs(2));
+    // The rogue attacks the RPC endpoint before it reads the decision, so by
+    // the time the job finishes the attack has happened.
     let id = approval["approval_id"].as_str().unwrap();
     assert!(setup.run(&["approvals", "deny", id]).status.success());
     setup.wait_for_kind("job_finished", 1);
@@ -604,6 +601,11 @@ fn a_rogue_worker_cannot_bypass_policy_or_approve_its_own_request() {
 
     // The rogue exits 0 only if every attempt was refused.
     assert_eq!(worker_exits(&setup), [(Some(0), true)], "{}", setup.log());
+    // Under confinement the worker cannot create a socket or open the pipe,
+    // so the attack never reaches the Core's own peer check.
+    if cfg!(any(target_os = "linux", windows)) {
+        assert_eq!(setup.count("rpc_client_rejected"), 0, "{}", setup.log());
+    }
     assert_eq!(
         setup.statuses(),
         [

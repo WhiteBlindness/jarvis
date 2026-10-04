@@ -13,7 +13,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use jarvis_sandbox::{Contained, Limits};
+use jarvis_sandbox::{Confinement, Contained};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
@@ -43,10 +43,10 @@ pub struct WorkerExit {
 }
 
 /// Start and contain the worker; return it with its protocol pipes.
-pub fn spawn(config: &WorkerConfig) -> io::Result<(Worker, ChildStdin, ChildStdout)> {
-    let limits = Limits {
-        memory_bytes: config.memory_limit_bytes,
-    };
+pub fn spawn(
+    config: &WorkerConfig,
+    confinement: &Confinement,
+) -> io::Result<(Worker, ChildStdin, ChildStdout)> {
     let mut command = Command::new(&config.program);
     command
         .args(&config.args)
@@ -63,10 +63,10 @@ pub fn spawn(config: &WorkerConfig) -> io::Result<(Worker, ChildStdin, ChildStdo
     if let Some(cwd) = &config.cwd {
         command.current_dir(cwd);
     }
-    jarvis_sandbox::prepare(&mut command, &limits);
+    jarvis_sandbox::prepare(&mut command, confinement)?;
 
     let mut child = command.spawn()?;
-    let contained = match jarvis_sandbox::contain(&child, &limits) {
+    let contained = match jarvis_sandbox::contain(&child, confinement) {
         Ok(contained) => Arc::new(contained),
         Err(error) => {
             // Still suspended on Windows: it has run no code.
