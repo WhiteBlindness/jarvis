@@ -38,7 +38,7 @@ Each threat lists its current mitigation and the test that proves it, or states 
 
 ## Assets
 
-| Asset | Why it matters | Phase 2 exposure |
+| Asset | Why it matters | Exposure |
 | --- | --- | --- |
 | Filesystem | Personal files, project files, system files | Tools read inside one fixture directory and write inside one workspace directory, writes only after a person approves |
 | Credentials | API keys, tokens, SSH keys, password stores | None through tools; the worker starts with a cleared environment |
@@ -138,13 +138,39 @@ Status: **Implemented** means the mitigation exists in code and a test covers it
 | Threat | Mitigation | Status | Evidence |
 | --- | --- | --- | --- |
 | Worker grants itself approval | No approval field exists in the worker protocol; the worker never sees an approval it could act on | Implemented | `worker_cannot_smuggle_authority`; rogue worker test |
-| Worker approves through the RPC interface | Peers are identified by the OS, at connection time and again before every request. The worker, its process group and descendants (Linux) or job (Windows) are refused; on Windows its low integrity level also blocks the pipe. Refusals are audited | Implemented (with the Linux gap below) | `a_rogue_worker_cannot_bypass_policy_or_approve_its_own_request`; `a_descendant_that_leaves_the_process_group_is_still_recognised` |
+| Worker approves through the RPC interface | First the OS: on Linux the worker cannot create a socket at all; on Windows its package SID is not in the pipe's DACL. Then the Core: peers are identified at connection time and again before every request; the worker, its process group or job, and (Windows) any AppContainer or below-medium-integrity client are refused and audited | Implemented | `a_rogue_worker_cannot_bypass_policy_or_approve_its_own_request` (asserts the attack never reaches the Core); `the_worker_cannot_open_an_owner_only_pipe`; `the_rpc_check_recognises_the_worker_as_restricted` (Windows) |
 | Approving something other than what was shown | The client must present the fingerprint of the exact request it displayed; the session consumes the approval only if the fingerprint still matches the call it is about to run | Implemented | `a_wrong_fingerprint_grants_nothing`; `consuming_for_a_different_call_is_refused_and_changes_nothing`; `a_write_runs_only_after_a_person_approves_it_through_another_client` |
 | Approval reused, replayed or used twice | Conditional state transitions in one transaction, enforced again by triggers; consumed approvals are terminal | Implemented | `an_approval_is_used_at_most_once_even_across_restarts`; `approval_rows_are_protected_by_triggers` |
 | Stale approvals | Time-to-live checked at grant and at use; expiry on session end and on restart | Implemented | `an_approval_nobody_decides_on_expires`; `no_approval_or_queued_job_survives_a_restart`; `no_approval_can_be_used_after_the_core_restarts` |
 | Crash between approval and execution | Consumption and `execution_started` commit together. If that commit fails nothing runs and recovery expires the approval; if it succeeds the approval is spent whatever happens next | Implemented | `a_store_failure_before_consumption_never_runs_the_tool`; `a_store_failure_after_the_tool_ran_leaves_a_consumed_approval` |
 | Terminal injection in what the person reviews | Arguments are shown through a display-safe description: control characters escaped, long values cut, file content summarised by size, SHA-256 and a short escaped preview | Implemented | `description_is_safe_to_print` |
 | Approval fatigue | Out of scope for code; every approval shows the full request and expires. A person can still approve without reading | Accepted risk | — |
+
+### Worker isolation (Phase 3)
+
+What a compromised worker can do when it ignores the protocol and calls the operating system directly. **Prevented**: the OS refuses it and a test proves the refusal on CI. **Mitigated**: reduced, not removed. **Residual**: possible today, accepted and stated. **Out of scope**: not defended against.
+
+| Attempt | Windows (AppContainer, ADR 0013) | Linux (Landlock + seccomp, ADR 0014) | Classification | Evidence |
+| --- | --- | --- | --- | --- |
+| Read the user's files (profile, Documents, Desktop, `.ssh`, other drives) | The package SID is not in their ACLs | Not beneath a Landlock grant | Prevented | `reading_a_user_file_is_denied`; `listing_the_home_directory_is_denied` |
+| Read the Core's database, config or logs | Same | Same | Prevented, and checked at every start | Start-up probe (`no access to the Core's files`); `the_real_confinement_passes_every_check` |
+| Write or delete any file | Only read grants exist | Only read grants exist | Prevented | `writing_outside_the_grants_is_denied` |
+| Read system files outside the runtime | Readable where Windows grants "ALL APPLICATION PACKAGES" (system directories) | `/etc`, `/proc`, `/run` and others denied | Prevented on Linux; Residual on Windows (system files only, no user data) | `system_files_outside_the_grants_are_denied` (Linux) |
+| Any network: internet, LAN, loopback, DNS, model APIs | No capabilities: the Filtering Platform drops all traffic | No socket can be created | Prevented, and checked at every start | `connecting_to_a_loopback_listener_is_denied`; `reaching_the_internet_is_denied`; `every_kind_of_socket_is_denied` (Linux); start-up probe |
+| Reach the Core's RPC endpoint | Pipe DACL omits the package SID; RPC refuses restricted tokens | No sockets | Prevented | `a_rogue_worker_cannot_bypass_policy_or_approve_its_own_request`; `the_worker_cannot_open_an_owner_only_pipe` |
+| Start another program, or escape the job | Child-process policy plus a one-process job without breakaway | `fork`, `vfork` and process `clone` denied | Prevented, and checked at every start | `starting_a_child_process_is_denied` |
+| Re-execute itself as another binary | Not possible without creating a process | `execve` of a binary under a runtime root, which keeps the same Landlock domain and seccomp filter | Mitigated on Linux | ADR 0014 |
+| Read or signal other processes (including the Core) | AppContainer and low integrity: `OpenProcess` refused | `ptrace`, `process_vm_readv`, `kill` family denied; `/proc` unreadable | Prevented | `reading_another_process_is_denied`; `signalling_another_process_is_denied` (Linux) |
+| Use a handle or descriptor it should not have | Explicit handle list: only the three stdio pipes | Every descriptor above 2 is close-on-exec | Prevented | `an_inheritable_handle_does_not_reach_the_worker` (Windows); `an_inheritable_descriptor_does_not_reach_the_worker` (Linux) |
+| Read secrets from its environment | Only `PATH`, `SYSTEMROOT` and the profile variables Windows needs | Only `PATH` | Prevented | `only_the_given_environment_reaches_the_worker`; `the_worker_environment_is_cleared` |
+| Learn the user's name or profile path | From the profile variables an AppContainer launch requires | Not exposed | Residual on Windows | ADR 0013 |
+| Use privileges or capabilities | Every privilege but `SeChangeNotifyPrivilege` removed before it runs | All capabilities dropped when the Core runs as root; `no_new_privs` | Prevented | `the_worker_runs_in_an_app_container_at_low_integrity` (Windows); `the_worker_has_no_capabilities` (Linux) |
+| Exhaust memory | Job commit limit | `RLIMIT_AS` | Mitigated (CPU time is not limited) | `the_memory_limit_applies` |
+| Outlive the Core | Job kill-on-close | `PR_SET_PDEATHSIG` | Prevented | `the_worker_dies_with_the_core` |
+| Run with a boundary that silently failed to apply | Every control is applied before the first instruction; any failure aborts the start; the start-up probe proves network, file and process denial | Same | Prevented | `a_missing_boundary_is_detected`; `a_probe_that_cannot_run_fails_closed`; `a_missing_worker_program_stops_the_core_before_any_worker` |
+| Network block disabled because the Base Filtering Engine is stopped | The start-up probe would see traffic and the Core would refuse to start | Not applicable | Mitigated | Start-up probe |
+| Exploit a kernel or OS-component vulnerability to leave the boundary | — | — | Out of scope | — |
+| A same-user process outside JARVIS tampering with the Core | — | — | Out of scope (see known gaps) | — |
 
 ### The RPC interface
 
@@ -163,13 +189,13 @@ Status: **Implemented** means the mitigation exists in code and a test covers it
 | --- | --- | --- | --- |
 | Worker crash or hang | Exit detected and recorded; pending approvals expired; job marked interrupted; handshake and job timeouts kill a stuck worker. The job timeout also applies while a request waits for a person and while buffered requests are handled | Implemented | `a_crashing_worker_is_restarted_until_the_budget_is_spent`; `a_silent_worker_is_killed_at_the_handshake_timeout`; `a_job_that_runs_too_long_ends_the_session`; `the_job_time_limit_applies_while_waiting_for_a_person`; `buffered_requests_do_not_extend_a_job_past_its_limit`; `a_worker_that_dies_while_waiting_for_approval_leaves_nothing_usable` |
 | Restart loops | Exponential backoff and a restart budget per time window; after that the Core reports itself unhealthy and refuses jobs | Implemented | `RestartPolicy` unit tests; `a_crashing_worker_is_restarted_until_the_budget_is_spent` |
-| Worker outliving the Core | Job object kill-on-close (Windows), `PR_SET_PDEATHSIG` (Linux) | Implemented | `the_worker_dies_with_the_core` |
+| Worker outliving the Core | Job object kill-on-close (Windows), `PR_SET_PDEATHSIG` (Linux) | Implemented | `the_worker_dies_with_the_core`; `dropping_the_process_kills_the_worker` |
 | Core crash mid-task | WAL with `synchronous=FULL`; start-up recovery closes tasks, approvals and jobs left open | Implemented | `recovery_marks_unfinished_tasks`; `start_up_recovers_what_a_previous_run_left_open` |
 | Two Cores on one database | Exclusive lock file | Implemented | `second_core_cannot_open_same_database`; `a_second_core_cannot_use_the_same_database` |
 | Audit tampering by Core bugs | Append-only triggers with `recursive_triggers` on; immutable terminal rows | Implemented | `audit_log_is_append_only`; trigger tests |
 | Audit tampering with file access | Not addressed. Anyone with write access to the database file can rewrite it | Planned | — |
 | Log or terminal injection | Worker and client text is escaped before it reaches the wire, the audit log, the logs or the CLI | Implemented | `worker_text_in_errors_is_escaped`; `error_messages_are_sanitised` |
-| Credential leakage to the worker | Cleared environment with no config option to add variables; no inherited descriptors | Implemented (descriptors: Linux test) | `the_worker_environment_is_cleared` |
+| Credential leakage to the worker | Cleared environment with no config option to add variables; no inherited descriptors or handles; no readable credential files | Implemented | `the_worker_environment_is_cleared`; `only_the_given_environment_reaches_the_worker`; the descriptor and handle probes |
 
 ## Durability semantics
 
@@ -177,11 +203,11 @@ The Core guarantees that **authority is used at most once**: an approval is cons
 
 ## Known gaps
 
-- **The worker is contained, not sandboxed.** On both platforms it can read any file the user can read and open network connections. On Linux it can also write the user's files and start processes. A separate account, AppContainer, or namespaces with Landlock and seccomp are the next step (ADR 0012).
-- **The Linux worker check relies on ancestry.** A worker process that leaves its process group *and* is re-parented away from the worker (by double forking) is indistinguishable from any other process of the user, and can use the RPC interface, including to approve requests.
-- **Processes the Linux worker starts and detaches can survive it.** Killing the process group does not reach a process that left the group.
+- **The isolation is as strong as the OS mechanisms behind it.** A kernel, AppContainer or Landlock escape is out of scope. The seccomp filter is a denylist of dangerous syscall groups, not an allowlist.
+- **On Windows the worker can read system directories** that grant "ALL APPLICATION PACKAGES" (for example `C:\Windows`, `Program Files`), and learns the user's profile path from the variables an AppContainer launch requires. It can open neither the profile nor anything else of the user's.
+- **CPU time is not limited.** A worker that spins wastes CPU until the job or handshake timeout ends its session.
 - **A local attacker running as the same user** can edit the config, the policy and the database, and can approve requests. JARVIS does not defend against that account.
-- **Some Windows controls are verified only on a real desktop:** UI restrictions, the low-integrity token against the user's profile, and handle inheritance. See [`windows-validation.md`](windows-validation.md).
+- **Some Windows behaviour is verified only on a real desktop:** UI restrictions (CI runs inside a job), a standard (non-administrator) account, and Windows editions other than the CI image. See [`windows-validation.md`](windows-validation.md).
 - **Fixture reads have a time-of-check to time-of-use window** between canonicalisation and open; the fixture root is the user's to populate. Writes do not have this problem.
 - **Dependencies are pinned by lockfiles** but not yet audited in CI.
 

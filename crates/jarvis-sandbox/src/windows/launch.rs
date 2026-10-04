@@ -28,8 +28,8 @@ use std::os::windows::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::watch;
@@ -90,6 +90,12 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
             "a Windows worker always runs without network access",
         ));
     }
+    // One launch at a time in this process: the access-control check and
+    // update, and the AppContainer set-up inside CreateProcessW, then never
+    // interleave with another launch from the same Core (or test binary).
+    static LAUNCH: Mutex<()> = Mutex::new(());
+    let _launching = LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
+
     let sid = PackageSid::ensure()?;
     appcontainer::grant_paths(&sid, &confinement.filesystem)?;
 

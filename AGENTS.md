@@ -28,13 +28,14 @@ uv run pytest
 Demo (the Core in one terminal, clients in another):
 
 ```bash
+cargo run -p jarvis-core -- isolation check --config config/jarvis.example.toml
 cargo run -p jarvis-core -- serve --config config/jarvis.example.toml
 cargo run -p jarvis-core -- submit "write notes.txt: hello" --config config/jarvis.example.toml
 cargo run -p jarvis-core -- approvals list --config config/jarvis.example.toml
 cargo run -p jarvis-core -- audit --config config/jarvis.example.toml
 ```
 
-CI runs all of the above on every pull request. Rust tests also run on Windows. Windows behaviour that CI cannot prove is listed in `docs/windows-validation.md`.
+CI runs all of the above on every pull request. Rust tests also run on Windows. Windows behaviour that CI cannot prove is listed in `docs/windows-validation.md`. On Linux the tests need a kernel with Landlock enabled; on Windows, a real `python.exe` (not the `py` launcher or a virtual environment).
 
 ## Invariants
 
@@ -49,7 +50,7 @@ Do not weaken these without an ADR in `docs/decisions/` and an update to the thr
 7. State changes and their audit events commit in one transaction. Audit events are append-only; terminal tasks, decided approvals and finished jobs are immutable.
 8. Decoding is strict on every interface: unknown fields, unknown types and other protocol versions are rejected.
 9. Everything the worker or a client can influence is bounded: frame and request sizes, request and error counts, tool, job and approval time, result size, buffered frames, connections, long polls, worker memory and restarts.
-10. The worker starts with a cleared environment, is never started through a shell, is contained before it runs, and is refused by the RPC server.
+10. The worker starts with a cleared environment, is never started through a shell, runs inside its OS isolation (ADRs 0013, 0014) from its first instruction with no network, no child processes and no files beyond its runtime and source, and is refused by the RPC server. The Core proves the isolation at start-up and does not run a worker without it.
 11. The worker package never performs privileged operations itself (`tests/test_boundaries.py` guards this).
 
 ## Adding a tool

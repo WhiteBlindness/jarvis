@@ -2,7 +2,7 @@
 
 JARVIS separates the code that interprets intent from the code that decides and acts. A Python worker proposes actions as typed requests. A long-lived Rust Core validates them, derives the capabilities they need, evaluates policy, asks a person when policy requires it, executes allowed tools under limits, verifies their output and records every step in SQLite. Local clients talk to the Core over a small typed RPC interface.
 
-This document describes what exists in Phase 2. Planned components are marked as such.
+This document describes what exists in Phase 3. Planned components are marked as such.
 
 ## Components
 
@@ -14,7 +14,8 @@ This document describes what exists in Phase 2. Planned components are marked as
 |                                                                   |
 |  daemon      start-up, recovery, worker restarts, shutdown        |
 |  rpc         peer identification, strict requests, long polls     |
-|  supervisor  spawn and contain the worker, forward stderr, kill   |
+|  isolation   worker confinement; start-up proof that it holds     |
+|  supervisor  start the isolated worker, forward stderr, kill      |
 |  session     handshake, jobs, request pipeline, limits            |
 |  policy      capability extraction, policy evaluation             |
 |  approval    fingerprints, display-safe descriptions, wake-ups    |
@@ -23,13 +24,17 @@ This document describes what exists in Phase 2. Planned components are marked as
 +----------------------+-------------------------------+------------+
       stdin/stdout      |                               | uses
       (worker protocol) |                               v
-+---------------------- v ---+   +-------------------------------------+
-| Python worker (contained)  |   | jarvis-tools                        |
-|  client  (protocol, jobs)  |   |  system.info                        |
-|  planner (deterministic)   |   |  filesystem.read_fixture            |
-+----------------------------+   |  workspace.write_file               |
-                                 +-------------------------------------+
-   jarvis-sandbox: OS containment (the only crate with unsafe code)
++=====================  v  ===+  +-------------------------------------+
+| OS isolation boundary        |  | jarvis-tools                        |
+|  Windows: AppContainer, job  |  |  system.info                        |
+|  Linux: Landlock + seccomp   |  |  filesystem.read_fixture            |
+| +--------------------------+ |  |  workspace.write_file               |
+| | Python worker            | |  +-------------------------------------+
+| |  client  (protocol, jobs)| |
+| |  planner (deterministic) | |
+| +--------------------------+ |
++==============================+
+   jarvis-sandbox: starts the worker inside the boundary (the only crate with unsafe code)
    jarvis-protocol: wire types for both protocols, strict decoding
 ```
 
@@ -37,7 +42,7 @@ This document describes what exists in Phase 2. Planned components are marked as
 | --- | --- | --- |
 | `crates/jarvis-protocol` | Worker protocol v2 and local RPC v1: messages, IDs, capabilities, typed tool calls and results, task, job and approval statuses, audit event kinds, strict decoding | Nothing else in the repository; no I/O |
 | `crates/jarvis-tools` | First-party tools behind the `ToolExecutor` trait | The protocol types. Not policy |
-| `crates/jarvis-sandbox` | Worker containment (job objects, tokens, process groups), the owner-only named pipe, peer process helpers | The OS |
+| `crates/jarvis-sandbox` | Starts the worker under a `Confinement`: AppContainer, job, handle list and mitigations (Windows); Landlock, seccomp and process controls (Linux). Also the owner-only named pipe and peer process helpers | The OS |
 | `crates/jarvis-core` | Everything that decides, executes, records, supervises and serves clients; the CLI | Protocol, tools and sandbox |
 | `services/intelligence-python` | Worker process: protocol client, job loop and a deterministic planner | The worker protocol only |
 
@@ -107,7 +112,8 @@ The store checks the expected source state of every transition inside the transa
 ## Process model
 
 - `jarvis-core serve` is the long-lived Core (ADR 0011). It takes the database lock, migrates, recovers, binds the RPC endpoint, prints `ready <endpoint>` and supervises the worker.
-- The worker is started directly from the configured program and arguments, without a shell, with an environment cleared apart from `PATH` and `SYSTEMROOT`. Containment is applied before it runs any code (ADR 0012). Its stdout carries protocol frames, its stdin carries replies, and its stderr is forwarded to the Core's log as escaped, length-limited lines.
+- Before the first worker starts, `isolation::verify` runs a probe under the worker's exact isolation and checks from the Core's side that it cannot reach a loopback listener, send a datagram, read a file next to the database or start a process. If any check fails, `serve` stops with an error (ADR 0013).
+- The worker is started directly from the resolved absolute program path and the configured arguments, without a shell, with an environment cleared apart from `PATH` and `SYSTEMROOT` (plus, on Windows, the profile variables an AppContainer launch requires). Every isolation control is in force before it runs any code (ADRs 0013, 0014): it can read its interpreter and its source directory and nothing else, and has no network and no child processes. Its stdout carries protocol frames, its stdin carries replies, and its stderr is forwarded to the Core's log as escaped, length-limited lines.
 - A worker that does not complete the handshake, or a job that runs past `job_timeout`, is killed. When the worker stops for any reason, the session expires its approvals and interrupts its job, and the supervisor restarts it with exponential backoff, within a restart budget per time window. Once the budget is spent the Core reports itself unhealthy and refuses jobs.
 - On SIGINT, SIGTERM, Ctrl+C, Ctrl+Break or console close, or an authorised `shutdown` request, the Core cancels the running tool, expires pending approvals, closes the worker's stdin, kills it after the grace period, stops the RPC server and records `core_stopped`. A second signal exits immediately.
 - The client commands (`health`, `submit`, `job`, `jobs`, `approvals`, `shutdown`) connect to the endpoint named in the same config file. `tasks` and `audit` read the database directly, read-only.
@@ -115,7 +121,8 @@ The store checks the expected source state of every transition inside the transa
 ## Local RPC
 
 - Unix domain socket in an owner-only directory, or a named pipe that only the current user can open (ADR 0010). No TCP.
-- Every connection is identified by the OS before a request is read. Unidentifiable peers, other users (Unix) and the worker are refused and audited.
+- The isolated worker cannot reach the endpoint at all: it has no sockets on Linux, and its package SID is not in the pipe's DACL on Windows.
+- Every connection is identified by the OS before a request is read. Unidentifiable peers, other users (Unix), restricted tokens (Windows: AppContainer or below medium integrity) and the worker are refused and audited.
 - One request at a time per connection, at most 16 KiB each, idle timeout 30 s, at most 16 connections, long polls up to 60 s. Long polls wait on a change counter that the session and the RPC server bump, then re-read the database.
 
 ## Concurrency
@@ -144,7 +151,7 @@ The Core runs on Tokio. A session handles one request at a time: a worker can ne
 | --- | --- | --- |
 | Protocol | Syntax rules, strict decoding of both protocols, version handling, contract fixtures shared with Python, property tests on arbitrary bytes | `crates/jarvis-protocol` |
 | Tools | Fixture containment; workspace writes against `..`, symlinks, junctions (Windows), hard links, a directory swapped for a link mid-write, size limits | `crates/jarvis-tools` |
-| Containment | Memory limit, killing the tree, descendants that leave the process group (Linux), no child processes, low integrity and the owner-only pipe (Windows) | `crates/jarvis-sandbox/tests` |
+| Isolation | A real Python child under the worker's confinement tries to read user files and the home directory, write anywhere, reach loopback and the internet, start or signal processes, read the Core, use leaked handles and open the Core's pipe; identity, privileges, capabilities, memory limit, lifetime, concurrent launches; the start-up check passing, failing on a missing boundary, and failing closed when the probe cannot run | `crates/jarvis-sandbox/tests`, `crates/jarvis-core/tests/isolation.rs` |
 | Store | Migrations, append-only audit, triggers on every table, approval grant, deny, expiry and single use, failure inside the consuming transaction, recovery | `crates/jarvis-core/src/store/tests.rs` |
 | Policy, restarts, config | Default deny, class ceilings, backoff and budget | Unit tests |
 | Session | Every failure path over in-memory pipes with an untrusted peer, including approvals and database failures before and after execution | `crates/jarvis-core/tests/session.rs` |
@@ -155,5 +162,5 @@ The Core runs on Tokio. A session handles one request at a time: a worker can ne
 
 - Dashboard and any client other than the CLI.
 - Model-backed planning, speech, retrieval and memory.
-- A sandbox for the worker stronger than the current containment.
+- Network access for a model, which will be a capability the Core brokers; the worker itself stays without network.
 - More than one worker, and tools beyond the three above.

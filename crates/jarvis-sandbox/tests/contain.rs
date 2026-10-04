@@ -603,9 +603,34 @@ async fn an_inheritable_handle_does_not_reach_the_worker() {
 #[tokio::test]
 async fn the_worker_runs_in_an_app_container_at_low_integrity() {
     // TokenIsAppContainer = 29, TokenIntegrityLevel = 25; low = 0x1000.
-    let outcome = run(
-        "import ctypes, sys\nfrom ctypes import wintypes\na = ctypes.WinDLL('advapi32', use_last_error=True)\nk = ctypes.WinDLL('kernel32', use_last_error=True)\nk.GetCurrentProcess.restype = wintypes.HANDLE\ntoken = wintypes.HANDLE()\nif not a.OpenProcessToken(k.GetCurrentProcess(), 0x0008, ctypes.byref(token)):\n    raise ctypes.WinError(ctypes.get_last_error())\nvalue = wintypes.DWORD()\nn = wintypes.DWORD()\na.GetTokenInformation(token, 29, ctypes.byref(value), 4, ctypes.byref(n))\nbuf = ctypes.create_string_buffer(64)\na.GetTokenInformation(token, 25, buf, 64, ctypes.byref(n))\na.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)\na.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)\nsid = ctypes.c_void_p.from_buffer(buf).value\ncount = a.GetSidSubAuthorityCount(ctypes.c_void_p(sid)).contents.value\nlevel = a.GetSidSubAuthority(ctypes.c_void_p(sid), count - 1).contents.value\nprint(value.value, hex(level))\nsys.exit(0 if value.value == 1 and level <= 0x1000 else 1)",
-    )
+    let outcome = run(concat!(
+        "import ctypes, sys\n",
+        "from ctypes import wintypes\n",
+        "a = ctypes.WinDLL('advapi32', use_last_error=True)\n",
+        "k = ctypes.WinDLL('kernel32', use_last_error=True)\n",
+        "k.GetCurrentProcess.restype = wintypes.HANDLE\n",
+        "a.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]\n",
+        "a.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]\n",
+        "a.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]\n",
+        "a.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)\n",
+        "a.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]\n",
+        "a.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)\n",
+        "token = wintypes.HANDLE()\n",
+        "if not a.OpenProcessToken(k.GetCurrentProcess(), 0x0008, ctypes.byref(token)):\n",
+        "    raise ctypes.WinError(ctypes.get_last_error())\n",
+        "value = wintypes.DWORD()\n",
+        "n = wintypes.DWORD()\n",
+        "if not a.GetTokenInformation(token, 29, ctypes.addressof(value), 4, ctypes.byref(n)):\n",
+        "    raise ctypes.WinError(ctypes.get_last_error())\n",
+        "buf = ctypes.create_string_buffer(256)\n",
+        "if not a.GetTokenInformation(token, 25, ctypes.addressof(buf), 256, ctypes.byref(n)):\n",
+        "    raise ctypes.WinError(ctypes.get_last_error())\n",
+        "sid = ctypes.c_void_p.from_buffer(buf).value\n",
+        "count = a.GetSidSubAuthorityCount(sid).contents.value\n",
+        "level = a.GetSidSubAuthority(sid, count - 1).contents.value\n",
+        "print(value.value, hex(level))\n",
+        "sys.exit(0 if value.value == 1 and level <= 0x1000 else 1)\n",
+    ))
     .await;
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }

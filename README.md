@@ -2,7 +2,7 @@
 
 A local-first agent runtime with a Rust execution core, typed capabilities and Python intelligence workers.
 
-**Status:** Phase 2. A long-lived Rust Core supervises a contained Python worker, executes typed tools under a capability policy, asks a person before any action with side effects, and records every decision in SQLite. Local clients use a small typed RPC interface. Tested on Linux and Windows. There is no language model, UI, voice or personal integration yet.
+**Status:** Phase 3. A long-lived Rust Core supervises a Python worker that the operating system isolates (an AppContainer on Windows, Landlock and seccomp on Linux), executes typed tools under a capability policy, asks a person before any action with side effects, and records every decision in SQLite. Local clients use a small typed RPC interface. Tested on Linux and Windows. There is no language model, UI, voice or personal integration yet.
 
 ## Why it exists
 
@@ -16,8 +16,9 @@ JARVIS starts from the opposite end: the model never gets operating system acces
 - **Approvals bound to one exact request.** A request that needs a person is suspended in the Core. The worker never sees an approval and has no field to claim one. A person approves through a separate client, which must present the SHA-256 fingerprint of the exact task, request, tool, arguments and capabilities it displayed. The approval is consumed in the same transaction that starts execution, and can never be used twice, outlive its session or survive a restart.
 - **Decide, record, then act.** The policy decision, the consumed approval and `execution_started` are committed before a tool runs. Tests inject database failures before and after execution to show what happens in each case.
 - **Integrity in the schema, not only in code.** Triggers keep the audit log append-only and make terminal tasks, decided approvals and finished jobs immutable, including against `INSERT OR REPLACE`.
-- **A supervised, contained worker.** No shell, a cleared environment, a handshake and a job timeout, restarts with exponential backoff inside a budget, and OS containment applied before the worker runs any code: on Windows a job object (no child processes, memory limit, killed with the Core) and a low-integrity token without privileges; on Linux its own process group, death with the Core, `no_new_privs` and a memory limit.
-- **A local RPC interface that refuses the worker.** Unix socket in an owner-only directory, or a named pipe that only the current user can open. Every peer is identified by the OS, and connections from the worker (or anything it started) are refused and audited.
+- **An OS boundary around the worker, proved at every start.** The worker can read its interpreter and its own source and nothing else: no user files, no Core data, no writes, no network of any kind (loopback included), no child processes, no access to other processes. On Windows that is an AppContainer with no capabilities, a job object, a child-process policy, an explicit handle list and process mitigations, set in one `CreateProcessW` call, with no administrator rights and no second account. On Linux it is Landlock plus a seccomp filter, with no root. Before the first worker runs, the Core starts a probe under the same isolation and checks from its own side that it could not reach a loopback listener, read a file next to the database or start a process; if any check fails, the Core refuses to start.
+- **A supervised worker.** No shell, a cleared environment, a handshake and a job timeout, restarts with exponential backoff inside a budget, and death with the Core.
+- **A local RPC interface the worker cannot reach.** Unix socket in an owner-only directory, or a named pipe that only the current user can open. The isolated worker cannot create a socket (Linux) or open the pipe (Windows); behind that, every peer is identified by the OS and the worker, anything in its job or process group, and restricted Windows tokens are refused and audited.
 - **Adversarial tests.** A hostile worker process tries smuggled approvals, path traversal, invented tools, replays, requests outside its job and approving its own write over the RPC endpoint, against the real binary.
 
 ## Architecture
@@ -25,11 +26,16 @@ JARVIS starts from the opposite end: the model never gets operating system acces
 ```
  person ── CLI ── local RPC ──►  Rust Core (jarvis-core serve)              SQLite
                                   rpc → jobs, approvals               ──►  jobs, tasks,
- Python worker ── tool_request ►  decode → capabilities → policy            approvals,
- (contained)   ◄─ tool_response   → [approval] → record → Tool Gateway ──►  audit_events
-                                                       │
-                                                  typed tools
-                          system.info · filesystem.read_fixture · workspace.write_file
+                                  decode → capabilities → policy            approvals,
+                                  → [approval] → record → Tool Gateway ──►  audit_events
+                                       ▲ stdio only        │
+ ┌─ OS isolation boundary ──────────┐  │              typed tools
+ │ AppContainer (Windows)           │  │  system.info · filesystem.read_fixture ·
+ │ Landlock + seccomp (Linux)       │  │  workspace.write_file
+ │   Python worker ── tool_request ─┼──┘
+ │   reads its runtime and source;  │
+ │   no network, files, processes   │
+ └──────────────────────────────────┘
 ```
 
 | Component | Language | Role |
@@ -37,7 +43,7 @@ JARVIS starts from the opposite end: the model never gets operating system acces
 | `crates/jarvis-protocol` | Rust | Worker protocol v2 and local RPC v1: closed tool and capability sets, strict decoding |
 | `crates/jarvis-core` | Rust | Daemon, RPC server, policy, approvals, Tool Gateway, session, SQLite store, supervision, CLI |
 | `crates/jarvis-tools` | Rust | First-party tools behind a `ToolExecutor` trait |
-| `crates/jarvis-sandbox` | Rust | Worker containment; the only crate with `unsafe` code |
+| `crates/jarvis-sandbox` | Rust | Starts the worker inside its OS isolation; the only crate with `unsafe` code |
 | `services/intelligence-python` | Python | Worker: protocol client, job loop and a deterministic planner (standard library only) |
 
 Details: [architecture](docs/architecture.md), [protocols](docs/protocol.md), [threat model](docs/threat-model.md), [decisions](docs/decisions/README.md), [Windows validation](docs/windows-validation.md).
@@ -52,7 +58,7 @@ Every capability belongs to one class:
 | B. Require confirmation | Side effects inside an approved area | `workspace.write` (write one text file inside the configured workspace) |
 | C. Prohibited | Shell, process launch, unrestricted filesystem or network, credentials, the Core's own state | No tool exists, and neither protocol can express them |
 
-The limits are stated plainly in the [threat model](docs/threat-model.md). The worker is contained, not sandboxed: on both platforms it can still read the user's files and open network connections, and on Linux it can also write the user's files. Any process running as the same user can use the RPC interface, which is the trust boundary. Some Windows controls can only be checked on a real desktop; [docs/windows-validation.md](docs/windows-validation.md) lists them.
+The limits are stated plainly in the [threat model](docs/threat-model.md). The worker's isolation relies on the operating system: a kernel or AppContainer escape is out of scope, the Linux syscall filter is a denylist of dangerous groups rather than an allowlist, and on Windows the worker can read system directories (not user data) and learns the profile path. Any process running as the same user, other than the worker, can use the RPC interface, which is the trust boundary. Some Windows behaviour can only be checked on a real desktop; [docs/windows-validation.md](docs/windows-validation.md) lists it.
 
 ## Implemented
 
@@ -60,7 +66,7 @@ The limits are stated plainly in the [threat model](docs/threat-model.md). The w
 - Local RPC: health, submit and wait for jobs, list and wait for approvals, approve, deny, shutdown. CLI commands for each, plus read-only `tasks` and `audit`.
 - Human approval for class B requests, bound by fingerprint, single use, with expiry, audited from request to consumption.
 - Three tools: `system.info` (no hostname, username, environment or paths), `filesystem.read_fixture` (one configured directory) and `workspace.write_file` (one configured directory, handle-based resolution, atomic replace, no links followed out).
-- Worker containment on Windows and Linux, with tests that probe it from a real child process.
+- Worker isolation on Windows (AppContainer) and Linux (Landlock and seccomp), proved by a start-up probe and by hostile probes from a real child process on CI; `isolation check` and `isolation remove` commands, and an optional Windows script that adds firewall rules for the worker as defence in depth.
 - SQLite store with migrations, jobs, tasks, approvals, an append-only audit log, replay protection and crash recovery.
 - Python worker with a job loop and a deterministic planner.
 
@@ -68,7 +74,7 @@ The limits are stated plainly in the [threat model](docs/threat-model.md). The w
 
 - A TypeScript dashboard on the RPC interface.
 - Model-backed planning in the Python worker, then speech and retrieval.
-- A stronger worker sandbox (separate account, AppContainer, namespaces with Landlock and seccomp).
+- Network access for models only through the Core, as a brokered capability; the worker itself stays without network.
 - More tools, each added through the threat model first.
 
 ## Stack
@@ -77,7 +83,13 @@ Rust 2024 (Tokio, rusqlite with bundled SQLite, serde, clap, tracing, cap-std, s
 
 ## Run it
 
-Requirements: Rust 1.89 or newer and Python 3.11 or newer. SQLite is compiled in and the worker has no dependencies. On Windows, set `program = "python"` in `config/jarvis.example.toml` and see [docs/windows-validation.md](docs/windows-validation.md).
+Requirements: Rust 1.89 or newer and Python 3.11 or newer. SQLite is compiled in and the worker has no dependencies. On Linux the kernel must have Landlock enabled (5.13 or newer, which current distributions ship); otherwise the Core refuses to start the worker. On Windows, set `program = "python"` (a real `python.exe`, not the `py` launcher or a virtual environment) in `config/jarvis.example.toml` and see [docs/windows-validation.md](docs/windows-validation.md). No administrator rights are needed on either system.
+
+Check the worker's isolation on this machine first (no running Core needed):
+
+```bash
+cargo run -p jarvis-core -- isolation check --config config/jarvis.example.toml
+```
 
 Start the Core in one terminal:
 
@@ -140,7 +152,7 @@ cd services/intelligence-python
 uv sync && uv run pytest && uv run mypy && uv run ruff check .
 ```
 
-The Rust suite covers the request pipeline and every refusal path, approvals (grant, deny, expiry, wrong fingerprint, single use, restart, the worker leaving while a request waits, database failures before and after execution), the workspace writer against traversal, links and races, containment probes, worker crashes and restart budgets, signals, recovery and the RPC interface. CI runs it on Linux and Windows, along with the Python checks, the minimum supported Rust version, the documented quick start and a secret scan.
+The Rust suite covers the request pipeline and every refusal path, approvals (grant, deny, expiry, wrong fingerprint, single use, restart, the worker leaving while a request waits, database failures before and after execution), the workspace writer against traversal, links and races, isolation probes (a real Python child trying to read the profile, write files, reach the network, start processes, signal or read the Core, use a leaked handle and open the RPC endpoint), the start-up check failing closed, worker crashes and restart budgets, signals, recovery and the RPC interface. CI runs it on Linux and Windows, along with `isolation check`, the Windows provisioning script, the isolation overhead measurement, the Python checks, the minimum supported Rust version, the documented quick start and a secret scan.
 
 ## Repository layout
 
