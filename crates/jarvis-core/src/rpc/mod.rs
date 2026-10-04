@@ -3,7 +3,8 @@
 //! One JSON request per line, one response per line, over a local transport
 //! (see [`transport`]). Every connection is identified by the OS before any
 //! request is read: connections from the worker process (or anything in its
-//! job or process group) and connections that cannot be identified are
+//! job or process group), from a restricted token on Windows (AppContainer
+//! or below medium integrity), and connections that cannot be identified are
 //! refused and audited. Requests are size-limited, connections time out when
 //! idle, and the number of concurrent connections is capped.
 
@@ -166,6 +167,13 @@ fn refusal(state: &RpcState, peer: &Peer) -> Option<&'static str> {
     #[cfg(unix)]
     if peer.uid != Some(jarvis_sandbox::current_uid()) {
         return Some("the client runs as a different user");
+    }
+    // The pipe's DACL already keeps AppContainer processes out; this also
+    // refuses a same-user client at low integrity, and fails closed if the
+    // client cannot be inspected.
+    #[cfg(windows)]
+    if !matches!(jarvis_sandbox::is_restricted_process(pid), Ok(false)) {
+        return Some("the client runs with a restricted token, or could not be inspected");
     }
     None
 }

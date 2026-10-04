@@ -502,6 +502,7 @@ name = "jarvis-sandbox"
 version = "0.2.0"
 dependencies = [
  "libc",
+ "tempfile",
  "tokio",
  "windows-sys 0.61.2",
 ]

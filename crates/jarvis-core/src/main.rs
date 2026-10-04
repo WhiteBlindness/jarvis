@@ -6,10 +6,10 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use jarvis_core::config::Config;
-use jarvis_core::daemon;
 use jarvis_core::rpc::Endpoint;
 use jarvis_core::rpc::client::Client;
 use jarvis_core::store::Store;
+use jarvis_core::{daemon, isolation};
 use jarvis_protocol::{
     ApprovalId, ApprovalStatus, ApprovalView, Fingerprint, Goal, HealthReport, JobId, JobStatus,
     JobView, RpcError, RpcRequest, RpcResponse, Summary, TaskId,
@@ -118,6 +118,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect or undo the worker's OS isolation on this machine.
+    #[command(subcommand)]
+    Isolation(IsolationCommand),
     /// Print the audit log in sequence order (read-only).
     Audit {
         #[command(flatten)]
@@ -130,6 +133,26 @@ enum Command {
         /// Print one JSON object per line.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IsolationCommand {
+    /// Show how the worker is isolated here, then prove it: run the same
+    /// probe the Core runs before its first worker (no network, no access to
+    /// the Core's files, no child processes). Needs no running Core and no
+    /// administrator rights. Exits 2 if isolation is not enforced.
+    Check {
+        #[command(flatten)]
+        config: ConfigArg,
+    },
+    /// Undo what starting the worker changed on this machine: on Windows,
+    /// the access entries for the worker's AppContainer on the granted
+    /// directories, and the AppContainer profile itself. Nothing to undo on
+    /// Linux. Stop the Core first.
+    Remove {
+        #[command(flatten)]
+        config: ConfigArg,
     },
 }
 
@@ -214,6 +237,7 @@ fn main() -> ExitCode {
             limit,
             json,
         } => print_audit(&config.config, task, limit, json).map(|()| true),
+        Command::Isolation(command) => isolation(command),
         command => client_command(command),
     };
     match result {
@@ -263,6 +287,71 @@ fn serve(config_path: &Path) -> anyhow::Result<bool> {
         let report = result?;
         Ok(!report.gave_up)
     })
+}
+
+fn isolation(command: IsolationCommand) -> anyhow::Result<bool> {
+    match command {
+        IsolationCommand::Check { config } => {
+            let config = Config::load(&config.config)?;
+            let launch = isolation::launch(&config.worker)?;
+            let report = jarvis_sandbox::report(&launch.confinement)?;
+            println!("mechanism   {}", report.mechanism);
+            for (key, value) in &report.identity {
+                println!("{:<11} {value}", key.replace('_', " "));
+            }
+            println!("program     {}", launch.command.program.display());
+            for grant in &launch.confinement.filesystem {
+                let access = match grant.access {
+                    jarvis_sandbox::Access::ReadExecute => "read+execute",
+                    jarvis_sandbox::Access::Read => "read",
+                    jarvis_sandbox::Access::ReadWrite => "read+write",
+                };
+                println!("grant       {access:<12} {}", grant.path.display());
+            }
+            let scratch = config
+                .database
+                .parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            std::fs::create_dir_all(&scratch)
+                .with_context(|| format!("cannot create {}", scratch.display()))?;
+            let verified = runtime()?.block_on(isolation::verify(&launch, &scratch));
+            match verified {
+                Ok(verification) => {
+                    for check in &verification.checks {
+                        println!("ok          {} ({})", check.name, check.detail);
+                    }
+                    println!(
+                        "verified in {} ms under: {}",
+                        verification.elapsed.as_millis(),
+                        verification.controls
+                    );
+                    Ok(true)
+                }
+                Err(isolation::IsolationError::NotEnforced(checks)) => {
+                    for check in &checks {
+                        let mark = if check.passed { "ok" } else { "FAILED" };
+                        println!("{mark:<11} {} ({})", check.name, check.detail);
+                    }
+                    println!("worker isolation is NOT enforced; the Core will not start a worker");
+                    Ok(false)
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        IsolationCommand::Remove { config } => {
+            let config = Config::load(&config.config)?;
+            let launch = isolation::launch(&config.worker)?;
+            let done = jarvis_sandbox::remove(&launch.confinement)?;
+            if done.is_empty() {
+                println!("nothing to remove");
+            }
+            for line in done {
+                println!("{line}");
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// The first signal starts a graceful shutdown. Every step of it is bounded,
@@ -369,7 +458,10 @@ fn client_command(command: Command) -> anyhow::Result<bool> {
                     other => Err(unexpected(other)),
                 }
             }
-            Command::Serve { .. } | Command::Tasks { .. } | Command::Audit { .. } => {
+            Command::Serve { .. }
+            | Command::Tasks { .. }
+            | Command::Audit { .. }
+            | Command::Isolation(_) => {
                 bail!("internal error: not a client command")
             }
         }

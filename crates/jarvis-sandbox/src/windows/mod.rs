@@ -1,31 +1,28 @@
-//! Windows containment: a job object, a low-integrity token without
-//! privileges, and UI restrictions, all applied while the worker is still
-//! suspended.
+//! Windows isolation: the worker runs in an AppContainer with no
+//! capabilities, inside a job object, with a child-process policy, an
+//! explicit handle list and process mitigations, all applied by the single
+//! `CreateProcessW` call in [`launch`]. See ADR 0013.
 //!
-//! Sequence (each step fails closed; on error the caller kills the still
-//! suspended child):
+//! What each control stops:
 //!
-//! 1. The child is created with `CREATE_SUSPENDED | DETACHED_PROCESS`: it
-//!    gets no console, so no console host process has to start inside the
-//!    job (which would count against the process limit).
-//! 2. A job object is created with kill-on-close, an active-process limit of
-//!    one (no child processes), a per-process memory limit and
-//!    die-on-unhandled-exception; breakaway is not allowed.
-//! 3. If the child is not already in a job, the job also gets UI
-//!    restrictions. (Windows refuses to nest a job that has UI restrictions
-//!    under an existing job, which is the case under some terminals and CI
-//!    runners.)
-//! 4. The child is assigned to the job.
-//! 5. The child's primary token is lowered to Low integrity and every
-//!    privilege except `SeChangeNotifyPrivilege` is removed. Lowering the
-//!    integrity of a token is always permitted; doing it before the first
-//!    thread runs means no code in the worker ever runs with more.
-//! 6. The integrity level is read back to confirm it took effect.
-//! 7. The child's thread is resumed.
+//! - **AppContainer, no capabilities.** File access needs the package SID to
+//!   be granted as well as the user, so the user's profile and the Core's
+//!   data are unreadable; the Windows Filtering Platform blocks all network
+//!   traffic, loopback included; the worker runs at low integrity.
+//! - **Child-process policy and a one-process job.** The worker cannot start
+//!   another program, so it cannot hand work to an unconfined process.
+//! - **Job object.** Kill-on-close ties the worker's life to the Core; a
+//!   commit limit caps its memory; UI restrictions apply when the Core is not
+//!   itself in a job.
+//! - **Handle list.** Only the three stdio pipe ends are inherited.
+//! - **Token check.** Before the suspended worker runs, the Core confirms it
+//!   is an AppContainer at low integrity inside the job and removes every
+//!   privilege except `SeChangeNotifyPrivilege`.
 
-use std::ffi::c_void;
+use std::ffi::{OsStr, c_void};
 use std::io;
 use std::mem::{size_of, zeroed};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::RawHandle;
 use std::ptr::{null, null_mut};
 
@@ -38,18 +35,14 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, AllocateAndInitializeSid, FreeSid, GetLengthSid, GetSidSubAuthority,
-    GetSidSubAuthorityCount, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
-    PSECURITY_DESCRIPTOR, PSID, SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_REMOVED, SECURITY_ATTRIBUTES,
-    SECURITY_MANDATORY_LABEL_AUTHORITY, SID_AND_ATTRIBUTES, SetTokenInformation,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES,
-    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenPrivileges, TokenUser,
-};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    AdjustTokenPrivileges, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+    LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PSECURITY_DESCRIPTOR, PSID, SE_CHANGE_NOTIFY_NAME,
+    SE_PRIVILEGE_REMOVED, SECURITY_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_MANDATORY_LABEL,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenIsAppContainer,
+    TokenPrivileges, TokenUser,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_BASIC_UI_RESTRICTIONS,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
@@ -57,37 +50,78 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows_sys::Win32::System::SystemServices::{
-    JOB_OBJECT_UILIMIT_ALL, SE_GROUP_INTEGRITY, SECURITY_MANDATORY_LOW_RID,
+    JOB_OBJECT_UILIMIT_ALL, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, OpenProcess,
-    OpenProcessToken, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread,
-    THREAD_SUSPEND_RESUME,
+    GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::{Confinement, Contained};
+use crate::{Confinement, Report};
 
-pub(crate) fn prepare(
-    command: &mut tokio::process::Command,
-    _confinement: &Confinement,
-) -> io::Result<()> {
-    command.creation_flags(CREATE_SUSPENDED | DETACHED_PROCESS);
-    Ok(())
+mod appcontainer;
+mod launch;
+
+pub(crate) use launch::{Process, Stderr, Stdin, Stdout, spawn};
+
+/// Describe the AppContainer the worker would run in, without creating it.
+pub(crate) fn report(_confinement: &Confinement) -> io::Result<Report> {
+    let sid = appcontainer::PackageSid::derive()?;
+    let in_job = current_process_in_job()?;
+    Ok(Report {
+        mechanism: format!(
+            "AppContainer (no capabilities) + job object + child-process policy + mitigations ({})",
+            launch::MITIGATION_NAMES
+        ),
+        identity: vec![
+            (
+                "appcontainer".to_owned(),
+                appcontainer::PROFILE_NAME.to_owned(),
+            ),
+            ("package_sid".to_owned(), sid.to_sddl()?),
+            (
+                "ui_restrictions".to_owned(),
+                if in_job {
+                    "no (the Core runs inside a job)".to_owned()
+                } else {
+                    "yes".to_owned()
+                },
+            ),
+        ],
+    })
 }
 
-pub(crate) fn contain(
-    child: &tokio::process::Child,
-    confinement: &Confinement,
-) -> io::Result<Contained> {
-    let limits = &confinement.limits;
-    let pid = child
-        .id()
-        .ok_or_else(|| io::Error::other("worker exited before it could be contained"))?;
-    let process = child
-        .raw_handle()
-        .ok_or_else(|| io::Error::other("worker has no process handle"))?
-        as HANDLE;
+/// Remove the package SID's entries from every granted path, then delete
+/// the AppContainer profile.
+pub(crate) fn remove(confinement: &Confinement) -> io::Result<Vec<String>> {
+    let sid = appcontainer::PackageSid::derive()?;
+    let mut done: Vec<String> = appcontainer::revoke_paths(&sid, &confinement.filesystem)?
+        .into_iter()
+        .map(|path| format!("removed the worker's access entry from {path}"))
+        .collect();
+    if appcontainer::delete_profile()? {
+        done.push(format!(
+            "deleted the AppContainer profile {}",
+            appcontainer::PROFILE_NAME
+        ));
+    }
+    Ok(done)
+}
 
+/// Whether the Core itself runs inside a job object.
+fn current_process_in_job() -> io::Result<bool> {
+    let mut in_job = 0;
+    // SAFETY: the current-process pseudo-handle and a null job handle ask
+    // whether this process is in any job.
+    let ok = unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) };
+    check(ok, "IsProcessInJob(self)")?;
+    Ok(in_job != 0)
+}
+
+/// A job that kills its processes when the Core closes it, admits one
+/// active process when child processes are denied, caps committed memory,
+/// and turns an unhandled exception into an exit instead of a dialog.
+fn create_job(confinement: &Confinement, ui_restricted: bool) -> io::Result<Handle> {
     let job = Handle::new(
         // SAFETY: no security attributes, unnamed job; the result is checked.
         unsafe { CreateJobObjectW(null(), null()) },
@@ -96,30 +130,28 @@ pub(crate) fn contain(
 
     // SAFETY: an all-zero JOBOBJECT_EXTENDED_LIMIT_INFORMATION is a valid
     // value of this plain C struct.
-    let mut limits_info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
-    limits_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
         | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-    limits_info.BasicLimitInformation.ActiveProcessLimit = 1;
-    limits_info.ProcessMemoryLimit = usize::try_from(limits.memory_bytes).unwrap_or(usize::MAX);
+    if confinement.deny_child_processes {
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.ActiveProcessLimit = 1;
+    }
+    limits.ProcessMemoryLimit =
+        usize::try_from(confinement.limits.memory_bytes).unwrap_or(usize::MAX);
     // SAFETY: `job` is a valid job handle and the pointer and size describe
     // the structure that matches JobObjectExtendedLimitInformation.
     let ok = unsafe {
         SetInformationJobObject(
             job.0,
             JobObjectExtendedLimitInformation,
-            (&raw const limits_info).cast::<c_void>(),
+            (&raw const limits).cast::<c_void>(),
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )
     };
     check(ok, "SetInformationJobObject(limits)")?;
 
-    let mut already_in_job = 0;
-    // SAFETY: a null job handle asks whether the process is in any job.
-    let ok = unsafe { IsProcessInJob(process, null_mut(), &mut already_in_job) };
-    check(ok, "IsProcessInJob")?;
-    let ui_restricted = already_in_job == 0;
     if ui_restricted {
         let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
             UIRestrictionsClass: JOB_OBJECT_UILIMIT_ALL,
@@ -135,75 +167,105 @@ pub(crate) fn contain(
         };
         check(ok, "SetInformationJobObject(ui)")?;
     }
-
-    // SAFETY: both handles are valid; the process is suspended.
-    let ok = unsafe { AssignProcessToJobObject(job.0, process) };
-    check(ok, "AssignProcessToJobObject")?;
-
-    lower_token(process)?;
-    resume_threads(pid)?;
-
-    let mut controls = vec![
-        "job object (killed with the Core, no child processes)".to_owned(),
-        format!("commit limit {} MiB", limits.memory_bytes / (1024 * 1024)),
-        "low integrity".to_owned(),
-        "privileges removed".to_owned(),
-    ];
-    if ui_restricted {
-        controls.push("UI restrictions".to_owned());
-    } else {
-        controls.push("no UI restrictions (already inside a job)".to_owned());
-    }
-    Ok(Contained {
-        inner: Guard { job, pid },
-        description: controls.join(", "),
-    })
+    Ok(job)
 }
 
-/// Lower the child's primary token to Low integrity and remove its
-/// privileges, then read the integrity level back.
-fn lower_token(process: HANDLE) -> io::Result<()> {
+/// Confirm the suspended worker's token is an AppContainer token at low
+/// integrity, then remove its privileges. Fails closed.
+fn verify_worker_token(process: HANDLE) -> io::Result<()> {
     let mut raw = null_mut();
-    // SAFETY: `process` is a valid process handle; `raw` receives a token
-    // handle that `Handle` closes.
-    let ok = unsafe {
-        OpenProcessToken(
-            process,
-            TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &mut raw,
-        )
-    };
-    check(ok, "OpenProcessToken")?;
-    let token = Handle::new(raw).ok_or_else(|| last_error("OpenProcessToken"))?;
+    // SAFETY: a valid process handle; `raw` receives a token handle that
+    // `Handle` closes.
+    let ok = unsafe { OpenProcessToken(process, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut raw) };
+    check(ok, "OpenProcessToken(worker)")?;
+    let token = Handle::new(raw).ok_or_else(|| last_error("OpenProcessToken(worker)"))?;
 
-    let low = LowSid::new()?;
-    let label = TOKEN_MANDATORY_LABEL {
-        Label: SID_AND_ATTRIBUTES {
-            Sid: low.0,
-            Attributes: SE_GROUP_INTEGRITY as u32,
-        },
-    };
-    // SAFETY: the label points at a valid SID that outlives the call; the
-    // length covers the structure and the SID.
-    let ok = unsafe {
-        SetTokenInformation(
-            token.0,
-            TokenIntegrityLevel,
-            (&raw const label).cast::<c_void>(),
-            size_of::<TOKEN_MANDATORY_LABEL>() as u32 + GetLengthSid(low.0),
-        )
-    };
-    check(ok, "SetTokenInformation(TokenIntegrityLevel)")?;
-
-    remove_privileges(&token)?;
-
+    if !is_app_container(&token)? {
+        return Err(io::Error::other(
+            "the worker is not running in an AppContainer",
+        ));
+    }
     let level = integrity_rid(&token)?;
-    if level != SECURITY_MANDATORY_LOW_RID as u32 {
+    if level > SECURITY_MANDATORY_LOW_RID as u32 {
         return Err(io::Error::other(format!(
-            "worker integrity level is {level:#x}, expected low"
+            "worker integrity level is {level:#x}, expected low or below"
         )));
     }
+    remove_privileges(&token)
+}
+
+/// Confirm the worker was placed in its job at creation.
+fn require_in_job(process: HANDLE, job: &Handle) -> io::Result<()> {
+    let mut in_job = 0;
+    // SAFETY: valid process and job handles.
+    let ok = unsafe { IsProcessInJob(process, job.0, &mut in_job) };
+    check(ok, "IsProcessInJob(worker)")?;
+    if in_job == 0 {
+        return Err(io::Error::other("the worker is not inside its job object"));
+    }
     Ok(())
+}
+
+fn is_app_container(token: &Handle) -> io::Result<bool> {
+    let mut value = 0u32;
+    let mut needed = 0u32;
+    // SAFETY: TokenIsAppContainer is a DWORD; the buffer is exactly that.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenIsAppContainer,
+            (&raw mut value).cast::<c_void>(),
+            size_of::<u32>() as u32,
+            &mut needed,
+        )
+    };
+    check(ok, "GetTokenInformation(TokenIsAppContainer)")?;
+    Ok(value != 0)
+}
+
+/// Whether the process `pid` runs with an AppContainer token or below
+/// medium integrity. Used by the RPC server to refuse any client that is
+/// not the interactive user at normal integrity.
+pub(crate) fn is_restricted_process(pid: u32) -> io::Result<bool> {
+    let process = Handle::new(
+        // SAFETY: opens the process for a query only.
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) },
+    )
+    .ok_or_else(|| last_error("OpenProcess(client)"))?;
+    let mut raw = null_mut();
+    // SAFETY: a valid process handle; the token handle is owned by `Handle`.
+    let ok = unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut raw) };
+    check(ok, "OpenProcessToken(client)")?;
+    let token = Handle::new(raw).ok_or_else(|| last_error("OpenProcessToken(client)"))?;
+    Ok(is_app_container(&token)? || integrity_rid(&token)? < SECURITY_MANDATORY_MEDIUM_RID as u32)
+}
+
+/// A NUL-terminated UTF-16 copy of `value`.
+fn wide(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(Some(0)).collect()
+}
+
+fn wide_str(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+/// A SID in its `S-1-...` string form.
+fn sid_to_string(sid: PSID) -> io::Result<String> {
+    let mut text = null_mut();
+    // SAFETY: a valid SID; `text` receives a LocalAlloc'd string freed below.
+    let ok = unsafe { ConvertSidToStringSidW(sid, &mut text) };
+    check(ok, "ConvertSidToStringSidW")?;
+    // SAFETY: `text` is a NUL-terminated UTF-16 string from the call above.
+    let value = unsafe {
+        let mut len = 0;
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
+    };
+    // SAFETY: allocated by ConvertSidToStringSidW.
+    unsafe { LocalFree(text.cast::<c_void>()) };
+    Ok(value)
 }
 
 fn remove_privileges(token: &Handle) -> io::Result<()> {
@@ -306,41 +368,6 @@ fn token_information(token: &Handle, class: i32) -> io::Result<Vec<u64>> {
     Ok(buffer)
 }
 
-/// Resume every thread of the (suspended, single-threaded) child.
-fn resume_threads(pid: u32) -> io::Result<()> {
-    let snapshot = Handle::new(
-        // SAFETY: a thread snapshot of the whole system; checked below.
-        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) },
-    )
-    .ok_or_else(|| last_error("CreateToolhelp32Snapshot"))?;
-    // SAFETY: an all-zero THREADENTRY32 is valid; dwSize is set as required.
-    let mut entry: THREADENTRY32 = unsafe { zeroed() };
-    entry.dwSize = size_of::<THREADENTRY32>() as u32;
-    let mut resumed = 0;
-    // SAFETY: valid snapshot handle and a correctly sized entry.
-    let mut more = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
-    while more {
-        if entry.th32OwnerProcessID == pid {
-            let thread = Handle::new(
-                // SAFETY: opens the thread by ID with only the resume right.
-                unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) },
-            )
-            .ok_or_else(|| last_error("OpenThread"))?;
-            // SAFETY: valid thread handle with THREAD_SUSPEND_RESUME.
-            if unsafe { ResumeThread(thread.0) } == u32::MAX {
-                return Err(last_error("ResumeThread"));
-            }
-            resumed += 1;
-        }
-        // SAFETY: as for Thread32First.
-        more = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
-    }
-    if resumed == 0 {
-        return Err(io::Error::other("no thread found to resume"));
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
 pub(crate) struct Guard {
     job: Handle,
@@ -433,20 +460,7 @@ impl OwnerOnlyDescriptor {
         // SAFETY: the buffer holds a TOKEN_USER whose SID points into the
         // same buffer, which lives until the end of this function.
         let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        let mut text = null_mut();
-        // SAFETY: valid SID; `text` receives a LocalAlloc'd string freed below.
-        let ok = unsafe { ConvertSidToStringSidW(sid, &mut text) };
-        check(ok, "ConvertSidToStringSidW")?;
-        // SAFETY: `text` is a NUL-terminated UTF-16 string from the call above.
-        let sid_text = unsafe {
-            let mut len = 0;
-            while *text.add(len) != 0 {
-                len += 1;
-            }
-            String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
-        };
-        // SAFETY: allocated by ConvertSidToStringSidW.
-        unsafe { LocalFree(text.cast::<c_void>()) };
+        let sid_text = sid_to_string(sid)?;
 
         let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid_text})")
             .encode_utf16()
@@ -497,40 +511,6 @@ impl Drop for Handle {
     fn drop(&mut self) {
         // SAFETY: the handle is valid and owned by this value.
         unsafe { CloseHandle(self.0) };
-    }
-}
-
-/// The Low mandatory label SID (S-1-16-4096), freed on drop.
-struct LowSid(PSID);
-
-impl LowSid {
-    fn new() -> io::Result<Self> {
-        let mut sid: PSID = null_mut();
-        // SAFETY: builds a SID with one sub-authority; `sid` is freed by Drop.
-        let ok = unsafe {
-            AllocateAndInitializeSid(
-                &SECURITY_MANDATORY_LABEL_AUTHORITY,
-                1,
-                SECURITY_MANDATORY_LOW_RID as u32,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                &mut sid,
-            )
-        };
-        check(ok, "AllocateAndInitializeSid")?;
-        Ok(Self(sid))
-    }
-}
-
-impl Drop for LowSid {
-    fn drop(&mut self) {
-        // SAFETY: allocated by AllocateAndInitializeSid.
-        unsafe { FreeSid(self.0) };
     }
 }
 

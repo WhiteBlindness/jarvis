@@ -1,7 +1,9 @@
 //! The long-lived Core.
 //!
 //! Start-up opens the store (lock, migrations), closes everything a previous
-//! run left open, records `core_started`, and starts the local RPC server.
+//! run left open, records `core_started`, proves that the worker's OS
+//! isolation is enforced on this machine (and stops if it is not), and
+//! starts the local RPC server.
 //! The Core then supervises the worker: it starts and contains it, runs one
 //! session with it, and when the worker stops, restarts it with exponential
 //! backoff as long as the restart budget allows. Shutdown (signal or an
@@ -21,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, SupervisorConfig};
 use crate::gateway::Gateway;
 use crate::hub::Hub;
+use crate::isolation::{self, IsolationError, WorkerLaunch};
 use crate::rpc::{self, Endpoint, Listener, RpcState};
 use crate::session::{SessionContext, SessionEnd, SessionError, run_session};
 use crate::store::{Store, StoreError};
@@ -45,6 +48,8 @@ pub enum CoreError {
         endpoint: String,
         source: std::io::Error,
     },
+    #[error(transparent)]
+    Isolation(#[from] IsolationError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +177,16 @@ pub async fn serve_with_executor(
     )
     .await?;
 
+    // No worker starts until its isolation has been shown to hold here.
+    let launch = match verified_launch(config).await {
+        Ok(launch) => launch,
+        Err(error) => {
+            let reason = error.to_string();
+            record(&store, AuditEventKind::CoreStopped { reason }).await?;
+            return Err(CoreError::Isolation(error));
+        }
+    };
+
     let hub = Arc::new(Hub::default());
     let endpoint = Endpoint::from_config(&config.rpc);
     let listener = match Listener::bind(&endpoint) {
@@ -213,7 +228,7 @@ pub async fn serve_with_executor(
         core_version: CORE_VERSION,
         hub: Arc::clone(&hub),
     };
-    let supervised = supervise(config, &ctx, &shutdown).await;
+    let supervised = supervise(config, &launch, &ctx, &shutdown).await;
 
     rpc_stop.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), rpc_task).await;
@@ -235,17 +250,33 @@ pub async fn serve_with_executor(
     Ok(report)
 }
 
+/// Build the worker's launch and run the isolation probe under it. The
+/// canary goes next to the database, which the worker is never granted.
+async fn verified_launch(config: &Config) -> Result<WorkerLaunch, IsolationError> {
+    let launch = isolation::launch(&config.worker)?;
+    let scratch = config
+        .database
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let verification = isolation::verify(&launch, &scratch).await?;
+    let checks: Vec<&str> = verification.checks.iter().map(|c| c.name).collect();
+    tracing::info!(
+        elapsed_ms = verification.elapsed.as_millis(),
+        checks = %checks.join(", "),
+        controls = %verification.controls,
+        "worker isolation verified"
+    );
+    Ok(launch)
+}
+
 async fn supervise(
     config: &Config,
+    launch: &WorkerLaunch,
     ctx: &SessionContext,
     shutdown: &CancellationToken,
 ) -> Result<ServeReport, CoreError> {
     let hub = &ctx.hub;
-    let confinement = crate::confinement::for_worker(&config.worker);
-    tracing::info!(
-        grants = confinement.filesystem.len(),
-        "worker confinement built"
-    );
     let mut policy = RestartPolicy::new(config.supervisor);
     let mut report = ServeReport {
         sessions: 0,
@@ -258,7 +289,7 @@ async fn supervise(
             worker.pid = None;
         });
         let started = Instant::now();
-        match supervisor::spawn(&config.worker, &confinement) {
+        match supervisor::spawn(launch) {
             Err(error) => {
                 tracing::error!(%error, program = %config.worker.program, "worker failed to start");
                 record(

@@ -38,8 +38,23 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Proves the worker boundary on this runner before the tests rely on
+      # it (no network, no access to the Core's files, no child processes).
+      # On Windows the first run also grants the interpreter's directory to
+      # the worker's AppContainer identity.
+      - name: Isolation check
+        shell: bash
+        run: |
+          sed 's/^program = "python3"/program = "python"/' config/jarvis.example.toml > config/jarvis.ci.toml
+          cargo run --locked -p jarvis-core -- isolation check --config config/jarvis.ci.toml
       - name: Test
         run: cargo test --workspace --locked
+        env:
+          JARVIS_TEST_PYTHON: python
+      # Prints interpreter start-up time with and without isolation and the
+      # resident memory of an idle confined interpreter.
+      - name: Isolation overhead
+        run: cargo test -p jarvis-sandbox --test contain --locked -- --ignored --nocapture measure_isolation_overhead
         env:
           JARVIS_TEST_PYTHON: python
 

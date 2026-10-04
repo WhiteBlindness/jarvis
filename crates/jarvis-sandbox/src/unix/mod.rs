@@ -10,18 +10,105 @@
 //! async-signal-safe.
 
 use std::io;
+use std::process::{ExitStatus, Stdio};
 
-use crate::{Confinement, Contained};
+use crate::{Confinement, Contained, Report, Spawned, WorkerCommand};
 
 #[cfg(target_os = "linux")]
 mod landlock;
 #[cfg(target_os = "linux")]
 mod seccomp;
 
-pub(crate) fn prepare(
-    command: &mut tokio::process::Command,
-    confinement: &Confinement,
-) -> io::Result<()> {
+pub(crate) type Stdin = tokio::process::ChildStdin;
+pub(crate) type Stdout = tokio::process::ChildStdout;
+pub(crate) type Stderr = tokio::process::ChildStderr;
+
+pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::Result<Spawned> {
+    let mut cmd = tokio::process::Command::new(&command.program);
+    cmd.args(&command.args)
+        .env_clear()
+        .envs(command.env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(cwd) = &command.cwd {
+        cmd.current_dir(cwd);
+    }
+    prepare(&mut cmd, confinement)?;
+    // Every control is applied in the child before exec; if any fails, the
+    // exec does not happen and spawn returns the error.
+    let mut child = cmd.spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| io::Error::other("worker exited before it could be contained"))?;
+    let contained = describe(pid, confinement);
+    let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let (Some(stdin), Some(stdout), Some(stderr)) = pipes else {
+        let _ = contained.kill_all();
+        return Err(io::Error::other("worker pipes were not created"));
+    };
+    Ok(Spawned {
+        process: crate::Process {
+            inner: Process { child, pid },
+        },
+        contained,
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct Process {
+    child: tokio::process::Child,
+    pid: u32,
+}
+
+impl Process {
+    pub(crate) fn id(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait().await
+    }
+
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    pub(crate) fn start_kill(&mut self) -> io::Result<()> {
+        self.child.start_kill()
+    }
+}
+
+pub(crate) fn report(confinement: &Confinement) -> io::Result<Report> {
+    #[cfg(target_os = "linux")]
+    {
+        let abi = landlock::abi_version()?;
+        let _ = confinement;
+        Ok(Report {
+            mechanism: format!("landlock (ABI {abi}) + seccomp-bpf + rlimits"),
+            identity: vec![("user".to_owned(), current_uid().to_string())],
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = confinement;
+        Ok(Report {
+            mechanism: "process group + rlimits (no filesystem or network boundary)".to_owned(),
+            identity: vec![("user".to_owned(), current_uid().to_string())],
+        })
+    }
+}
+
+pub(crate) fn remove(_confinement: &Confinement) -> io::Result<Vec<String>> {
+    // Landlock and seccomp leave nothing behind.
+    Ok(Vec::new())
+}
+
+fn prepare(command: &mut tokio::process::Command, confinement: &Confinement) -> io::Result<()> {
     // Own process group: the whole tree can be signalled at once.
     command.process_group(0);
     let parent = std::process::id();
@@ -153,13 +240,7 @@ fn mark_close_on_exec_from(first: libc::c_int, max_fd: libc::c_int) {
     }
 }
 
-pub(crate) fn contain(
-    child: &tokio::process::Child,
-    confinement: &Confinement,
-) -> io::Result<Contained> {
-    let pid = child
-        .id()
-        .ok_or_else(|| io::Error::other("worker exited before it could be contained"))?;
+fn describe(pid: u32, confinement: &Confinement) -> Contained {
     let mut controls = vec![
         "own process group".to_owned(),
         "stdio only".to_owned(),
@@ -182,10 +263,10 @@ pub(crate) fn contain(
             controls.push("no child processes".to_owned());
         }
     }
-    Ok(Contained {
+    Contained {
         inner: Guard { pgid: pid },
         description: controls.join(", "),
-    })
+    }
 }
 
 #[derive(Debug)]

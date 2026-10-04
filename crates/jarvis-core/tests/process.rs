@@ -713,18 +713,48 @@ fn a_silent_worker_is_killed_at_the_handshake_timeout() {
 }
 
 #[test]
-fn a_missing_worker_program_is_reported_and_retried_within_the_budget() {
+fn a_missing_worker_program_stops_the_core_before_any_worker() {
+    // The worker's isolation is checked before the first start, and that
+    // needs the program; a Core that cannot check it does not run.
     let setup = Setup::new("crash", POLICY, "");
     setup.edit(
         &format!("program = {:?}", python()),
         "program = \"jarvis-no-such-interpreter\"",
     );
-    setup.edit("restart_budget = 3", "restart_budget = 1");
-    let daemon = setup.serve();
-    setup.wait_for_kind("worker_restart_abandoned", 1);
-    assert!(setup.log().contains("worker failed to start"));
-    assert_eq!(worker_exits(&setup), [(None, false); 2]);
-    assert_eq!(setup.shutdown(daemon).code(), Some(2));
+    let output = setup.run(&["serve"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("was not found"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(setup.count("worker_spawned"), 0);
+    let stopped = setup
+        .events()
+        .into_iter()
+        .find_map(|event| match event.event {
+            AuditEventKind::CoreStopped { reason } => Some(reason),
+            _ => None,
+        });
+    assert!(stopped.is_some_and(|reason| reason.contains("was not found")));
+}
+
+#[test]
+fn isolation_check_proves_the_boundary_without_a_running_core() {
+    let setup = Setup::new("real", POLICY, "");
+    let output = setup.run(&["isolation", "check"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text}\n{}", stderr(&output));
+    for check in [
+        "no loopback TCP",
+        "no loopback UDP",
+        "no access to the Core's files",
+        "no child processes",
+    ] {
+        assert!(text.contains(&format!("ok          {check}")), "{text}");
+    }
+    // It ran no Core: there is no database.
+    assert!(!setup.database().exists());
 }
 
 #[test]

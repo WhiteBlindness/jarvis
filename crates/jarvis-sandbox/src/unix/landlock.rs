@@ -8,7 +8,7 @@
 //! process — is denied. See ADR 0014.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
@@ -104,11 +104,9 @@ impl Ruleset {
     }
 }
 
-use std::os::fd::FromRawFd;
-
 /// The kernel's Landlock ABI version, or an error if Landlock is unavailable
 /// (not built in, or disabled at boot).
-fn abi_version() -> io::Result<i64> {
+pub(crate) fn abi_version() -> io::Result<i64> {
     // SAFETY: the version query takes a null attr, zero size and the version
     // flag; it returns the ABI number or -1.
     let abi = unsafe {
