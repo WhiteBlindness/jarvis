@@ -178,17 +178,14 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
         )
     };
     let created = check(created, "CreateProcessW").map_err(|error| {
+        let mut context = launch_context(command);
         if error.raw_os_error() == Some(ERROR_ENVVAR_NOT_FOUND as i32) {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "{error}; starting an AppContainer needs {} in the Core's environment",
-                    PROFILE_VARIABLES.join(", ")
-                ),
-            )
-        } else {
-            error
+            context.push_str(&format!(
+                "; starting an AppContainer needs {} in the Core's environment",
+                PROFILE_VARIABLES.join(", ")
+            ));
         }
+        io::Error::new(error.kind(), format!("{error} ({context})"))
     });
     // The child holds its own copies now. Ours must close, or the Core would
     // never see end-of-file on the worker's output.
@@ -470,6 +467,26 @@ const PROFILE_VARIABLES: [&str; 5] = [
     "LOCALAPPDATA",
     "USERPROFILE",
 ];
+
+/// What a failed launch had to work with, for the error message: whether the
+/// program and working directory exist, and which profile variables the
+/// Core's environment lacks.
+fn launch_context(command: &WorkerCommand) -> String {
+    let missing: Vec<&str> = PROFILE_VARIABLES
+        .into_iter()
+        .filter(|name| std::env::var_os(name).is_none())
+        .collect();
+    format!(
+        "program exists: {}, working directory exists: {}, missing profile variables: {}",
+        command.program.is_file(),
+        command.cwd.as_ref().is_none_or(|dir| dir.is_dir()),
+        if missing.is_empty() {
+            "none".to_owned()
+        } else {
+            missing.join(", ")
+        }
+    )
+}
 
 /// `env` plus the profile variables an AppContainer launch needs, taken
 /// from the Core's environment when `env` does not set them.

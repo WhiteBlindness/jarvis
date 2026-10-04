@@ -205,7 +205,10 @@ pub struct Verification {
 /// The probe. It reports what happened; the Core trusts only what it can
 /// observe itself (its listener, its datagram socket, its canary's content)
 /// plus the probe's report of refusals, and treats anything unexpected as a
-/// failure.
+/// failure. On Windows the Filtering Platform drops a blocked connection
+/// attempt silently, so the TCP attempt gives up after 2 s; an allowed
+/// loopback connection completes in far less, and the UDP check is a second,
+/// independent signal the Core observes itself.
 const PROBE: &str = r#"
 import json, socket, subprocess, sys
 tcp, udp, canary = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
@@ -219,7 +222,7 @@ def attempt(name, action):
         report[name] = "allowed"
 def connect_tcp():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(5)
+    s.settimeout(2)
     s.connect(("127.0.0.1", tcp))
     s.sendall(b"probe")
 def send_udp():

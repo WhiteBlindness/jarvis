@@ -259,6 +259,20 @@ async fn dropping_the_process_kills_the_worker() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_workers_start_and_exit_independently() {
+    // Several isolated processes starting and exiting at once, as when a
+    // probe exits just before the worker starts, or several Cores run.
+    let runs: Vec<_> = (0..6)
+        .map(|n| tokio::spawn(async move { run(&format!("print({n})")).await }))
+        .collect();
+    for (n, handle) in runs.into_iter().enumerate() {
+        let outcome = handle.await.unwrap();
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+        assert_eq!(outcome.stdout.trim(), n.to_string());
+    }
+}
+
 #[tokio::test]
 async fn a_relative_program_is_refused() {
     let mut command = command("pass");

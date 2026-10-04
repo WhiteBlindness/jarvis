@@ -48,7 +48,7 @@ jobs:
           sed 's/^program = "python3"/program = "python"/' config/jarvis.example.toml > config/jarvis.ci.toml
           cargo run --locked -p jarvis-core -- isolation check --config config/jarvis.ci.toml
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
         env:
           JARVIS_TEST_PYTHON: python
       # Prints interpreter start-up time with and without isolation, the

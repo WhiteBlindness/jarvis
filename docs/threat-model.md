@@ -1,6 +1,6 @@
 # Threat model
 
-This document defines what JARVIS protects, where the trust boundaries are, and which controls exist today. It covers the Phase 2 system: a long-lived Rust Core that supervises one contained Python worker, executes typed tools under a capability policy, asks a person before any class B action, and serves local clients over RPC. It was written before any model integration, and it is the reference for every new tool.
+This document defines what JARVIS protects, where the trust boundaries are, and which controls exist today. It covers the Phase 3 system: a long-lived Rust Core that supervises one Python worker isolated by the operating system, executes typed tools under a capability policy, asks a person before any class B action, and serves local clients over RPC. It was written before any model integration, and it is the reference for every new tool.
 
 Each threat lists its current mitigation and the test that proves it, or states plainly that the mitigation is planned.
 
@@ -22,12 +22,18 @@ Each threat lists its current mitigation and the test that proves it, or states 
         ^  stdio pipe, line-delimited JSON
         |  (the worker's only channel to the Core)
         v
-+--------------------------------------------------+
-| Python worker (untrusted)                         |
-|  OS containment: job object + low integrity       |
-|  (Windows), process group + pdeathsig (Linux)     |
-|  deterministic planner today; models later        |
-+--------------------------------------------------+
++==================================================+
+| OS isolation boundary, proved at Core start-up    |
+|  Windows: AppContainer (no capabilities), job,    |
+|    child-process policy, handle list, mitigations |
+|  Linux: Landlock + seccomp + no capabilities      |
+| +----------------------------------------------+ |
+| | Python worker (untrusted)                    | |
+| |  reads its runtime and source, nothing else  | |
+| |  no network, no processes, no other files    | |
+| |  deterministic planner today; models later   | |
+| +----------------------------------------------+ |
++==================================================+
 ```
 
 ## Assets
@@ -36,10 +42,10 @@ Each threat lists its current mitigation and the test that proves it, or states 
 | --- | --- | --- |
 | Filesystem | Personal files, project files, system files | Tools read inside one fixture directory and write inside one workspace directory, writes only after a person approves |
 | Credentials | API keys, tokens, SSH keys, password stores | None through tools; the worker starts with a cleared environment |
-| Private documents | Notes, mail, documents on the PC | None through tools. A compromised worker can read what the user can read (see known gaps) |
+| Private documents | Notes, mail, documents on the PC | None through tools. The worker's OS isolation denies it every file outside its runtime and source |
 | Browser and session data | Cookies, profiles, saved sessions | As above |
-| Processes | Ability to start, stop or control programs | No tool starts processes. On Windows the worker cannot start any |
-| Network access | Exfiltration, remote actions | No tool performs network I/O. The worker is not blocked from the network (known gap) |
+| Processes | Ability to start, stop or control programs | No tool starts processes. The worker can start, signal or read no other process |
+| Network access | Exfiltration, remote actions | No tool performs network I/O. The worker has no network at all, loopback included |
 | The approval channel | Whoever can approve can trigger class B actions | Local RPC, same user only, worker refused |
 | User identity | Hostname, username, account names | `system.info` deliberately omits them |
 | The Core's own state | Policy, config, audit log, task and approval history | Not reachable through the worker protocol or the RPC interface |
@@ -51,11 +57,11 @@ Each threat lists its current mitigation and the test that proves it, or states 
 | Person at the machine | Trusted | Owns the machine, writes the config and policy, decides on approvals |
 | Local client (CLI) | Trusted as the person | Any process of the same user that can open the RPC endpoint, except the worker |
 | Model (future) | Untrusted | Its output is data. It may be steered by content it reads (prompt injection) |
-| Python worker | Untrusted | Its requests are validated as if hostile, and it runs under OS containment |
+| Python worker | Untrusted | Its requests are validated as if hostile, and the OS isolates it from everything but its runtime, its source and its stdio |
 | Rust Core | Trusted | The only component that decides and executes |
 | Tool Gateway and tools | Trusted code, bounded | Receive typed arguments only after policy (and, for class B, a person) allows them |
 | Other local users | Untrusted | Cannot reach the RPC endpoint |
-| Operating system | Trusted | The Core relies on OS process isolation, file permissions, peer credentials and job objects |
+| Operating system | Trusted | The Core relies on AppContainers, the Windows Filtering Platform and job objects (Windows), Landlock and seccomp (Linux), file permissions and peer credentials |
 
 ## Trust boundaries
 
@@ -63,7 +69,7 @@ Each threat lists its current mitigation and the test that proves it, or states 
 2. **Worker → Core (stdio protocol).** Every frame is size-bounded, decoded strictly, version-checked, tied to the current job and validated before it can create a task.
 3. **Client → Core (local RPC).** The OS identifies every peer before a request is read. Requests are size-bounded and decoded strictly; there are nine typed operations and none runs a tool directly.
 4. **Core → tools.** The Gateway calls a tool only with a typed, validated call that policy has allowed and, for class B, whose approval was consumed in the same transaction that started execution.
-5. **Worker → OS.** OS containment limits what worker code can do outside the protocol. It is not a sandbox (see known gaps).
+5. **Worker → OS.** The worker runs inside an OS isolation boundary (ADRs 0013, 0014): it can read its interpreter and its own source, and nothing else; it has no network, cannot start or signal processes, and cannot reach the Core's RPC endpoint. The Core proves the boundary on each start before any worker runs, and refuses to run a worker if it does not hold.
 
 ## Security invariants
 
@@ -76,8 +82,9 @@ These rules hold in the current code. Changes that break one of them need an ADR
 5. **One approval, one request, one use.** An approval is bound by fingerprint to one task, request, tool, argument set and capability set. It is granted only by a local client that presents that fingerprint, and consumed at most once. It never survives its session or a restart.
 6. **One task, one terminal state; append-only audit.** Task and approval transitions commit with their audit events. Triggers reject changes to terminal tasks, decided approvals, finished jobs and any audit event.
 7. **Everything is bounded.** Frames, results, fixture and workspace sizes, tool time, job time, approval time, requests and protocol errors per session, frames buffered while waiting for a person, RPC request size, RPC connections, long-poll time, worker memory and worker restarts.
-8. **The worker does not inherit secrets or authority.** Cleared environment, no inherited descriptors besides stdio, no shell, OS containment applied before it runs any code.
+8. **The worker does not inherit secrets or authority.** Cleared environment (on Windows plus the profile variables an AppContainer launch requires), no inherited descriptors or handles besides stdio, no shell, no privileges or capabilities, OS isolation applied before it runs any code.
 9. **Strict decoding on every interface.** Unknown fields, unknown message types and other versions are rejected on the worker protocol and the RPC interface.
+10. **The worker's isolation is proved, not assumed.** Before the first worker starts, the Core runs a probe under the identical isolation and checks from its own side that it cannot reach the network (loopback included), read the Core's files or start a process. If any check fails, the Core does not start.
 
 ## Action classes
 
