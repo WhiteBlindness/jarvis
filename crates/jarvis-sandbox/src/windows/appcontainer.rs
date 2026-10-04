@@ -29,7 +29,7 @@ use windows_sys::Win32::Security::Isolation::{
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    EqualSid, FreeSid, GetAce, INHERIT_ONLY_ACE, NO_INHERITANCE, OBJECT_INHERIT_ACE,
+    EqualSid, FreeSid, GetAce, INHERIT_ONLY_ACE, INHERITED_ACE, NO_INHERITANCE, OBJECT_INHERIT_ACE,
     PSECURITY_DESCRIPTOR, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -192,21 +192,44 @@ fn container_folder(sid: &PackageSid) -> io::Result<Result<PathBuf, i32>> {
 /// Deny the package SID every write in its own AppContainer folder, which
 /// Windows otherwise gives it in full (it is where `TEMP` points). With
 /// this, the worker can write nowhere: it cannot fill the disk or keep
-/// state across restarts. Done once; later starts find the entry.
+/// state across restarts.
+///
+/// Windows gives the subfolders their own explicit allow entries, and an
+/// explicit allow is weighed before an inherited deny, so the deny is set
+/// explicitly on the folder and on every directory below it. Done once;
+/// later starts find the entries.
 pub(crate) fn deny_container_writes(sid: &PackageSid) -> io::Result<()> {
+    const MAX_DIRECTORIES: usize = 256;
     let folder =
         container_folder(sid)?.map_err(|code| hresult_error("GetAppContainerFolderPath", code))?;
-    let dacl = Dacl::read(&folder)?;
-    if dacl.denies(sid, WRITE_RIGHTS) {
-        return Ok(());
+    let mut pending = vec![folder];
+    let mut visited = 0;
+    while let Some(dir) = pending.pop() {
+        visited += 1;
+        if visited > MAX_DIRECTORIES {
+            return Err(io::Error::other(
+                "the AppContainer folder holds more directories than expected",
+            ));
+        }
+        let dacl = Dacl::read(&dir)?;
+        if !dacl.denies_explicitly(sid, WRITE_RIGHTS) {
+            dacl.apply(
+                &dir,
+                sid,
+                DENY_ACCESS,
+                WRITE_RIGHTS,
+                SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            )?;
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            // Directories only; links and junctions are not followed.
+            if entry.file_type()?.is_dir() {
+                pending.push(entry.path());
+            }
+        }
     }
-    dacl.apply(
-        &folder,
-        sid,
-        DENY_ACCESS,
-        WRITE_RIGHTS,
-        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-    )
+    Ok(())
 }
 
 /// The rights a grant gives the package SID. Every grant includes
@@ -372,14 +395,18 @@ impl Dacl {
             })
     }
 
-    /// Whether a deny entry for `sid` covers all of `rights`.
-    fn denies(&self, sid: &PackageSid, rights: u32) -> bool {
-        self.entries().into_iter().any(|(kind, entry, mask, _)| {
-            kind == ACCESS_DENIED_ACE_TYPE
+    /// Whether an explicit (not inherited) deny entry for `sid` covers all
+    /// of `rights`.
+    fn denies_explicitly(&self, sid: &PackageSid, rights: u32) -> bool {
+        self.entries()
+            .into_iter()
+            .any(|(kind, entry, mask, flags)| {
+                kind == ACCESS_DENIED_ACE_TYPE
+                && flags & INHERITED_ACE as u8 == 0
                 // SAFETY: valid SIDs.
                 && unsafe { EqualSid(entry, sid.as_psid()) } != 0
                 && mask & rights == rights
-        })
+            })
     }
 
     /// Whether any allow entry names `sid`.

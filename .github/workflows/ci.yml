@@ -58,18 +58,27 @@ jobs:
         run: cargo test -p jarvis-sandbox --test contain --locked -- --include-ignored --nocapture measure_isolation_overhead only_the_given_environment_reaches_the_worker
         env:
           JARVIS_TEST_PYTHON: python
-      # The optional provisioning script, end to end on a throwaway runner:
-      # install twice (idempotent), check, remove twice.
+      # The optional provisioning script, end to end on a throwaway runner.
+      # The runner is elevated, so jarvis-core is run directly here: the
+      # script itself never starts it with administrator rights.
       - name: Isolation script
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $config = 'config/jarvis.ci.toml'
-          scripts/windows/isolation.ps1 -Action Install -Config $config -Yes
-          scripts/windows/isolation.ps1 -Action Install -Config $config -Yes
-          scripts/windows/isolation.ps1 -Action Check -Config $config
-          scripts/windows/isolation.ps1 -Action Remove -Config $config -Yes
-          scripts/windows/isolation.ps1 -Action Remove -Config $config -Yes
+          $core = 'target/debug/jarvis-core.exe'
+          $python = Split-Path (Get-Command python).Source
+          $sid = scripts/windows/isolation.ps1 -Action Sid
+          $reported = (& $core isolation check --config $config | Select-String '^package sid\s+(\S+)').Matches[0].Groups[1].Value
+          if ($sid -ne $reported) { throw "package SID: script $sid, Core $reported" }
+          scripts/windows/isolation.ps1 -Action Install -GrantPath $python -Yes
+          scripts/windows/isolation.ps1 -Action Install -GrantPath $python -Yes
+          & $core isolation check --config $config
+          if ($LASTEXITCODE -ne 0) { throw 'isolation check failed with the firewall rules in place' }
+          scripts/windows/isolation.ps1 -Action Remove -GrantPath $python -Yes
+          scripts/windows/isolation.ps1 -Action Remove -GrantPath $python -Yes
+          & $core isolation remove --config $config
+          & $core isolation remove --config $config
 
   msrv:
     name: Minimum Rust version

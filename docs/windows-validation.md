@@ -76,7 +76,8 @@ Expected: the class A job completes. The write waits; the approval shows path, s
 - Security tab: **AppContainer** flag set, integrity **AppContainer** (low), package SID `S-1-15-2-...` matching section 2, no privileges except `SeChangeNotifyPrivilege`, no capabilities listed.
 - Job tab: one job with active process limit 1, process memory limit 512 MiB, kill on job close, and (if `health` says so) UI restrictions.
 - Handles view: the three stdio pipe handles (`\Device\NamedPipe\jarvis-worker-...`) and no handle to `jarvis.db`, `jarvis.db.lock`, the WAL file, the `\Device\NamedPipe\jarvis` RPC pipe, or any file in your profile.
-- Environment tab: `PATH`, `SYSTEMROOT`, the profile variables (`APPDATA`, `HOMEDRIVE`, `HOMEPATH`, `LOCALAPPDATA`, `USERPROFILE`) and nothing else (Windows may also add `TEMP`/`TMP` pointing into `%LOCALAPPDATA%\Packages\jarvis.worker\AC`). Set `$env:JARVIS_SECRET_PROBE = "x"` before starting the Core and confirm it is absent.
+- Environment tab: `PATH`, `SYSTEMROOT`, the profile variables (`APPDATA`, `HOMEDRIVE`, `HOMEPATH`, `USERPROFILE`), and `LOCALAPPDATA`, `TEMP` and `TMP`, which Windows points into `%LOCALAPPDATA%\Packages\jarvis.worker\AC` (CI observed this), and nothing else. Set `$env:JARVIS_SECRET_PROBE = "x"` before starting the Core and confirm it is absent.
+- Security of `%LOCALAPPDATA%\Packages\jarvis.worker\AC` (Properties, Security, Advanced): an entry denying the package SID write access, inherited by everything below.
 
 End `jarvis-core.exe` from Task Manager (End task). Expected: the worker disappears with it.
 
@@ -121,21 +122,24 @@ Record: interpreter start with and without isolation, the idle worker's memory, 
 
 ## 9. Optional provisioning, and removal
 
-Normal use needs neither step. From an **elevated** PowerShell:
+Normal use needs neither step. The script never starts `jarvis-core.exe` with administrator rights: it derives the worker's package SID itself.
 
 ```powershell
-scripts\windows\isolation.ps1 -Action Install -Config $cfg
+scripts\windows\isolation.ps1 -Action Sid                    # the package SID
+scripts\windows\isolation.ps1 -Action Check -Config $cfg     # as your normal user
 ```
 
-It lists what it will do and asks first: add Windows Firewall rules in the group `JARVIS worker isolation` that block all traffic for the worker's package SID, and, only if the isolation check failed because your Python directory could not be granted, grant read and execute on it. Run it twice: the second run says there is nothing to do. Check the rules in `wf.msc` (Outbound and Inbound rules, group `JARVIS worker isolation`, scoped to the package). Then, as a normal user, `scripts\windows\isolation.ps1 -Action Check -Config $cfg`.
+`Sid` must print the same SID as `jarvis isolation check`. `Check` refuses to run from an elevated PowerShell.
 
-To undo everything (elevated if the firewall rules exist):
+From an **elevated** PowerShell, once:
 
 ```powershell
-scripts\windows\isolation.ps1 -Action Remove -Config $cfg
+scripts\windows\isolation.ps1 -Action Install
 ```
 
-Expected: the rules are gone, `icacls <python dir>` no longer lists the package SID, and `%LOCALAPPDATA%\Packages\jarvis.worker` no longer exists. A later `jarvis isolation check` recreates the profile and grants.
+It lists what it will do and asks first: add Windows Firewall rules in the group `JARVIS worker isolation` that block all traffic for the package SID. If the isolation check failed because your Python, installed for all users outside `Program Files`, could not be granted, add `-GrantPath <python directory>`; the script refuses anything but a directory holding `python.exe` that is neither a drive root nor above `C:\Users`. Run it twice: the second run changes nothing. Check the rules in `wf.msc` (group `JARVIS worker isolation`, scoped to the package), then run `Check` again as your normal user.
+
+To undo everything: elevated, `scripts\windows\isolation.ps1 -Action Remove [-GrantPath <python directory>]` removes the firewall rules and grants; then, as your normal user, `jarvis isolation remove` removes the Core's access entries and the AppContainer profile. Expected afterwards: no rules in the group, `icacls <python dir>` no longer lists the package SID, and `%LOCALAPPDATA%\Packages\jarvis.worker` no longer exists. A later `jarvis isolation check` recreates the profile and grants.
 
 **LOCAL WINDOWS VERIFICATION REQUIRED:** with the Windows Defender Firewall service stopped (only on a test machine), `jarvis isolation check` must either still pass (the Filtering Platform still enforces AppContainer isolation) or fail and make the Core refuse to start. It must never report `ok` while the probe actually reached the network. Record which.
 

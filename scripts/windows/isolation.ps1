@@ -7,43 +7,56 @@
     user, with no administrator rights. Normal use needs nothing from this
     script. It exists to:
 
-      Check    (no administrator rights) Run the Core's own isolation probe,
-               show the worker's AppContainer identity, and report the
-               Windows services that enforce AppContainer network isolation.
+      Sid      Print the worker's package SID (derived from the AppContainer
+               name, as the Core derives it). No administrator rights.
 
-      Install  (administrator, optional, once) Add defence in depth:
-               Windows Firewall rules that block all traffic for the worker's
-               package SID, in case the AppContainer network block were ever
-               not applied. Also grants the worker read and execute access to
-               the interpreter's directory when the user cannot (a Python
-               installed for all users outside Program Files).
+      Check    As your normal user: run the Core's own isolation probe and
+               report the Windows services that enforce AppContainer network
+               isolation and any optional firewall rules. Refuses to run
+               elevated: it starts jarvis-core.exe, which must never run with
+               administrator rights.
 
-      Remove   Undo everything: the firewall rules (administrator), and, by
-               running 'jarvis-core isolation remove', the access entries and
-               the AppContainer profile the Core created (no administrator).
+      Install  Elevated, optional, once. Adds Windows Firewall rules that
+               block all traffic for the worker's package SID, as defence in
+               depth. With -GrantPath, also grants read and execute on an
+               interpreter directory the user may not change (a Python
+               installed for all users outside Program Files). Never starts
+               jarvis-core.exe.
+
+      Remove   Elevated: removes the firewall rules and the -GrantPath
+               entries. As your normal user: runs 'jarvis-core isolation
+               remove', which removes the access entries the Core made and
+               the AppContainer profile.
 
     Every privileged action is listed and confirmed before it is performed
-    (unless -Yes is given). The script stops at the first error and makes no
-    further change. Running it again is safe.
+    (unless -Yes is given). The script stops at the first error. Running it
+    again is safe.
 
 .EXAMPLE
     scripts\windows\isolation.ps1 -Action Check -Config config\jarvis.toml
 
 .EXAMPLE
-    # From an elevated PowerShell, once:
-    scripts\windows\isolation.ps1 -Action Install -Config config\jarvis.toml
+    # From an elevated PowerShell, once (optional):
+    scripts\windows\isolation.ps1 -Action Install
+
+.EXAMPLE
+    # Elevated, for a Python installed for all users in C:\Python312:
+    scripts\windows\isolation.ps1 -Action Install -GrantPath C:\Python312
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Check', 'Install', 'Remove')]
+    [ValidateSet('Sid', 'Check', 'Install', 'Remove')]
     [string] $Action,
 
-    [Parameter(Mandatory)]
+    # The Core configuration (Check, and Remove as a normal user).
     [string] $Config,
 
-    # The jarvis-core executable. Defaults to a release build, then a debug
-    # build, in this repository.
+    # Interpreter directories to grant (Install) or ungrant (Remove).
+    [string[]] $GrantPath = @(),
+
+    # The jarvis-core executable for Check and Remove. Defaults to a release
+    # build, then a debug build, in this repository.
     [string] $Core,
 
     # Do not ask before privileged actions.
@@ -53,17 +66,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Must match PROFILE_NAME in crates/jarvis-sandbox/src/windows/appcontainer.rs.
+$ProfileName = 'JARVIS.Worker'
 $RuleGroup = 'JARVIS worker isolation'
-
-function Find-Core {
-    if ($Core) { return (Resolve-Path $Core).Path }
-    $root = Resolve-Path (Join-Path $PSScriptRoot '..\..')
-    foreach ($build in 'release', 'debug') {
-        $candidate = Join-Path $root "target\$build\jarvis-core.exe"
-        if (Test-Path $candidate) { return $candidate }
-    }
-    throw 'jarvis-core.exe not found; build it (cargo build -p jarvis-core) or pass -Core.'
-}
 
 function Test-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -79,35 +84,57 @@ function Confirm-Step([string[]] $Steps) {
     if ($answer -notmatch '^(y|yes)$') { throw 'Cancelled; nothing was changed.' }
 }
 
-# Runs 'jarvis-core isolation check' and returns its standard output lines
-# and exit code. The identity and grant lines are printed before the probe
-# runs, so they are there even when the probe fails. Errors go to the
-# console directly (redirecting them would make Windows PowerShell 5.1 stop
-# at the first one under ErrorActionPreference = Stop).
-function Invoke-Check([string] $CorePath) {
-    $output = @(& $CorePath isolation check --config $Config | ForEach-Object { "$_" })
-    $code = $LASTEXITCODE
-    $output | ForEach-Object { Write-Host $_ }
-    return @{ Lines = $output; Code = $code }
+# The package SID for the AppContainer name, computed by Windows exactly as
+# the Core computes it. No executable from the repository is involved.
+function Get-PackageSid {
+    if (-not ('JarvisIsolation.Native' -as [type])) {
+        Add-Type -Namespace JarvisIsolation -Name Native -MemberDefinition @'
+[DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+public static extern int DeriveAppContainerSidFromAppContainerName(string name, out IntPtr sid);
+[DllImport("advapi32.dll")]
+public static extern IntPtr FreeSid(IntPtr sid);
+'@
+    }
+    $pointer = [IntPtr]::Zero
+    $result = [JarvisIsolation.Native]::DeriveAppContainerSidFromAppContainerName($ProfileName, [ref]$pointer)
+    if ($result -ne 0) { throw ('DeriveAppContainerSidFromAppContainerName failed: 0x{0:X8}' -f $result) }
+    try {
+        $sid = (New-Object Security.Principal.SecurityIdentifier($pointer)).Value
+    } finally {
+        [void][JarvisIsolation.Native]::FreeSid($pointer)
+    }
+    if ($sid -notmatch '^S-1-15-2(-\d+){7}$') { throw "Unexpected package SID '$sid'." }
+    return $sid
 }
 
-function Assert-Check([string] $CorePath) {
-    $result = Invoke-Check $CorePath
-    if ($result.Code -ne 0) { throw "jarvis-core isolation check failed (exit code $($result.Code))." }
-    return $result.Lines
+# An interpreter directory that may be granted: it exists, holds python.exe,
+# and is neither a drive root nor an ancestor of the user profiles.
+function Resolve-GrantPath([string] $Path) {
+    $full = (Resolve-Path -LiteralPath $Path).ProviderPath.TrimEnd('\')
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) { throw "'$full' is not a directory." }
+    if (-not (Test-Path -LiteralPath (Join-Path $full 'python.exe') -PathType Leaf)) {
+        throw "'$full' holds no python.exe; only an interpreter directory may be granted."
+    }
+    if ($full -ieq ([IO.Path]::GetPathRoot($full)).TrimEnd('\')) { throw "'$full' is a drive root." }
+    $profiles = (Join-Path $env:SystemDrive 'Users').TrimEnd('\')
+    if ($profiles -ieq $full -or $profiles.StartsWith("$full\", [StringComparison]::OrdinalIgnoreCase)) {
+        throw "'$full' contains the user profiles."
+    }
+    return $full
 }
 
-# The paths the Core grants the worker, from the check output. Callers wrap
-# the call in @(): a function that returns an empty array returns $null.
-function Get-Grants([object[]] $Lines) {
-    return @($Lines | Where-Object { $_ -match '^grant\s+(read\+execute|read)\s+(.+)$' } |
-        ForEach-Object { $Matches[2].Trim() })
+function Find-Core {
+    if ($Core) { return (Resolve-Path -LiteralPath $Core).ProviderPath }
+    $root = Resolve-Path (Join-Path $PSScriptRoot '..\..')
+    foreach ($build in 'release', 'debug') {
+        $candidate = Join-Path $root "target\$build\jarvis-core.exe"
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    throw 'jarvis-core.exe not found; build it (cargo build -p jarvis-core) or pass -Core.'
 }
 
-function Get-Field([object[]] $Lines, [string] $Name) {
-    $line = $Lines | Where-Object { "$_" -like "$Name *" } | Select-Object -First 1
-    if (-not $line) { throw "'$Name' missing from the isolation check output." }
-    return ("$line".Substring($Name.Length)).Trim()
+function Assert-Config {
+    if (-not $Config) { throw "-Config is required for $Action." }
 }
 
 function Show-Services {
@@ -115,50 +142,50 @@ function Show-Services {
     # Platform: the Base Filtering Engine (BFE) and the firewall service.
     foreach ($name in 'BFE', 'mpssvc') {
         $service = Get-Service -Name $name -ErrorAction SilentlyContinue
-        $state = if ($service) { $service.Status } else { 'missing' }
-        Write-Host ("service     {0,-8} {1}" -f $name, $state)
+        $state = if ($service) { "$($service.Status)" } else { 'missing' }
+        Write-Host ('service     {0,-8} {1}' -f $name, $state)
         if ($state -ne 'Running') {
             Write-Warning "$name is not running: AppContainer network isolation may not be enforced. The Core's start-up probe fails closed in that case."
         }
     }
 }
 
+# Callers wrap this in @(): a function that returns an empty array returns
+# $null.
 function Get-Rules {
     return @(Get-NetFirewallRule -Group $RuleGroup -ErrorAction SilentlyContinue)
 }
 
-$corePath = Find-Core
-
 switch ($Action) {
+    'Sid' {
+        Get-PackageSid
+    }
+
     'Check' {
-        $lines = Assert-Check $corePath
+        if (Test-Administrator) {
+            throw 'Run Check as your normal user, not elevated: it starts jarvis-core.exe.'
+        }
+        Assert-Config
+        & (Find-Core) isolation check --config $Config
+        if ($LASTEXITCODE -ne 0) { throw "jarvis-core isolation check failed (exit code $LASTEXITCODE)." }
         Show-Services
         $rules = @(Get-Rules)
-        Write-Host ("firewall    {0} optional block rule(s) for the worker" -f $rules.Count)
+        Write-Host ('firewall    {0} optional block rule(s) for the worker' -f $rules.Count)
     }
 
     'Install' {
         if (-not (Test-Administrator)) {
             throw 'Install needs an elevated PowerShell (Run as administrator). Normal use does not.'
         }
-        $result = Invoke-Check $corePath
-        $sid = Get-Field $result.Lines 'package sid'
-        if ($sid -notmatch '^S-1-15-2(-\d+){7}$') { throw "Unexpected package SID '$sid'." }
+        $sid = Get-PackageSid
+        $grants = @($GrantPath | ForEach-Object { Resolve-GrantPath $_ })
+        $rules = @(Get-Rules)
 
         $steps = @()
-        $grants = @()
-        if ($result.Code -ne 0) {
-            # Typically: the interpreter is installed for all users in a
-            # directory the user may not change, so the Core could not grant
-            # the worker access to it. Grant read and execute (and nothing
-            # else) to the package SID on each path the Core grants.
-            $grants = @(Get-Grants $result.Lines)
-            foreach ($path in $grants) {
-                $steps += "grant read and execute on '$path' (inherited) to package SID $sid"
-            }
+        foreach ($path in $grants) {
+            $steps += "grant read and execute on '$path' (inherited) to package SID $sid"
         }
-        $rules = @(Get-Rules)
-        if ($rules.Count -lt 2) {
+        if ($rules.Count -ne 2) {
             $steps += "add Windows Firewall rules (group '$RuleGroup') blocking all inbound and outbound traffic for package SID $sid"
         }
         if ($steps.Count -eq 0) {
@@ -171,31 +198,44 @@ switch ($Action) {
             & icacls.exe $path /grant "*${sid}:(OI)(CI)(RX)" /Q | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "icacls failed on '$path' (exit code $LASTEXITCODE)." }
         }
-        # Replace any partial set so the result is always the same two rules.
-        $rules | Remove-NetFirewallRule
-        New-NetFirewallRule -DisplayName 'JARVIS worker: block outbound' -Group $RuleGroup `
-            -Direction Outbound -Action Block -Package $sid -Profile Any | Out-Null
-        New-NetFirewallRule -DisplayName 'JARVIS worker: block inbound' -Group $RuleGroup `
-            -Direction Inbound -Action Block -Package $sid -Profile Any | Out-Null
-        Write-Host 'Firewall rules added.'
-        Assert-Check $corePath | Out-Null
+        if ($rules.Count -ne 2) {
+            # Replace any partial set so the result is always the same two rules.
+            $rules | Remove-NetFirewallRule
+            New-NetFirewallRule -DisplayName 'JARVIS worker: block outbound' -Group $RuleGroup `
+                -Direction Outbound -Action Block -Package $sid -Profile Any | Out-Null
+            New-NetFirewallRule -DisplayName 'JARVIS worker: block inbound' -Group $RuleGroup `
+                -Direction Inbound -Action Block -Package $sid -Profile Any | Out-Null
+        }
+        Write-Host 'Done. Run this script with -Action Check as your normal user to confirm.'
     }
 
     'Remove' {
-        $rules = @(Get-Rules)
-        $steps = @("run 'jarvis-core isolation remove': remove the worker's access entries and delete its AppContainer profile")
-        if ($rules.Count -gt 0) {
-            if (-not (Test-Administrator)) {
-                throw "Firewall rules in group '$RuleGroup' exist; removing them needs an elevated PowerShell."
+        if (Test-Administrator) {
+            $sid = Get-PackageSid
+            $grants = @($GrantPath | ForEach-Object { Resolve-GrantPath $_ })
+            $rules = @(Get-Rules)
+            $steps = @()
+            if ($rules.Count -gt 0) { $steps += "remove $($rules.Count) Windows Firewall rule(s) in group '$RuleGroup'" }
+            foreach ($path in $grants) { $steps += "remove the entries for package SID $sid from '$path'" }
+            if ($steps.Count -gt 0) {
+                Confirm-Step $steps
+                $rules | Remove-NetFirewallRule
+                foreach ($path in $grants) {
+                    & icacls.exe $path /remove:g "*$sid" /Q | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "icacls failed on '$path' (exit code $LASTEXITCODE)." }
+                }
+            } else {
+                Write-Host 'No firewall rules or grants to remove.'
             }
-            $steps += "remove $($rules.Count) Windows Firewall rule(s) in group '$RuleGroup'"
+            Write-Host 'Now run, as your normal user: jarvis-core isolation remove --config <your config>'
+        } else {
+            Assert-Config
+            $rules = @(Get-Rules)
+            & (Find-Core) isolation remove --config $Config
+            if ($LASTEXITCODE -ne 0) { throw "jarvis-core isolation remove failed (exit code $LASTEXITCODE)." }
+            if ($rules.Count -gt 0) {
+                Write-Warning "Firewall rules in group '$RuleGroup' remain; run -Action Remove from an elevated PowerShell to remove them."
+            }
         }
-        Confirm-Step $steps
-        if ($rules.Count -gt 0) {
-            $rules | Remove-NetFirewallRule
-            Write-Host 'Firewall rules removed.'
-        }
-        & $corePath isolation remove --config $Config
-        if ($LASTEXITCODE -ne 0) { throw "jarvis-core isolation remove failed (exit code $LASTEXITCODE)." }
     }
 }
