@@ -99,7 +99,7 @@ pub(crate) fn remove(confinement: &Confinement) -> io::Result<Vec<String>> {
         .into_iter()
         .map(|path| format!("removed the worker's access entry from {path}"))
         .collect();
-    if appcontainer::delete_profile()? {
+    if appcontainer::delete_profile(&sid)? {
         done.push(format!(
             "deleted the AppContainer profile {}",
             appcontainer::PROFILE_NAME

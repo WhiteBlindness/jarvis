@@ -22,7 +22,8 @@ use windows_sys::Win32::Security::Authorization::{
     TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeleteAppContainerProfile,
+    DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
@@ -32,7 +33,9 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
 };
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+use windows_sys::core::PWSTR;
 
 use super::{wide, wide_str};
 use crate::{Access, Grant};
@@ -118,8 +121,12 @@ impl Drop for PackageSid {
     }
 }
 
-/// Delete the profile. Returns whether one existed.
-pub(crate) fn delete_profile() -> io::Result<bool> {
+/// Delete the profile. Returns whether one existed: `DeleteAppContainerProfile`
+/// itself reports success either way, so existence is checked first.
+pub(crate) fn delete_profile(sid: &PackageSid) -> io::Result<bool> {
+    if !profile_exists(sid)? {
+        return Ok(false);
+    }
     let name = wide_str(PROFILE_NAME);
     // SAFETY: a NUL-terminated profile name.
     let result = unsafe { DeleteAppContainerProfile(name.as_ptr()) };
@@ -128,6 +135,22 @@ pub(crate) fn delete_profile() -> io::Result<bool> {
         code if HRESULT_NOT_FOUND.contains(&code) => Ok(false),
         code => Err(hresult_error("DeleteAppContainerProfile", code)),
     }
+}
+
+/// Whether the profile's folder exists. Any answer other than "not found"
+/// counts as existing, so a deletion is still attempted.
+fn profile_exists(sid: &PackageSid) -> io::Result<bool> {
+    let text = wide_str(&sid.to_sddl()?);
+    let mut path: PWSTR = null_mut();
+    // SAFETY: a NUL-terminated SID string and an out pointer that, on
+    // success, receives a CoTaskMemAlloc'd string freed below.
+    let result = unsafe { GetAppContainerFolderPath(text.as_ptr(), &mut path) };
+    if result == 0 {
+        // SAFETY: allocated by GetAppContainerFolderPath with CoTaskMemAlloc.
+        unsafe { CoTaskMemFree(path.cast()) };
+        return Ok(true);
+    }
+    Ok(!HRESULT_NOT_FOUND.contains(&result))
 }
 
 /// The rights a grant gives the package SID. Every grant includes
