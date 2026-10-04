@@ -79,11 +79,13 @@ function Confirm-Step([string[]] $Steps) {
     if ($answer -notmatch '^(y|yes)$') { throw 'Cancelled; nothing was changed.' }
 }
 
-# Runs 'jarvis-core isolation check' and returns its output lines and exit
-# code. The identity and grant lines are printed before the probe runs, so
-# they are there even when the probe fails.
+# Runs 'jarvis-core isolation check' and returns its standard output lines
+# and exit code. The identity and grant lines are printed before the probe
+# runs, so they are there even when the probe fails. Errors go to the
+# console directly (redirecting them would make Windows PowerShell 5.1 stop
+# at the first one under ErrorActionPreference = Stop).
 function Invoke-Check([string] $CorePath) {
-    $output = @(& $CorePath isolation check --config $Config 2>&1 | ForEach-Object { "$_" })
+    $output = @(& $CorePath isolation check --config $Config | ForEach-Object { "$_" })
     $code = $LASTEXITCODE
     $output | ForEach-Object { Write-Host $_ }
     return @{ Lines = $output; Code = $code }
@@ -95,7 +97,8 @@ function Assert-Check([string] $CorePath) {
     return $result.Lines
 }
 
-# The paths the Core grants the worker, from the check output.
+# The paths the Core grants the worker, from the check output. Callers wrap
+# the call in @(): a function that returns an empty array returns $null.
 function Get-Grants([object[]] $Lines) {
     return @($Lines | Where-Object { $_ -match '^grant\s+(read\+execute|read)\s+(.+)$' } |
         ForEach-Object { $Matches[2].Trim() })
@@ -130,7 +133,7 @@ switch ($Action) {
     'Check' {
         $lines = Assert-Check $corePath
         Show-Services
-        $rules = Get-Rules
+        $rules = @(Get-Rules)
         Write-Host ("firewall    {0} optional block rule(s) for the worker" -f $rules.Count)
     }
 
@@ -149,12 +152,12 @@ switch ($Action) {
             # directory the user may not change, so the Core could not grant
             # the worker access to it. Grant read and execute (and nothing
             # else) to the package SID on each path the Core grants.
-            $grants = Get-Grants $result.Lines
+            $grants = @(Get-Grants $result.Lines)
             foreach ($path in $grants) {
                 $steps += "grant read and execute on '$path' (inherited) to package SID $sid"
             }
         }
-        $rules = Get-Rules
+        $rules = @(Get-Rules)
         if ($rules.Count -lt 2) {
             $steps += "add Windows Firewall rules (group '$RuleGroup') blocking all inbound and outbound traffic for package SID $sid"
         }
@@ -179,7 +182,7 @@ switch ($Action) {
     }
 
     'Remove' {
-        $rules = Get-Rules
+        $rules = @(Get-Rules)
         $steps = @("run 'jarvis-core isolation remove': remove the worker's access entries and delete its AppContainer profile")
         if ($rules.Count -gt 0) {
             if (-not (Test-Administrator)) {
