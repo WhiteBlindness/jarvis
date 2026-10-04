@@ -1,4 +1,4 @@
 {
-  "frame": "{\"protocol\":1,\"type\":\"tool_request\",\"request_id\":\"r1\",\"tool\":\"rm -rf /\",\"args\":{}}",
+  "frame": "{\"protocol\":2,\"type\":\"tool_request\",\"request_id\":\"r1\",\"job_id\":\"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b\",\"tool\":\"rm -rf /\",\"args\":{}}",
   "error": "malformed_frame"
 }

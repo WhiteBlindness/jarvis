@@ -3,7 +3,7 @@
 //! Every frame is a JSON object with a `protocol` field and a `type` tag:
 //!
 //! ```json
-//! {"protocol":1,"type":"tool_request","request_id":"r1","tool":"system.info","args":{}}
+//! {"protocol":2,"type":"tool_request","request_id":"r1","job_id":"…","tool":"system.info","args":{}}
 //! ```
 
 use std::fmt;
@@ -12,8 +12,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Capability, ErrorCode, ProtocolVersion, RequestId, SessionId, TaskId, ToolName, ToolResult,
-    WireError,
+    ApprovalId, Capability, ErrorCode, Goal, JobId, ProtocolVersion, RequestId, SessionId, Summary,
+    TaskId, ToolName, ToolResult, WireError,
 };
 
 /// First message of a session, sent by the worker.
@@ -24,15 +24,34 @@ pub struct Hello {
     pub worker_version: Label,
 }
 
-/// A request to run one tool. The worker names the tool and its arguments,
-/// nothing else: there is no field for capabilities, approvals or task IDs,
-/// and adding one makes the frame malformed.
+/// A request to run one tool while working on a job. The worker names the
+/// job, the tool and its arguments, nothing else: there is no field for
+/// capabilities, approvals or task IDs, and adding one makes the frame
+/// malformed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolRequest {
     pub request_id: RequestId,
+    pub job_id: JobId,
     pub tool: ToolName,
     pub args: serde_json::Value,
+}
+
+/// How the worker ended a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobOutcome {
+    Completed,
+    Failed,
+}
+
+/// The worker has finished the job it was given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobResult {
+    pub job_id: JobId,
+    pub outcome: JobOutcome,
+    pub summary: Summary,
 }
 
 /// Messages a worker may send.
@@ -41,6 +60,7 @@ pub struct ToolRequest {
 pub enum WorkerMessage {
     Hello(Hello),
     ToolRequest(ToolRequest),
+    JobResult(JobResult),
 }
 
 /// Limits the Core enforces for the session, announced at handshake.
@@ -62,23 +82,36 @@ pub struct Welcome {
     pub limits: SessionLimits,
 }
 
-/// What happened to a tool request that became a task.
+/// A job assigned to the worker. The worker works on one job at a time and
+/// answers with `job_result`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobAssignment {
+    pub job_id: JobId,
+    pub goal: Goal,
+}
+
+/// What happened to a tool request that became a task. A request that needs
+/// a person's confirmation gets its reply only once the person has decided
+/// (or the approval has expired); the worker never sees the approval itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolOutcome {
-    /// Policy allowed the call, the tool ran, and its result passed verification.
+    /// Policy allowed the call (with a person's approval where required),
+    /// the tool ran, and its result passed verification.
     Completed { result: ToolResult },
     /// Policy denied at least one required capability. Nothing ran.
     Denied {
         capabilities: Vec<Capability>,
         reason: String,
     },
-    /// A human must confirm this call. Nothing ran, and the task expires
-    /// when the session ends.
-    ConfirmationRequired {
-        capabilities: Vec<Capability>,
-        reason: String,
+    /// A person declined to approve the call. Nothing ran.
+    Declined {
+        approval_id: ApprovalId,
+        reason: Summary,
     },
+    /// Nobody approved the call before the approval expired. Nothing ran.
+    Expired { approval_id: ApprovalId },
     /// The tool does not exist or its arguments are invalid. Nothing ran.
     Rejected { error: WireError },
     /// The tool ran but failed, timed out, was cancelled, or produced a
@@ -113,6 +146,7 @@ pub struct ErrorMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoreMessage {
     Welcome(Welcome),
+    Job(JobAssignment),
     ToolResponse(ToolResponse),
     Error(ErrorMessage),
 }
@@ -166,13 +200,11 @@ pub enum DecodeError {
         request_id: Option<RequestId>,
         reason: String,
     },
-    #[error(
-        "unsupported protocol version {found}; this side speaks {}",
-        ProtocolVersion::CURRENT
-    )]
+    #[error("unsupported protocol version {found}; this side speaks {expected}")]
     UnsupportedVersion {
         request_id: Option<RequestId>,
         found: u64,
+        expected: u32,
     },
 }
 
@@ -199,14 +231,16 @@ impl DecodeError {
     }
 }
 
+const VERSION_KEY: &str = "protocol";
+
 /// Decode a frame sent by a worker.
 pub fn decode_worker_message(frame: &[u8]) -> Result<WorkerMessage, DecodeError> {
-    decode(frame)
+    decode_versioned(frame, VERSION_KEY, ProtocolVersion::CURRENT.0)
 }
 
 /// Decode a frame sent by the Core. Used by tests and Rust-side clients.
 pub fn decode_core_message(frame: &[u8]) -> Result<CoreMessage, DecodeError> {
-    decode(frame)
+    decode_versioned(frame, VERSION_KEY, ProtocolVersion::CURRENT.0)
 }
 
 /// Encode a Core message as one JSON object, without the trailing newline.
@@ -236,7 +270,11 @@ fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>, serde_json::Error> {
 /// Strict decoding in a fixed order: JSON, object, version, schema. The
 /// version is checked before the schema because a frame from another version
 /// may legitimately have a different shape.
-fn decode<T: DeserializeOwned>(frame: &[u8]) -> Result<T, DecodeError> {
+pub(crate) fn decode_versioned<T: DeserializeOwned>(
+    frame: &[u8],
+    key: &str,
+    expected: u32,
+) -> Result<T, DecodeError> {
     let value: serde_json::Value =
         serde_json::from_slice(frame).map_err(|error| DecodeError::Malformed {
             request_id: None,
@@ -254,20 +292,26 @@ fn decode<T: DeserializeOwned>(frame: &[u8]) -> Result<T, DecodeError> {
         .and_then(serde_json::Value::as_str)
         .and_then(|id| RequestId::try_from(id.to_owned()).ok());
 
-    match object.remove("protocol") {
+    match object.remove(key) {
         None => {
             return Err(DecodeError::Malformed {
                 request_id,
-                reason: "missing field `protocol`".to_owned(),
+                reason: format!("missing field `{key}`"),
             });
         }
         Some(version) => match version.as_u64() {
-            Some(found) if found == u64::from(ProtocolVersion::CURRENT.0) => {}
-            Some(found) => return Err(DecodeError::UnsupportedVersion { request_id, found }),
+            Some(found) if found == u64::from(expected) => {}
+            Some(found) => {
+                return Err(DecodeError::UnsupportedVersion {
+                    request_id,
+                    found,
+                    expected,
+                });
+            }
             None => {
                 return Err(DecodeError::Malformed {
                     request_id,
-                    reason: "`protocol` must be a non-negative integer".to_owned(),
+                    reason: format!("`{key}` must be a non-negative integer"),
                 });
             }
         },
@@ -285,6 +329,8 @@ mod tests {
 
     use super::*;
 
+    const JOB: &str = "01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b";
+
     fn frame(value: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&value).unwrap()
     }
@@ -292,14 +338,14 @@ mod tests {
     #[test]
     fn decodes_hello_and_tool_request() {
         let hello = decode_worker_message(&frame(json!({
-            "protocol": 1, "type": "hello", "worker": "jarvis-worker", "worker_version": "0.1.0"
+            "protocol": 2, "type": "hello", "worker": "jarvis-worker", "worker_version": "0.1.0"
         })))
         .unwrap();
         assert!(matches!(hello, WorkerMessage::Hello(_)));
 
         let request = decode_worker_message(&frame(json!({
-            "protocol": 1, "type": "tool_request", "request_id": "r1",
-            "tool": "system.info", "args": {}
+            "protocol": 2, "type": "tool_request", "request_id": "r1",
+            "job_id": JOB, "tool": "system.info", "args": {}
         })))
         .unwrap();
         assert!(matches!(request, WorkerMessage::ToolRequest(_)));
@@ -312,14 +358,14 @@ mod tests {
             worker_version: Label::try_from("1".to_owned()).unwrap(),
         });
         let bytes = encode_worker_message(&message).unwrap();
-        assert!(bytes.starts_with(br#"{"protocol":1,"type":"hello""#));
+        assert!(bytes.starts_with(br#"{"protocol":2,"type":"hello""#));
         assert_eq!(decode_worker_message(&bytes).unwrap(), message);
     }
 
     #[test]
     fn version_is_checked_before_schema() {
         let error = decode_worker_message(&frame(json!({
-            "protocol": 2, "type": "something_new", "request_id": "r9"
+            "protocol": 3, "type": "something_new", "request_id": "r9"
         })))
         .unwrap_err();
         assert_eq!(error.code(), ErrorCode::UnsupportedProtocolVersion);
@@ -335,8 +381,8 @@ mod tests {
             json!({"policy": "allow"}),
         ] {
             let mut value = json!({
-                "protocol": 1, "type": "tool_request", "request_id": "r1",
-                "tool": "system.info", "args": {}
+                "protocol": 2, "type": "tool_request", "request_id": "r1",
+                "job_id": JOB, "tool": "system.info", "args": {}
             });
             value
                 .as_object_mut()
@@ -351,7 +397,7 @@ mod tests {
     #[test]
     fn workers_cannot_send_core_messages() {
         let error = decode_worker_message(&frame(json!({
-            "protocol": 1, "type": "welcome", "session_id": SessionId::new(),
+            "protocol": 2, "type": "welcome", "session_id": SessionId::new(),
             "core_version": "0", "tools": [],
             "limits": {"max_frame_bytes": 1, "tool_timeout_ms": 1, "max_requests": 1}
         })))
@@ -367,13 +413,14 @@ mod tests {
             b"[1,2,3]",
             b"\"hello\"",
             b"{}",
-            br#"{"protocol":"1","type":"hello","worker":"w","worker_version":"1"}"#,
+            br#"{"protocol":"2","type":"hello","worker":"w","worker_version":"1"}"#,
             br#"{"protocol":-1,"type":"hello","worker":"w","worker_version":"1"}"#,
-            br#"{"protocol":1}"#,
-            br#"{"protocol":1,"type":"hello"}"#,
-            br#"{"protocol":1,"type":"hello","worker":"bad name","worker_version":"1"}"#,
-            br#"{"protocol":1,"type":"tool_request","request_id":"r 1","tool":"system.info","args":{}}"#,
-            br#"{"protocol":1,"type":"tool_request","request_id":"r1","tool":"System","args":{}}"#,
+            br#"{"protocol":2}"#,
+            br#"{"protocol":2,"type":"hello"}"#,
+            br#"{"protocol":2,"type":"tool_request","request_id":"r1","tool":"system.info","args":{}}"#,
+            br#"{"protocol":2,"type":"hello","worker":"bad name","worker_version":"1"}"#,
+            br#"{"protocol":2,"type":"tool_request","request_id":"r 1","job_id":"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b","tool":"system.info","args":{}}"#,
+            br#"{"protocol":2,"type":"tool_request","request_id":"r1","job_id":"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b","tool":"System","args":{}}"#,
             b"\xff\xfe{}",
         ];
         for case in cases {

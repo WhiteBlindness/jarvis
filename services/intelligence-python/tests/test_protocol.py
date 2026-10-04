@@ -11,19 +11,28 @@ import support
 from jarvis_worker.protocol import (
     PROTOCOL_VERSION,
     Capability,
+    Completed,
+    Declined,
     Denied,
     ErrorCode,
     ErrorMessage,
+    Expired,
     Hello,
+    Job,
+    JobOutcome,
+    JobResult,
     ProtocolError,
     ToolRequest,
     ToolResponse,
     Welcome,
+    WriteOutcome,
     decode_core_message,
     encode_worker_message,
-    validate_fixture_path,
+    validate_goal,
     validate_label,
+    validate_relative_path,
     validate_request_id,
+    validate_summary,
     validate_tool_name,
     validate_uuid,
 )
@@ -67,10 +76,15 @@ def delete_path(*path: str) -> Mutation:
 
 
 WELCOME = support.welcome()
+JOB_FRAME = support.job("system")
 COMPLETED = support.completed_system_info("r1")
 FIXTURE = support.completed_fixture("r1")
+WRITTEN = support.completed_write("r1")
 DENIED = support.denied("r1")
+DECLINED = support.declined("r1")
+EXPIRED = support.expired("r1")
 ERROR = support.error("internal", fatal=True)
+JOB = support.JOB_ID
 
 
 # --- protocol version -------------------------------------------------------------------------
@@ -88,7 +102,7 @@ def test_protocol_may_not_be_a_boolean_even_though_true_is_an_int() -> None:
     )
 
 
-@pytest.mark.parametrize("version", [0, 2, 99, 2**64 - 1])
+@pytest.mark.parametrize("version", [0, 1, 3, 99, 2**64 - 1])
 def test_another_protocol_version_is_unsupported(version: int) -> None:
     assert_rejected(
         mutated(WELCOME, set_path("protocol", value=version)),
@@ -97,7 +111,7 @@ def test_another_protocol_version_is_unsupported(version: int) -> None:
 
 
 def test_version_is_checked_before_the_schema() -> None:
-    frame = b'{"protocol":2,"type":"something_new","anything":[1,2,3]}'
+    frame = b'{"protocol":3,"type":"something_new","anything":[1,2,3]}'
     assert_rejected(frame, ErrorCode.UNSUPPORTED_PROTOCOL_VERSION)
 
 
@@ -105,8 +119,8 @@ def test_missing_protocol_is_malformed() -> None:
     assert_rejected(mutated(WELCOME, delete_path("protocol")))
 
 
-def test_the_current_version_is_one() -> None:
-    assert PROTOCOL_VERSION == 1
+def test_the_current_version_is_two() -> None:
+    assert PROTOCOL_VERSION == 2
 
 
 # --- frame shape -------------------------------------------------------------------------------
@@ -119,15 +133,15 @@ def test_the_current_version_is_one() -> None:
         b"   ",
         b"not json",
         b"{",
-        b'{"protocol":1,}',
+        b'{"protocol":2,}',
         b"[1,2,3]",
         b'"hello"',
         b"1",
         b"null",
         b"true",
         b"{}",
-        b'{"protocol":1}',
-        b'{"protocol":1,"type":"welcome"}',
+        b'{"protocol":2}',
+        b'{"protocol":2,"type":"welcome"}',
     ],
 )
 def test_frames_that_are_not_messages_are_malformed(frame: bytes) -> None:
@@ -138,7 +152,7 @@ def test_frames_that_are_not_messages_are_malformed(frame: bytes) -> None:
     "frame",
     [
         b"\xff\xfe{}",
-        b'{"protocol":1,"type":"error","x":"\xc3("}',
+        b'{"protocol":2,"type":"error","x":"\xc3("}',
         "{}".encode("utf-16"),
         "{}".encode("utf-32"),
         b"\xef\xbb\xbf" + support.to_frame(ERROR),
@@ -161,13 +175,13 @@ def test_non_finite_numbers_are_not_json(constant: str) -> None:
 @pytest.mark.parametrize("number", ["NaN", "Infinity", "1e999", "-1e999"])
 def test_json_is_checked_before_the_version(number: str) -> None:
     """Numbers JSON cannot represent make the frame malformed even if it is from another version."""
-    frame = b'{"protocol":2,"type":"welcome","extra":' + number.encode() + b"}"
+    frame = b'{"protocol":3,"type":"welcome","extra":' + number.encode() + b"}"
     assert_rejected(frame)
 
 
 def test_deeply_nested_json_is_malformed_not_a_crash() -> None:
     assert_rejected(b"[" * 100_000)
-    assert_rejected(b'{"protocol":1,"type":"error","x":' + b"[" * 100_000)
+    assert_rejected(b'{"protocol":2,"type":"error","x":' + b"[" * 100_000)
 
 
 def test_lone_surrogates_are_malformed() -> None:
@@ -183,7 +197,9 @@ def test_whitespace_around_the_object_is_tolerated() -> None:
     assert isinstance(message, ErrorMessage)
 
 
-@pytest.mark.parametrize("message_type", ["hello", "tool_request", "shell", "", None, 1, ["error"]])
+@pytest.mark.parametrize(
+    "message_type", ["hello", "tool_request", "job_result", "shell", "", None, 1, ["error"]]
+)
 def test_unknown_or_foreign_message_types_are_malformed(message_type: object) -> None:
     assert_rejected(mutated(ERROR, set_path("type", value=message_type)))
 
@@ -196,6 +212,10 @@ def test_type_is_required() -> None:
 
 EXTRA_FIELDS: list[tuple[dict[str, Any], tuple[str, ...]]] = [
     (WELCOME, ()),
+    (JOB_FRAME, ()),
+    (WRITTEN, ("outcome", "result")),
+    (DECLINED, ("outcome",)),
+    (EXPIRED, ("outcome",)),
     (WELCOME, ("limits",)),
     (COMPLETED, ()),
     (COMPLETED, ("outcome",)),
@@ -231,6 +251,12 @@ def test_unknown_fields_are_malformed_at_every_level(
         (WELCOME, ("limits", "max_frame_bytes")),
         (WELCOME, ("limits", "tool_timeout_ms")),
         (WELCOME, ("limits", "max_requests")),
+        (JOB_FRAME, ("job_id",)),
+        (JOB_FRAME, ("goal",)),
+        (WRITTEN, ("outcome", "result", "created")),
+        (DECLINED, ("outcome", "approval_id")),
+        (DECLINED, ("outcome", "reason")),
+        (EXPIRED, ("outcome", "approval_id")),
         (COMPLETED, ("request_id",)),
         (COMPLETED, ("task_id",)),
         (COMPLETED, ("outcome",)),
@@ -273,6 +299,18 @@ def test_missing_fields_are_malformed(base: dict[str, Any], path: tuple[str, ...
         (WELCOME, ("limits", "max_requests"), 2**32),
         (WELCOME, ("limits", "tool_timeout_ms"), 2**64),
         (WELCOME, ("limits", "tool_timeout_ms"), None),
+        (JOB_FRAME, ("job_id",), "not-a-uuid"),
+        (JOB_FRAME, ("goal",), ""),
+        (JOB_FRAME, ("goal",), "a\nb"),
+        (JOB_FRAME, ("goal",), "x" * 2001),
+        (JOB_FRAME, ("goal",), 1),
+        (WRITTEN, ("outcome", "result", "created"), 1),
+        (WRITTEN, ("outcome", "result", "created"), "true"),
+        (WRITTEN, ("outcome", "result", "path"), "../escape"),
+        (DECLINED, ("outcome", "approval_id"), "x"),
+        (DECLINED, ("outcome", "reason"), "line\nbreak"),
+        (DECLINED, ("outcome", "reason"), "x" * 1001),
+        (EXPIRED, ("outcome", "approval_id"), None),
         (COMPLETED, ("request_id",), 1),
         (COMPLETED, ("outcome",), "completed"),
         (COMPLETED, ("outcome", "status"), 1),
@@ -365,7 +403,9 @@ def test_unknown_error_codes_are_malformed(code: str) -> None:
     )
 
 
-@pytest.mark.parametrize("status", ["maybe", "", "Completed", "pending", None, 3])
+@pytest.mark.parametrize(
+    "status", ["maybe", "", "Completed", "pending", "confirmation_required", "approved", None, 3]
+)
 def test_unknown_outcome_statuses_are_malformed(status: object) -> None:
     assert_rejected(mutated(COMPLETED, set_path("outcome", "status", value=status)))
 
@@ -412,6 +452,28 @@ def test_decoding_does_not_change_typed_values() -> None:
     )
 
 
+def test_the_new_messages_and_outcomes_decode() -> None:
+    assert decode_core_message(support.to_frame(JOB_FRAME)) == Job(job_id=JOB, goal="system")
+    written = decode_core_message(support.to_frame(WRITTEN))
+    assert isinstance(written, ToolResponse)
+    assert written.outcome == Completed(WriteOutcome(path="notes.txt", bytes=5, created=True))
+    declined = decode_core_message(support.to_frame(DECLINED))
+    assert isinstance(declined, ToolResponse)
+    assert declined.outcome == Declined(approval_id=support.APPROVAL_ID, reason="not now")
+    expired = decode_core_message(support.to_frame(EXPIRED))
+    assert isinstance(expired, ToolResponse)
+    assert expired.outcome == Expired(approval_id=support.APPROVAL_ID)
+
+
+def test_an_approval_outcome_carries_no_capability_or_flag_the_worker_could_reuse() -> None:
+    """``declined`` and ``expired`` only inform; extra fields such as a token are refused."""
+    for base in (DECLINED, EXPIRED):
+        for key in ("approved", "token", "capabilities"):
+            document = copy.deepcopy(base)
+            document["outcome"][key] = True
+            assert_rejected(support.to_frame(document))
+
+
 def test_non_ascii_text_survives_decoding() -> None:
     document = support.error("internal", fatal=True)
     document["error"]["message"] = "caf\u00e9 \u2603 \U0001f600"
@@ -424,22 +486,28 @@ def test_non_ascii_text_survives_decoding() -> None:
 
 
 def test_encoding_is_compact_with_protocol_and_type_first() -> None:
-    hello = encode_worker_message(Hello("jarvis-worker", "0.1.0"))
+    hello = encode_worker_message(Hello("jarvis-worker", "0.2.0"))
     assert hello == (
-        b'{"protocol":1,"type":"hello","worker":"jarvis-worker","worker_version":"0.1.0"}'
+        b'{"protocol":2,"type":"hello","worker":"jarvis-worker","worker_version":"0.2.0"}'
     )
     request = encode_worker_message(
-        ToolRequest("req-1", "filesystem.read_fixture", {"path": "a/b.txt"})
+        ToolRequest("req-1", JOB, "filesystem.read_fixture", {"path": "a/b.txt"})
     )
     assert request == (
-        b'{"protocol":1,"type":"tool_request","request_id":"req-1",'
+        b'{"protocol":2,"type":"tool_request","request_id":"req-1",'
+        b'"job_id":"' + JOB.encode() + b'",'
         b'"tool":"filesystem.read_fixture","args":{"path":"a/b.txt"}}'
+    )
+    result = encode_worker_message(JobResult(JOB, JobOutcome.FAILED, "0 call(s)"))
+    assert result == (
+        b'{"protocol":2,"type":"job_result","job_id":"' + JOB.encode() + b'",'
+        b'"outcome":"failed","summary":"0 call(s)"}'
     )
 
 
 def test_encoding_keeps_non_ascii_text_as_utf8() -> None:
     frame = encode_worker_message(
-        ToolRequest("r1", "filesystem.read_fixture", {"path": "caf\u00e9"})
+        ToolRequest("r1", JOB, "filesystem.read_fixture", {"path": "caf\u00e9"})
     )
     assert "caf\u00e9".encode() in frame
     assert json.loads(frame)["args"] == {"path": "caf\u00e9"}
@@ -447,7 +515,7 @@ def test_encoding_keeps_non_ascii_text_as_utf8() -> None:
 
 def test_encoded_frames_stay_on_one_line() -> None:
     args: dict[str, Any] = {"path": "a\nb\r\nc\u2028d"}
-    frame = encode_worker_message(ToolRequest("r1", "filesystem.read_fixture", args))
+    frame = encode_worker_message(ToolRequest("r1", JOB, "filesystem.read_fixture", args))
     assert b"\n" not in frame
     assert b"\r" not in frame
     assert json.loads(frame)["args"] == args
@@ -455,13 +523,13 @@ def test_encoded_frames_stay_on_one_line() -> None:
 
 def test_encoding_preserves_argument_order_and_nesting() -> None:
     args: dict[str, Any] = {"z": 1, "a": [1, 2.5, None, True, {"k": "v"}]}
-    frame = encode_worker_message(ToolRequest("r1", "system.info", args))
+    frame = encode_worker_message(ToolRequest("r1", JOB, "system.info", args))
     assert frame.endswith(b'"args":{"z":1,"a":[1,2.5,null,true,{"k":"v"}]}}')
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), "\ud800", object(), {1, 2}])
 def test_arguments_that_are_not_json_cannot_be_encoded(bad: object) -> None:
-    request = ToolRequest("r1", "system.info", {"value": bad})  # type: ignore[dict-item]
+    request = ToolRequest("r1", JOB, "system.info", {"value": bad})  # type: ignore[dict-item]
     with pytest.raises(ProtocolError) as raised:
         encode_worker_message(request)
     assert raised.value.code == MALFORMED
@@ -478,13 +546,41 @@ def test_hello_labels_are_validated(worker: str) -> None:
 @pytest.mark.parametrize("request_id", ["", "../r1", "x" * 65])
 def test_tool_requests_validate_their_request_id(request_id: str) -> None:
     with pytest.raises(ProtocolError):
-        ToolRequest(request_id=request_id, tool="system.info", args={})
+        ToolRequest(request_id=request_id, job_id=JOB, tool="system.info", args={})
 
 
 @pytest.mark.parametrize("tool", ["", "system", "System.info", "rm -rf /", "a." + "b" * 64])
 def test_tool_requests_validate_their_tool_name(tool: str) -> None:
     with pytest.raises(ProtocolError):
-        ToolRequest(request_id="r1", tool=tool, args={})
+        ToolRequest(request_id="r1", job_id=JOB, tool=tool, args={})
+
+
+@pytest.mark.parametrize("job_id", ["", "not-a-uuid", support.SESSION_ID + "x"])
+def test_tool_requests_validate_their_job_id(job_id: str) -> None:
+    with pytest.raises(ProtocolError):
+        ToolRequest(request_id="r1", job_id=job_id, tool="system.info", args={})
+
+
+@pytest.mark.parametrize(
+    ("outcome", "summary"),
+    [("approved", ""), ("COMPLETED", ""), ("completed", "a\nb"), ("failed", "x" * 1001)],
+)
+def test_job_results_are_validated(outcome: str, summary: str) -> None:
+    with pytest.raises(ProtocolError):
+        JobResult(job_id=JOB, outcome=outcome, summary=summary)  # type: ignore[arg-type]
+
+
+def test_goal_and_summary_bounds() -> None:
+    assert validate_goal("x") == "x"
+    assert validate_goal("\u00e9" * 2000) == "\u00e9" * 2000
+    assert validate_summary("") == ""
+    assert validate_summary("x" * 1000) == "x" * 1000
+    for bad_goal in ["", "x" * 2001, "a\tb", "a\x7fb", "a\x85b"]:
+        with pytest.raises(ProtocolError):
+            validate_goal(bad_goal)
+    for bad_summary in ["x" * 1001, "a\nb", "\x1b[2J"]:
+        with pytest.raises(ProtocolError):
+            validate_summary(bad_summary)
 
 
 # --- identifier syntax (mirrors the Rust unit tests) ---------------------------------------------
@@ -529,12 +625,12 @@ def test_uuid_syntax() -> None:
         validate_uuid("not-a-uuid", "session_id")
 
 
-def test_fixture_path_accepts_plain_relative_paths() -> None:
+def test_relative_path_accepts_plain_relative_paths() -> None:
     for good in ["welcome.txt", "notes/today.md", "a/b/c-d_e.1.txt", "2026", "a/" * 15 + "a"]:
-        assert validate_fixture_path(good) == good
+        assert validate_relative_path(good) == good
 
 
-def test_fixture_path_rejects_escapes_and_ambiguous_forms() -> None:
+def test_relative_path_rejects_escapes_and_ambiguous_forms() -> None:
     for bad in [
         "",
         "..",
@@ -565,7 +661,7 @@ def test_fixture_path_rejects_escapes_and_ambiguous_forms() -> None:
         "/".join(["a"] * 17),
     ]:
         with pytest.raises(ProtocolError):
-            validate_fixture_path(bad)
+            validate_relative_path(bad)
 
 
 # --- ProtocolError -----------------------------------------------------------------------------

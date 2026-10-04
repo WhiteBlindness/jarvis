@@ -82,30 +82,38 @@ impl WireError {
     /// name. Control characters are escaped so that such text cannot forge
     /// lines or terminal sequences in logs, the audit log or the CLI.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        let message = message.into();
-        let mut message = if message.chars().any(char::is_control) {
-            message
-                .chars()
-                .map(|c| {
-                    if c.is_control() {
-                        c.escape_default().to_string()
-                    } else {
-                        c.to_string()
-                    }
-                })
-                .collect()
-        } else {
-            message
-        };
-        if message.len() > Self::MAX_MESSAGE_LEN {
-            let mut end = Self::MAX_MESSAGE_LEN;
-            while !message.is_char_boundary(end) {
-                end -= 1;
-            }
-            message.truncate(end);
+        Self {
+            code,
+            message: sanitize_message(message.into()),
         }
-        Self { code, message }
     }
+}
+
+/// Escape control characters, then cut to [`WireError::MAX_MESSAGE_LEN`]
+/// bytes at a character boundary.
+pub(crate) fn sanitize_message(message: String) -> String {
+    let mut message = if message.chars().any(char::is_control) {
+        message
+            .chars()
+            .map(|c| {
+                if c.is_control() {
+                    c.escape_default().to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect()
+    } else {
+        message
+    };
+    if message.len() > WireError::MAX_MESSAGE_LEN {
+        let mut end = WireError::MAX_MESSAGE_LEN;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    message
 }
 
 impl fmt::Display for WireError {

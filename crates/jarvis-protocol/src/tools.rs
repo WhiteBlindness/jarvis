@@ -19,7 +19,16 @@ pub struct SystemInfoArgs {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadFixtureArgs {
-    pub path: FixturePath,
+    pub path: RelativePath,
+}
+
+/// Arguments of `workspace.write_file`: create or replace one UTF-8 text
+/// file inside the configured workspace. The Core enforces the size limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteFileArgs {
+    pub path: RelativePath,
+    pub content: String,
 }
 
 /// A validated, typed tool invocation. Produced only by
@@ -29,6 +38,7 @@ pub struct ReadFixtureArgs {
 pub enum ToolCall {
     SystemInfo(SystemInfoArgs),
     ReadFixture(ReadFixtureArgs),
+    WriteFile(WriteFileArgs),
 }
 
 /// Why a well-formed request could not become a [`ToolCall`].
@@ -43,15 +53,18 @@ pub enum CallError {
 impl ToolCall {
     pub const SYSTEM_INFO: &'static str = "system.info";
     pub const READ_FIXTURE: &'static str = "filesystem.read_fixture";
+    pub const WRITE_FILE: &'static str = "workspace.write_file";
 
     /// Every tool the protocol defines, in a stable order.
-    pub const NAMES: &'static [&'static str] = &[Self::READ_FIXTURE, Self::SYSTEM_INFO];
+    pub const NAMES: &'static [&'static str] =
+        &[Self::READ_FIXTURE, Self::SYSTEM_INFO, Self::WRITE_FILE];
 
     /// Resolve a tool name and decode its arguments into the tool's schema.
     pub fn from_request(tool: &ToolName, args: &serde_json::Value) -> Result<Self, CallError> {
         match tool.as_str() {
             Self::SYSTEM_INFO => decode_args(Self::SYSTEM_INFO, args).map(Self::SystemInfo),
             Self::READ_FIXTURE => decode_args(Self::READ_FIXTURE, args).map(Self::ReadFixture),
+            Self::WRITE_FILE => decode_args(Self::WRITE_FILE, args).map(Self::WriteFile),
             other => Err(CallError::UnknownTool(other.to_owned())),
         }
     }
@@ -60,7 +73,21 @@ impl ToolCall {
         match self {
             Self::SystemInfo(_) => Self::SYSTEM_INFO,
             Self::ReadFixture(_) => Self::READ_FIXTURE,
+            Self::WriteFile(_) => Self::WRITE_FILE,
         }
+    }
+
+    /// The validated arguments in normalised form: re-serialised from the
+    /// typed value, with keys in a fixed order. This is what approval
+    /// fingerprints are computed over.
+    pub fn arguments(&self) -> serde_json::Value {
+        let encoded = match self {
+            Self::SystemInfo(args) => serde_json::to_value(args),
+            Self::ReadFixture(args) => serde_json::to_value(args),
+            Self::WriteFile(args) => serde_json::to_value(args),
+        };
+        // Plain structs of strings always serialise.
+        encoded.unwrap_or(serde_json::Value::Null)
     }
 }
 
@@ -80,20 +107,20 @@ fn decode_args<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// A path relative to the fixture directory, checked for syntax before it
-/// reaches the filesystem.
+/// A path relative to a tool's root directory (the fixture directory or the
+/// workspace), checked for syntax before it reaches the filesystem.
 ///
 /// The rules are an allowlist: forward-slash separated components, each made
 /// of ASCII letters, digits, `.`, `_` and `-`, starting with a letter or digit
 /// and not ending with `.`. That excludes `..`, `.`, hidden files, absolute
 /// paths, drive prefixes, backslashes, alternate data streams and Windows
-/// device names. The fixture tool still checks the resolved path against the
-/// canonical fixture root, which catches symlinks that point outside it.
+/// device names. The tools still resolve the path beneath their root directory
+/// handle, which catches symlinks and junctions that point outside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct FixturePath(String);
+pub struct RelativePath(String);
 
-impl FixturePath {
+impl RelativePath {
     pub const MAX_LEN: usize = 255;
     pub const MAX_COMPONENTS: usize = 16;
 
@@ -111,7 +138,7 @@ const WINDOWS_DEVICE_NAMES: &[&str] = &[
     "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
-impl TryFrom<String> for FixturePath {
+impl TryFrom<String> for RelativePath {
     type Error = String;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -167,13 +194,13 @@ fn check_component(component: &str) -> Result<(), String> {
     Ok(())
 }
 
-impl From<FixturePath> for String {
-    fn from(value: FixturePath) -> Self {
+impl From<RelativePath> for String {
+    fn from(value: RelativePath) -> Self {
         value.0
     }
 }
 
-impl fmt::Display for FixturePath {
+impl fmt::Display for RelativePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -203,10 +230,21 @@ pub struct SystemInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FixtureContent {
-    pub path: FixturePath,
+    pub path: RelativePath,
     /// Size of `content` in bytes.
     pub bytes: u64,
     pub content: String,
+}
+
+/// Result of `workspace.write_file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteOutcome {
+    pub path: RelativePath,
+    /// Bytes written.
+    pub bytes: u64,
+    /// The file did not exist before.
+    pub created: bool,
 }
 
 /// Typed output of a tool. Serialised without a tag: the worker already
@@ -217,6 +255,7 @@ pub struct FixtureContent {
 pub enum ToolResult {
     SystemInfo(SystemInfo),
     Fixture(FixtureContent),
+    Written(WriteOutcome),
 }
 
 impl ToolResult {
@@ -226,6 +265,7 @@ impl ToolResult {
             (self, call),
             (Self::SystemInfo(_), ToolCall::SystemInfo(_))
                 | (Self::Fixture(_), ToolCall::ReadFixture(_))
+                | (Self::Written(_), ToolCall::WriteFile(_))
         )
     }
 }
@@ -267,6 +307,40 @@ mod tests {
     }
 
     #[test]
+    fn write_file_arguments_are_strict_and_normalised() {
+        let call = ToolCall::from_request(
+            &tool("workspace.write_file"),
+            &json!({"content": "hi", "path": "notes/a.txt"}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&call.arguments()).unwrap(),
+            r#"{"content":"hi","path":"notes/a.txt"}"#
+        );
+        for args in [
+            json!({"path": "a.txt"}),
+            json!({"path": "../a.txt", "content": ""}),
+            json!({"path": "a.txt", "content": "x", "append": true}),
+            json!({"path": "a.txt", "content": 5}),
+        ] {
+            assert!(matches!(
+                ToolCall::from_request(&tool("workspace.write_file"), &args),
+                Err(CallError::InvalidArguments { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn untagged_results_decode_to_the_right_variant() {
+        let written: ToolResult =
+            serde_json::from_value(json!({"path": "a.txt", "bytes": 2, "created": true})).unwrap();
+        assert!(matches!(written, ToolResult::Written(_)));
+        let fixture: ToolResult =
+            serde_json::from_value(json!({"path": "a.txt", "bytes": 2, "content": "hi"})).unwrap();
+        assert!(matches!(fixture, ToolResult::Fixture(_)));
+    }
+
+    #[test]
     fn arguments_must_be_an_object() {
         for args in [json!(null), json!([]), json!("x"), json!(1)] {
             assert!(matches!(
@@ -279,7 +353,7 @@ mod tests {
     #[test]
     fn fixture_path_accepts_plain_relative_paths() {
         for ok in ["welcome.txt", "notes/today.md", "a/b/c-d_e.1.txt", "2026"] {
-            assert!(FixturePath::try_from(ok.to_owned()).is_ok(), "{ok}");
+            assert!(RelativePath::try_from(ok.to_owned()).is_ok(), "{ok}");
         }
     }
 
@@ -310,15 +384,15 @@ mod tests {
             "caf\u{e9}.txt",
             "a\0b",
         ] {
-            assert!(FixturePath::try_from(bad.to_owned()).is_err(), "{bad:?}");
+            assert!(RelativePath::try_from(bad.to_owned()).is_err(), "{bad:?}");
         }
     }
 
     #[test]
     fn fixture_path_enforces_length_and_depth() {
-        assert!(FixturePath::try_from("a".repeat(256)).is_err());
-        assert!(FixturePath::try_from(vec!["a"; 17].join("/")).is_err());
-        assert!(FixturePath::try_from(vec!["a"; 16].join("/")).is_ok());
+        assert!(RelativePath::try_from("a".repeat(256)).is_err());
+        assert!(RelativePath::try_from(vec!["a"; 17].join("/")).is_err());
+        assert!(RelativePath::try_from(vec!["a"; 16].join("/")).is_ok());
     }
 
     #[test]
@@ -334,7 +408,7 @@ mod tests {
         });
         assert!(info.answers(&ToolCall::SystemInfo(SystemInfoArgs {})));
         let read = ToolCall::ReadFixture(ReadFixtureArgs {
-            path: FixturePath::try_from("a.txt".to_owned()).unwrap(),
+            path: RelativePath::try_from("a.txt".to_owned()).unwrap(),
         });
         assert!(!info.answers(&read));
     }

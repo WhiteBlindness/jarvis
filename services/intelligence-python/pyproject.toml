@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jarvis-worker"
-version = "0.1.0"
+version = "0.2.0"
 description = "Intelligence worker for the JARVIS Core: speaks the worker protocol over stdio."
 readme = "README.md"
 requires-python = ">=3.11"

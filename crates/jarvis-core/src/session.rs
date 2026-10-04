@@ -1,36 +1,49 @@
 //! One worker session over a pair of byte streams.
 //!
-//! The session reads frames, enforces the handshake and the session limits,
-//! and turns each well-formed `tool_request` into a durable task:
+//! After the handshake the session hands the worker one queued job at a
+//! time and turns each `tool_request` of that job into a durable task:
 //!
 //! ```text
-//! frame ─► decode ─► create task ─► resolve tool + args ─► capabilities
-//!       ─► policy ─► record decision ─► Gateway ─► verify ─► record ─► reply
+//! frame ─► decode ─► create task ─► resolve tool + args ─► capabilities ─► policy
+//!   allow:                 record decision ─► Gateway ─► verify ─► record ─► reply
+//!   require_confirmation:  record approval request ─► wait for a person
+//!                          ─► consume approval + record decision ─► Gateway ─► …
 //! ```
 //!
 //! Requests are handled one at a time, in order. That is the simplest
 //! correct model for a single worker and doubles as a resource limit: a
-//! worker can never have more than one tool running.
+//! worker can never have more than one tool running or more than one request
+//! waiting for a person.
 //!
 //! The session works on any `AsyncRead`/`AsyncWrite` pair, so tests drive it
 //! over in-memory pipes and the Core drives it over a child's stdio.
 
+use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use jarvis_protocol::{
-    AuditEventKind, CallError, CoreMessage, DecodeError, ErrorCode, ErrorMessage, PolicyDecision,
-    RequestId, SessionId, SessionLimits, TaskId, TaskStatus, ToolCall, ToolName, ToolOutcome,
-    ToolRequest, ToolResponse, Welcome, WireError, WorkerMessage, decode_worker_message,
-    encode_core_message,
+    ApprovalId, ApprovalStatus, AuditEventKind, CallError, CoreMessage, DecodeError, ErrorCode,
+    ErrorMessage, Fingerprint, JobAssignment, JobId, JobOutcome, JobResult, JobStatus,
+    PolicyDecision, RequestId, SessionId, SessionLimits, Summary, TaskId, TaskStatus, ToolCall,
+    ToolName, ToolOutcome, ToolRequest, ToolResponse, Welcome, WireError, WorkerMessage,
+    WorkerState, decode_worker_message, encode_core_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Notify;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::approval;
 use crate::config::Limits;
 use crate::framing::{Frame, FrameReader};
 use crate::gateway::{Execution, Gateway};
+use crate::hub::Hub;
 use crate::policy::{Policy, required_capabilities};
-use crate::store::{NewTask, Store, StoreError, TaskChange};
+use crate::store::{ApprovalError, NewApproval, NewTask, Store, StoreError, TaskChange, now_ms};
+
+/// Frames a worker may send while one of its requests waits for a person.
+const MAX_BACKLOG: usize = 16;
 
 /// Everything a session needs from the Core.
 #[derive(Debug, Clone)]
@@ -40,7 +53,10 @@ pub struct SessionContext {
     pub gateway: Gateway,
     pub limits: Limits,
     pub handshake_timeout: Duration,
+    pub approval_ttl: Duration,
+    pub job_timeout: Duration,
     pub core_version: &'static str,
+    pub hub: Arc<Hub>,
 }
 
 /// Why a session ended.
@@ -48,10 +64,12 @@ pub struct SessionContext {
 pub enum SessionEnd {
     /// The worker closed its output stream.
     WorkerClosed,
-    /// Reading from or writing to the worker failed.
+    /// Reading from or writing to the worker failed or timed out.
     WorkerGone,
     /// The worker did not send `hello` in time.
     HandshakeTimeout,
+    /// The worker did not finish a job in time.
+    JobTimedOut(JobId),
     /// The Core is shutting down.
     Shutdown,
     /// The Core closed the session after a fatal protocol error or a limit.
@@ -64,6 +82,7 @@ impl SessionEnd {
             Self::WorkerClosed => "worker closed the session".into(),
             Self::WorkerGone => "worker stream failed".into(),
             Self::HandshakeTimeout => "worker did not complete the handshake in time".into(),
+            Self::JobTimedOut(job) => format!("job {job} exceeded the job time limit"),
             Self::Shutdown => "Core shutdown".into(),
             Self::Terminated(error) => format!("terminated: {error}"),
         }
@@ -108,6 +127,8 @@ where
         opened: false,
         requests: 0,
         errors: 0,
+        job: None,
+        backlog: VecDeque::new(),
     };
     let result = async {
         match session.handshake(shutdown).await? {
@@ -139,6 +160,11 @@ where
     })
 }
 
+struct RunningJob {
+    id: JobId,
+    deadline: Instant,
+}
+
 struct Session<'a, R, W> {
     ctx: &'a SessionContext,
     id: SessionId,
@@ -147,10 +173,20 @@ struct Session<'a, R, W> {
     opened: bool,
     requests: u32,
     errors: u32,
+    job: Option<RunningJob>,
+    /// Frames read while a request waited for a person, handled afterwards.
+    backlog: VecDeque<Frame>,
 }
 
 /// `None` means carry on; `Some` means the session is over.
 type Step = Option<SessionEnd>;
+
+/// What happened to one request.
+enum Handled {
+    Reply(ToolOutcome),
+    /// The session ends; reply first if there is something to say.
+    End(SessionEnd, Option<ToolOutcome>),
+}
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
     async fn handshake(&mut self, shutdown: &CancellationToken) -> Result<Step, SessionError> {
@@ -181,6 +217,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                 );
                 self.terminate(Some(request.request_id), error).await
             }
+            Ok(WorkerMessage::JobResult(_)) => {
+                let error = WireError::new(
+                    ErrorCode::HandshakeRequired,
+                    "the first message must be `hello`",
+                );
+                self.terminate(None, error).await
+            }
             Ok(WorkerMessage::Hello(hello)) => {
                 self.audit(
                     None,
@@ -191,6 +234,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                 )
                 .await?;
                 self.opened = true;
+                self.ctx.hub.set_worker_state(WorkerState::Idle);
                 tracing::info!(session = %self.id, worker = %hello.worker, version = %hello.worker_version, "session opened");
                 let welcome = CoreMessage::Welcome(Welcome {
                     session_id: self.id,
@@ -199,8 +243,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                     limits: SessionLimits {
                         max_frame_bytes: u32::try_from(self.ctx.limits.max_frame_bytes)
                             .unwrap_or(u32::MAX),
-                        tool_timeout_ms: u64::try_from(self.ctx.gateway.timeout().as_millis())
-                            .unwrap_or(u64::MAX),
+                        tool_timeout_ms: millis(self.ctx.gateway.timeout()),
                         max_requests: self.ctx.limits.max_requests_per_session,
                     },
                 });
@@ -211,40 +254,152 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
 
     async fn serve(&mut self, shutdown: &CancellationToken) -> Result<SessionEnd, SessionError> {
         loop {
-            let read = tokio::select! {
-                biased;
-                () = shutdown.cancelled() => return Ok(SessionEnd::Shutdown),
-                read = self.reader.next_frame() => read,
+            if self.job.is_none()
+                && let Some(end) = self.dispatch_next_job().await?
+            {
+                return Ok(end);
+            }
+            // Checked here as well as while reading: frames buffered during
+            // an approval are handled without waiting on the reader.
+            if self
+                .job
+                .as_ref()
+                .is_some_and(|job| Instant::now() >= job.deadline)
+            {
+                return self.job_timed_out().await;
+            }
+            let frame = match self.backlog.pop_front() {
+                Some(frame) => frame,
+                None => {
+                    let deadline = self.job.as_ref().map(|job| job.deadline);
+                    let idle = self.job.is_none();
+                    let read = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => return Ok(SessionEnd::Shutdown),
+                        () = sleep_until(deadline) => return self.job_timed_out().await,
+                        () = self.ctx.hub.jobs.notified(), if idle => continue,
+                        read = self.reader.next_frame() => read,
+                    };
+                    match read {
+                        Err(_) => return Ok(SessionEnd::WorkerGone),
+                        Ok(None) => return Ok(SessionEnd::WorkerClosed),
+                        Ok(Some(frame)) => frame,
+                    }
+                }
             };
-            let step = match read {
-                Err(_) => Some(SessionEnd::WorkerGone),
-                Ok(None) => Some(SessionEnd::WorkerClosed),
-                Ok(Some(Frame::TooLarge)) => self.reject_frame(None, self.too_large()).await?,
-                Ok(Some(Frame::Line(bytes))) => match decode_worker_message(&bytes) {
-                    Err(error @ DecodeError::UnsupportedVersion { .. }) => {
-                        self.terminate(error.request_id().cloned(), error.to_wire())
-                            .await?
-                    }
-                    Err(error) => {
-                        self.reject_frame(error.request_id().cloned(), error.to_wire())
-                            .await?
-                    }
-                    Ok(WorkerMessage::Hello(_)) => {
-                        let error = WireError::new(
-                            ErrorCode::UnexpectedMessage,
-                            "the session is already open",
-                        );
-                        self.reject_frame(None, error).await?
-                    }
-                    Ok(WorkerMessage::ToolRequest(request)) => {
-                        self.handle_request(request, shutdown).await?
-                    }
-                },
-            };
-            if let Some(end) = step {
+            if let Some(end) = self.handle_frame(frame, shutdown).await? {
                 return Ok(end);
             }
         }
+    }
+
+    async fn dispatch_next_job(&mut self) -> Result<Step, SessionError> {
+        let session_id = self.id;
+        let Some(job) = self
+            .ctx
+            .store
+            .call(move |s| s.claim_next_job(session_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+        tracing::info!(session = %self.id, job = %job.job_id, "job started");
+        self.job = Some(RunningJob {
+            id: job.job_id,
+            deadline: Instant::now() + self.ctx.job_timeout,
+        });
+        self.ctx.hub.set_worker_state(WorkerState::Busy);
+        self.ctx.hub.changed();
+        let message = CoreMessage::Job(JobAssignment {
+            job_id: job.job_id,
+            goal: job.goal,
+        });
+        self.send(&message).await
+    }
+
+    async fn job_timed_out(&mut self) -> Result<SessionEnd, SessionError> {
+        let Some(job) = self.job.take() else {
+            return Ok(SessionEnd::WorkerGone);
+        };
+        let summary = Some(Summary::lossy(&format!(
+            "the job exceeded the {} s limit",
+            self.ctx.job_timeout.as_secs()
+        )));
+        self.finish_job(job.id, JobStatus::Failed, summary).await?;
+        tracing::warn!(session = %self.id, job = %job.id, "job timed out; ending the session");
+        Ok(SessionEnd::JobTimedOut(job.id))
+    }
+
+    async fn finish_job(
+        &mut self,
+        job_id: JobId,
+        status: JobStatus,
+        summary: Option<Summary>,
+    ) -> Result<(), SessionError> {
+        let session_id = self.id;
+        self.ctx
+            .store
+            .call(move |s| s.finish_job(job_id, status, summary.as_ref(), Some(session_id)))
+            .await?;
+        self.ctx.hub.set_worker_state(WorkerState::Idle);
+        self.ctx.hub.changed();
+        Ok(())
+    }
+
+    async fn handle_frame(
+        &mut self,
+        frame: Frame,
+        shutdown: &CancellationToken,
+    ) -> Result<Step, SessionError> {
+        let bytes = match frame {
+            Frame::TooLarge => return self.reject_frame(None, self.too_large()).await,
+            Frame::Line(bytes) => bytes,
+        };
+        match decode_worker_message(&bytes) {
+            Err(error @ DecodeError::UnsupportedVersion { .. }) => {
+                self.terminate(error.request_id().cloned(), error.to_wire())
+                    .await
+            }
+            Err(error) => {
+                self.reject_frame(error.request_id().cloned(), error.to_wire())
+                    .await
+            }
+            Ok(WorkerMessage::Hello(_)) => {
+                let error =
+                    WireError::new(ErrorCode::UnexpectedMessage, "the session is already open");
+                self.reject_frame(None, error).await
+            }
+            Ok(WorkerMessage::JobResult(result)) => self.handle_job_result(result).await,
+            Ok(WorkerMessage::ToolRequest(request)) => {
+                if self.job.as_ref().map(|job| job.id) != Some(request.job_id) {
+                    let error = WireError::new(
+                        ErrorCode::UnexpectedMessage,
+                        "the request does not belong to the current job",
+                    );
+                    return self.reject_frame(Some(request.request_id), error).await;
+                }
+                self.handle_request(request, shutdown).await
+            }
+        }
+    }
+
+    async fn handle_job_result(&mut self, result: JobResult) -> Result<Step, SessionError> {
+        if self.job.as_ref().map(|job| job.id) != Some(result.job_id) {
+            let error = WireError::new(
+                ErrorCode::UnexpectedMessage,
+                "the result does not belong to the current job",
+            );
+            return self.reject_frame(None, error).await;
+        }
+        self.job = None;
+        let status = match result.outcome {
+            JobOutcome::Completed => JobStatus::Completed,
+            JobOutcome::Failed => JobStatus::Failed,
+        };
+        tracing::info!(session = %self.id, job = %result.job_id, %status, "job finished");
+        self.finish_job(result.job_id, status, Some(result.summary))
+            .await?;
+        Ok(None)
     }
 
     async fn handle_request(
@@ -267,6 +422,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         let new_task = NewTask {
             task_id,
             session_id: self.id,
+            job_id: Some(request.job_id),
             request_id: request.request_id.clone(),
             tool: request.tool.clone(),
             args: request.args.clone(),
@@ -283,30 +439,44 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             Err(error) => return Err(error.into()),
         }
 
-        let outcome = self.process(task_id, &request, shutdown).await?;
-        tracing::info!(
-            session = %self.id,
-            task = %task_id,
-            tool = %request.tool,
-            outcome = outcome_name(&outcome),
-            "request handled"
-        );
-        let response = CoreMessage::ToolResponse(ToolResponse {
-            request_id: request.request_id,
-            task_id,
-            outcome,
-        });
-        self.send(&response).await
+        let (outcome, end) = match self.process(task_id, &request, shutdown).await? {
+            Handled::Reply(outcome) => (Some(outcome), None),
+            Handled::End(end, outcome) => (outcome, Some(end)),
+        };
+        if let Some(outcome) = outcome {
+            tracing::info!(
+                session = %self.id,
+                task = %task_id,
+                tool = %request.tool,
+                outcome = outcome_name(&outcome),
+                "request handled"
+            );
+            let response = CoreMessage::ToolResponse(ToolResponse {
+                request_id: request.request_id,
+                task_id,
+                outcome,
+            });
+            if let Some(gone) = self.send(&response).await? {
+                return Ok(Some(end.unwrap_or(gone)));
+            }
+        }
+        match end {
+            // A limit was broken while the request waited: say so, as for
+            // any fatal error.
+            Some(SessionEnd::Terminated(error)) => self.terminate(None, error).await,
+            Some(SessionEnd::JobTimedOut(_)) => self.job_timed_out().await.map(Some),
+            end => Ok(end),
+        }
     }
 
     /// Validate, authorise and execute one request whose task exists in
     /// `received`. Every path ends the task in exactly one state.
     async fn process(
-        &self,
+        &mut self,
         task_id: TaskId,
         request: &ToolRequest,
         shutdown: &CancellationToken,
-    ) -> Result<ToolOutcome, SessionError> {
+    ) -> Result<Handled, SessionError> {
         let call = match ToolCall::from_request(&request.tool, &request.args) {
             Ok(call) => call,
             Err(error) => {
@@ -324,7 +494,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                 };
                 self.transition(task_id, TaskStatus::Received, change, vec![event])
                     .await?;
-                return Ok(ToolOutcome::Rejected { error });
+                return Ok(Handled::Reply(ToolOutcome::Rejected { error }));
             }
         };
 
@@ -349,23 +519,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                     vec![evaluated],
                 )
                 .await?;
-                Ok(ToolOutcome::Denied {
+                Ok(Handled::Reply(ToolOutcome::Denied {
                     capabilities,
                     reason: evaluation.reason,
-                })
-            }
-            PolicyDecision::RequireConfirmation => {
-                self.transition(
-                    task_id,
-                    TaskStatus::Received,
-                    decided(TaskStatus::AwaitingConfirmation),
-                    vec![evaluated],
-                )
-                .await?;
-                Ok(ToolOutcome::ConfirmationRequired {
-                    capabilities,
-                    reason: evaluation.reason,
-                })
+                }))
             }
             PolicyDecision::Allow => {
                 // Decide, record, then act: if this write fails, the tool
@@ -380,39 +537,221 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                     vec![evaluated, started],
                 )
                 .await?;
-
-                let executed = self.ctx.gateway.execute(&call, shutdown).await;
-                let duration_ms = u64::try_from(executed.duration.as_millis()).unwrap_or(u64::MAX);
-                match executed.execution {
-                    Execution::Completed { result, json } => {
-                        let change = TaskChange {
-                            result: Some(json),
-                            ..TaskChange::to(TaskStatus::Completed)
-                        };
-                        let finished = AuditEventKind::ExecutionFinished {
-                            status: TaskStatus::Completed,
-                            duration_ms,
-                            error: None,
-                        };
-                        self.transition(task_id, TaskStatus::Executing, change, vec![finished])
-                            .await?;
-                        Ok(ToolOutcome::Completed { result })
-                    }
-                    Execution::Failed { status, error } => {
-                        let change = TaskChange {
-                            error: Some(error.clone()),
-                            ..TaskChange::to(status)
-                        };
-                        let finished = AuditEventKind::ExecutionFinished {
-                            status,
-                            duration_ms,
-                            error: Some(error.clone()),
-                        };
-                        self.transition(task_id, TaskStatus::Executing, change, vec![finished])
-                            .await?;
-                        Ok(ToolOutcome::Failed { error })
-                    }
+                self.execute(task_id, &call, shutdown)
+                    .await
+                    .map(Handled::Reply)
+            }
+            PolicyDecision::RequireConfirmation => {
+                let approval_id = ApprovalId::new();
+                let fingerprint =
+                    approval::fingerprint(task_id, &request.request_id, &call, &capabilities);
+                let new = NewApproval {
+                    approval_id,
+                    task_id,
+                    session_id: self.id,
+                    request_id: request.request_id.clone(),
+                    tool: request.tool.clone(),
+                    capabilities: capabilities.clone(),
+                    fingerprint: fingerprint.clone(),
+                    expires_at_ms: now_ms().saturating_add(
+                        i64::try_from(self.ctx.approval_ttl.as_millis()).unwrap_or(i64::MAX),
+                    ),
+                };
+                // Register before the request is visible, so no decision is missed.
+                let notify = self.ctx.hub.approvals.register(approval_id);
+                let change = decided(TaskStatus::AwaitingConfirmation);
+                let requested = self
+                    .ctx
+                    .store
+                    .call(move |s| s.request_approval(&new, &change, &[evaluated]))
+                    .await;
+                if let Err(error) = requested {
+                    self.ctx.hub.approvals.remove(approval_id);
+                    return Err(error.into());
                 }
+                tracing::info!(session = %self.id, task = %task_id, approval = %approval_id, "waiting for a person");
+                self.ctx.hub.changed();
+                let handled = self
+                    .await_decision(approval_id, task_id, &call, &fingerprint, &notify, shutdown)
+                    .await;
+                self.ctx.hub.approvals.remove(approval_id);
+                handled
+            }
+        }
+    }
+
+    /// Wait until a person decides, the approval expires, the worker goes
+    /// away or the Core shuts down. The store is re-read after every wake-up
+    /// and is the only source of truth.
+    async fn await_decision(
+        &mut self,
+        approval_id: ApprovalId,
+        task_id: TaskId,
+        call: &ToolCall,
+        fingerprint: &Fingerprint,
+        notify: &Notify,
+        shutdown: &CancellationToken,
+    ) -> Result<Handled, SessionError> {
+        let expired = ToolOutcome::Expired { approval_id };
+        loop {
+            let record = self
+                .ctx
+                .store
+                .call(move |s| s.approval(approval_id))
+                .await?
+                .ok_or_else(|| StoreError::Corrupt(format!("approval {approval_id} vanished")))?;
+            match record.status {
+                ApprovalStatus::Granted => {
+                    return self
+                        .consume_and_execute(approval_id, task_id, call, fingerprint, shutdown)
+                        .await;
+                }
+                ApprovalStatus::Denied => {
+                    let reason = Summary::lossy(record.reason.as_deref().unwrap_or(""));
+                    return Ok(Handled::Reply(ToolOutcome::Declined {
+                        approval_id,
+                        reason,
+                    }));
+                }
+                ApprovalStatus::Expired | ApprovalStatus::Consumed => {
+                    return Ok(Handled::Reply(expired));
+                }
+                ApprovalStatus::Pending => {}
+            }
+
+            let remaining = record.expires_at_ms.saturating_sub(now_ms());
+            if remaining <= 0 {
+                self.expire(approval_id, "no decision before the approval expired")
+                    .await?;
+                continue;
+            }
+            let wait = Duration::from_millis(u64::try_from(remaining).unwrap_or(0));
+            let job = self.job.as_ref().map(|job| (job.id, job.deadline));
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    self.expire(approval_id, "the Core is shutting down").await?;
+                    return Ok(Handled::End(SessionEnd::Shutdown, Some(expired)));
+                }
+                () = sleep_until(job.map(|(_, deadline)| deadline)) => {
+                    self.expire(approval_id, "the job exceeded its time limit").await?;
+                    let end = job.map_or(SessionEnd::WorkerGone, |(id, _)| SessionEnd::JobTimedOut(id));
+                    return Ok(Handled::End(end, Some(expired)));
+                }
+                () = notify.notified() => {}
+                () = tokio::time::sleep(wait) => {}
+                read = self.reader.next_frame() => match read {
+                    Err(_) | Ok(None) => {
+                        self.expire(approval_id, "the worker went away").await?;
+                        let end = if read.is_err() { SessionEnd::WorkerGone } else { SessionEnd::WorkerClosed };
+                        return Ok(Handled::End(end, None));
+                    }
+                    Ok(Some(frame)) => {
+                        if self.backlog.len() >= MAX_BACKLOG {
+                            self.expire(approval_id, "the worker sent too many requests while waiting").await?;
+                            let error = WireError::new(
+                                ErrorCode::LimitExceeded,
+                                format!("more than {MAX_BACKLOG} frames while a request waited for a person"),
+                            );
+                            return Ok(Handled::End(SessionEnd::Terminated(error), Some(expired)));
+                        }
+                        self.backlog.push_back(frame);
+                    }
+                },
+            }
+        }
+    }
+
+    /// Use the granted approval and run the call. The approval is consumed,
+    /// the task moves to `executing` and `execution_started` is recorded in one
+    /// transaction before the tool runs; if any check fails, nothing runs.
+    async fn consume_and_execute(
+        &mut self,
+        approval_id: ApprovalId,
+        task_id: TaskId,
+        call: &ToolCall,
+        fingerprint: &Fingerprint,
+        shutdown: &CancellationToken,
+    ) -> Result<Handled, SessionError> {
+        let started = AuditEventKind::ExecutionStarted {
+            tool: call.tool_name().to_owned(),
+        };
+        let fingerprint = fingerprint.clone();
+        let consumed = self
+            .ctx
+            .store
+            .call(move |s| Ok(s.consume_approval(approval_id, &fingerprint, now_ms(), &[started])))
+            .await?;
+        self.ctx.hub.changed();
+        match consumed {
+            Ok(()) => {
+                tracing::info!(session = %self.id, task = %task_id, approval = %approval_id, "approval consumed");
+                self.execute(task_id, call, shutdown)
+                    .await
+                    .map(Handled::Reply)
+            }
+            Err(ApprovalError::Store(error)) => Err(error.into()),
+            Err(ApprovalError::Expired) => Ok(Handled::Reply(ToolOutcome::Expired { approval_id })),
+            Err(other) => {
+                // The approval no longer matches what would run. Never run it.
+                tracing::error!(session = %self.id, task = %task_id, approval = %approval_id, "refusing to use approval: {other}");
+                self.expire(approval_id, "the approval did not match the request")
+                    .await?;
+                Ok(Handled::Reply(ToolOutcome::Expired { approval_id }))
+            }
+        }
+    }
+
+    async fn expire(
+        &self,
+        approval_id: ApprovalId,
+        reason: &'static str,
+    ) -> Result<(), SessionError> {
+        self.ctx
+            .store
+            .call(move |s| s.expire_approval(approval_id, reason))
+            .await?;
+        self.ctx.hub.changed();
+        Ok(())
+    }
+
+    /// Run a call whose task is already `executing` and record the outcome.
+    async fn execute(
+        &self,
+        task_id: TaskId,
+        call: &ToolCall,
+        shutdown: &CancellationToken,
+    ) -> Result<ToolOutcome, SessionError> {
+        let executed = self.ctx.gateway.execute(call, shutdown).await;
+        let duration_ms = millis(executed.duration);
+        match executed.execution {
+            Execution::Completed { result, json } => {
+                let change = TaskChange {
+                    result: Some(json),
+                    ..TaskChange::to(TaskStatus::Completed)
+                };
+                let finished = AuditEventKind::ExecutionFinished {
+                    status: TaskStatus::Completed,
+                    duration_ms,
+                    error: None,
+                };
+                self.transition(task_id, TaskStatus::Executing, change, vec![finished])
+                    .await?;
+                Ok(ToolOutcome::Completed { result })
+            }
+            Execution::Failed { status, error } => {
+                let change = TaskChange {
+                    error: Some(error.clone()),
+                    ..TaskChange::to(status)
+                };
+                let finished = AuditEventKind::ExecutionFinished {
+                    status,
+                    duration_ms,
+                    error: Some(error.clone()),
+                };
+                self.transition(task_id, TaskStatus::Executing, change, vec![finished])
+                    .await?;
+                Ok(ToolOutcome::Failed { error })
             }
         }
     }
@@ -492,11 +831,19 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             let expired = self
                 .ctx
                 .store
-                .call(move |s| s.expire_awaiting(id, "the session closed before confirmation"))
+                .call(move |s| s.expire_awaiting(id, "the session closed before a decision"))
                 .await?;
             if expired > 0 {
-                tracing::info!(session = %self.id, expired, "pending confirmations expired");
+                tracing::info!(session = %self.id, expired, "pending approvals expired");
             }
+        }
+        if let Some(job) = self.job.take() {
+            let summary = Some(Summary::lossy(&format!(
+                "the worker stopped: {}",
+                end.describe()
+            )));
+            self.finish_job(job.id, JobStatus::Interrupted, summary)
+                .await?;
         }
         self.audit(
             None,
@@ -506,6 +853,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             },
         )
         .await?;
+        self.ctx.hub.changed();
         tracing::info!(session = %self.id, requests = self.requests, "session closed: {}", end.describe());
         Ok(())
     }
@@ -568,6 +916,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
     }
 }
 
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn tool_names() -> Vec<ToolName> {
     ToolCall::NAMES
         .iter()
@@ -579,7 +938,8 @@ fn outcome_name(outcome: &ToolOutcome) -> &'static str {
     match outcome {
         ToolOutcome::Completed { .. } => "completed",
         ToolOutcome::Denied { .. } => "denied",
-        ToolOutcome::ConfirmationRequired { .. } => "confirmation_required",
+        ToolOutcome::Declined { .. } => "declined",
+        ToolOutcome::Expired { .. } => "expired",
         ToolOutcome::Rejected { .. } => "rejected",
         ToolOutcome::Failed { .. } => "failed",
     }

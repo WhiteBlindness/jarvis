@@ -1,4 +1,4 @@
 {
-  "frame": "{\"protocol\":1,\"type\":\"tool_response\",\"request_id\":\"r1\",\"task_id\":\"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c\",\"outcome\":{\"status\":\"maybe\"}}",
+  "frame": "{\"protocol\":2,\"type\":\"tool_response\",\"request_id\":\"r1\",\"task_id\":\"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c\",\"outcome\":{\"status\":\"maybe\"}}",
   "error": "malformed_frame"
 }

@@ -1,10 +1,10 @@
 {
-  "protocol": 1,
+  "protocol": 2,
   "type": "error",
   "request_id": null,
   "error": {
     "code": "unsupported_protocol_version",
-    "message": "unsupported protocol version 2; this side speaks 1"
+    "message": "unsupported protocol version 3; this side speaks 2"
   },
   "fatal": true
 }

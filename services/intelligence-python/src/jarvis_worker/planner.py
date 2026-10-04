@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Protocol
 
-from jarvis_worker.protocol import TOOL_READ_FIXTURE, TOOL_SYSTEM_INFO, JsonValue
+from jarvis_worker.protocol import TOOL_READ_FIXTURE, TOOL_SYSTEM_INFO, TOOL_WRITE_FILE, JsonValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,9 +30,12 @@ class Planner(Protocol):
 
 
 # One left-to-right scan. ``read <target>`` consumes its target, so a word inside it (as in
-# ``read system.txt``) is not mistaken for a topic.
+# ``read system.txt``) is not mistaken for a topic, and ``write <path>: <text>`` consumes the
+# rest of the goal.
 _SCAN = re.compile(
-    r"\bread\s+(?P<target>\S+)|\b(?P<topic>system|runtime|machine|environment)\b",
+    r"\bwrite\s+(?P<write_path>[^\s:]+):\s?(?P<content>.*)"
+    r"|\bread\s+(?P<target>\S+)"
+    r"|\b(?P<topic>system|runtime|machine|environment)\b",
     re.IGNORECASE,
 )
 _TRAILING_PUNCTUATION = ",.;:!?"
@@ -47,6 +50,10 @@ class StubPlanner:
       whitespace-delimited word without trailing ``,.;:!?``. It is passed through unchanged even
       if it looks dangerous: judging paths is the Core's job. A target that is empty after
       stripping is skipped.
+    - ``write <path>: <text>`` yields one ``workspace.write_file`` call that writes ``<text>``
+      (everything after the colon and one optional space, to the end of the goal) to
+      ``<path>``. Because it takes the rest of the goal, a write is always the last call. Policy
+      decides whether a person must approve it; the planner does not know or care.
     - A goal that matches nothing yields an empty plan.
     """
 
@@ -55,7 +62,12 @@ class StubPlanner:
         wants_system_info = False
         for match in _SCAN.finditer(goal):
             target = match.group("target")
-            if target is not None:
+            write_path = match.group("write_path")
+            if write_path is not None:
+                calls.append(
+                    PlannedCall(TOOL_WRITE_FILE, {"path": write_path, "content": match["content"]})
+                )
+            elif target is not None:
                 path = target.rstrip(_TRAILING_PUNCTUATION)
                 if path:
                     calls.append(PlannedCall(TOOL_READ_FIXTURE, {"path": path}))

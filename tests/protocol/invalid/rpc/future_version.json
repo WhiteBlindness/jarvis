@@ -1,0 +1,4 @@
+{
+  "frame": "{\"rpc\":2,\"type\":\"health\"}",
+  "error": "unsupported_protocol_version"
+}

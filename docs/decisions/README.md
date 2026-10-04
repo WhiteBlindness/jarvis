@@ -11,3 +11,8 @@ Short records of decisions that shape the codebase. Each one states the context,
 | [0005](0005-no-wasm-sandbox-yet.md) | No WASM plugin sandbox in Phase 1 |
 | [0006](0006-defer-ui-voice-integrations.md) | Dashboard, voice and personal integrations are deferred |
 | [0007](0007-line-delimited-json-protocol.md) | Strict line-delimited JSON with an exact protocol version |
+| [0008](0008-approval-binding.md) | Approvals are bound to one exact request and used once |
+| [0009](0009-approvals-do-not-survive-restart.md) | Pending approvals do not survive a restart |
+| [0010](0010-local-rpc-transport.md) | Local RPC over a Unix socket or a named pipe |
+| [0011](0011-long-lived-core.md) | A long-lived Core that supervises its worker |
+| [0012](0012-worker-containment.md) | OS containment of the worker, without claiming a sandbox |

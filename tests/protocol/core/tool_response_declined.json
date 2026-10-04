@@ -1,0 +1,11 @@
+{
+  "protocol": 2,
+  "type": "tool_response",
+  "request_id": "req-0005",
+  "task_id": "01928f5e-7c3f-7e60-8f70-8b9cadbecfd0",
+  "outcome": {
+    "status": "declined",
+    "approval_id": "01928f5e-7c41-7a80-a192-adbecfd0e1f2",
+    "reason": "not today"
+  }
+}

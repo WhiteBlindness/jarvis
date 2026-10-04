@@ -3,6 +3,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::PolicyDecision;
+
 /// A permission that policy can grant. Capabilities describe intent ("read a
 /// fixture"), not syntax, and are a closed set: the policy file cannot name a
 /// capability that is not listed here.
@@ -17,15 +19,51 @@ pub enum Capability {
     /// Read a text file inside the configured fixture directory.
     #[serde(rename = "filesystem.read.fixture")]
     FilesystemReadFixture,
+    /// Create or replace a text file inside the configured workspace.
+    #[serde(rename = "workspace.write")]
+    WorkspaceWrite,
+}
+
+/// How much authority a capability carries. See `docs/threat-model.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionClass {
+    /// A. Read-only, bounded, no personal data: may run without a person.
+    Automatic,
+    /// B. Has side effects or touches personal data: a person must confirm
+    /// each use.
+    Confirm,
+}
+
+impl ActionClass {
+    /// The most permissive decision a policy may grant for this class.
+    pub fn ceiling(self) -> PolicyDecision {
+        match self {
+            Self::Automatic => PolicyDecision::Allow,
+            Self::Confirm => PolicyDecision::RequireConfirmation,
+        }
+    }
 }
 
 impl Capability {
-    pub const ALL: &'static [Capability] = &[Self::SystemInfo, Self::FilesystemReadFixture];
+    pub const ALL: &'static [Capability] = &[
+        Self::SystemInfo,
+        Self::FilesystemReadFixture,
+        Self::WorkspaceWrite,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SystemInfo => "system.info",
             Self::FilesystemReadFixture => "filesystem.read.fixture",
+            Self::WorkspaceWrite => "workspace.write",
+        }
+    }
+
+    pub fn class(self) -> ActionClass {
+        match self {
+            Self::SystemInfo | Self::FilesystemReadFixture => ActionClass::Automatic,
+            Self::WorkspaceWrite => ActionClass::Confirm,
         }
     }
 }
@@ -66,6 +104,19 @@ mod tests {
                 *capability
             );
         }
+    }
+
+    #[test]
+    fn writing_needs_confirmation_at_most() {
+        assert_eq!(Capability::WorkspaceWrite.class(), ActionClass::Confirm);
+        assert_eq!(
+            ActionClass::Confirm.ceiling(),
+            PolicyDecision::RequireConfirmation
+        );
+        assert_eq!(
+            Capability::SystemInfo.class().ceiling(),
+            PolicyDecision::Allow
+        );
     }
 
     #[test]

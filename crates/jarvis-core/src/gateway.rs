@@ -139,7 +139,7 @@ fn rejected(message: String) -> Execution {
 #[cfg(test)]
 mod tests {
     use jarvis_protocol::{
-        FixtureContent, FixturePath, ProtocolVersion, ReadFixtureArgs, SystemInfo, SystemInfoArgs,
+        FixtureContent, ProtocolVersion, ReadFixtureArgs, RelativePath, SystemInfo, SystemInfoArgs,
     };
     use jarvis_tools::{ToolError, ToolErrorKind, ToolFuture};
 
@@ -268,7 +268,7 @@ mod tests {
     #[tokio::test]
     async fn mismatched_result_is_rejected() {
         let call = ToolCall::ReadFixture(ReadFixtureArgs {
-            path: FixturePath::try_from("a.txt".to_owned()).unwrap(),
+            path: RelativePath::try_from("a.txt".to_owned()).unwrap(),
         });
         let executed = gateway(Returns(info()))
             .execute(&call, &CancellationToken::new())
@@ -281,8 +281,8 @@ mod tests {
 
     #[tokio::test]
     async fn inconsistent_fixture_result_is_rejected() {
-        let path = FixturePath::try_from("a.txt".to_owned()).unwrap();
-        let other = FixturePath::try_from("b.txt".to_owned()).unwrap();
+        let path = RelativePath::try_from("a.txt".to_owned()).unwrap();
+        let other = RelativePath::try_from("b.txt".to_owned()).unwrap();
         let call = ToolCall::ReadFixture(ReadFixtureArgs { path: path.clone() });
         for content in [
             FixtureContent {
@@ -308,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_result_is_rejected() {
-        let path = FixturePath::try_from("a.txt".to_owned()).unwrap();
+        let path = RelativePath::try_from("a.txt".to_owned()).unwrap();
         let call = ToolCall::ReadFixture(ReadFixtureArgs { path: path.clone() });
         let content = "\u{1}".repeat(1000); // 6 bytes each once JSON-escaped
         let result = ToolResult::Fixture(FixtureContent {

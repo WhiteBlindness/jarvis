@@ -1,4 +1,4 @@
 {
-  "frame": "{\"protocol\":1,\"type\":\"tool_request\",\"request_id\":\"r1\",\"tool\":\"filesystem.read_fixture\",\"args\":{\"path\":\"a.txt\"},\"approved\":true}",
+  "frame": "{\"protocol\":2,\"type\":\"tool_request\",\"request_id\":\"r1\",\"job_id\":\"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b\",\"tool\":\"workspace.write_file\",\"args\":{\"path\":\"a.txt\",\"content\":\"x\"},\"approved\":true}",
   "error": "malformed_frame"
 }

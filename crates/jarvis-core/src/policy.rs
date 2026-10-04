@@ -13,6 +13,7 @@ pub fn required_capabilities(call: &ToolCall) -> Vec<Capability> {
     match call {
         ToolCall::SystemInfo(_) => vec![Capability::SystemInfo],
         ToolCall::ReadFixture(_) => vec![Capability::FilesystemReadFixture],
+        ToolCall::WriteFile(_) => vec![Capability::WorkspaceWrite],
     }
 }
 
@@ -75,7 +76,7 @@ impl Policy {
 
 #[cfg(test)]
 mod tests {
-    use jarvis_protocol::{FixturePath, ReadFixtureArgs, SystemInfoArgs};
+    use jarvis_protocol::{ReadFixtureArgs, RelativePath, SystemInfoArgs, WriteFileArgs};
     use proptest::prelude::*;
 
     use super::*;
@@ -89,7 +90,11 @@ mod tests {
         let calls = [
             ToolCall::SystemInfo(SystemInfoArgs {}),
             ToolCall::ReadFixture(ReadFixtureArgs {
-                path: FixturePath::try_from("a.txt".to_owned()).unwrap(),
+                path: RelativePath::try_from("a.txt".to_owned()).unwrap(),
+            }),
+            ToolCall::WriteFile(WriteFileArgs {
+                path: RelativePath::try_from("a.txt".to_owned()).unwrap(),
+                content: String::new(),
             }),
         ];
         assert_eq!(calls.len(), ToolCall::NAMES.len());

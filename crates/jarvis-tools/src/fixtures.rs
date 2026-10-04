@@ -2,13 +2,13 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use jarvis_protocol::{FixtureContent, FixturePath};
+use jarvis_protocol::{FixtureContent, RelativePath};
 
 use crate::{ToolError, ToolErrorKind};
 
 /// The only directory `filesystem.read_fixture` can read from.
 ///
-/// [`FixturePath`] already guarantees a plain relative path. This type adds
+/// [`RelativePath`] already guarantees a plain relative path. This type adds
 /// the filesystem checks: the target is resolved with symlinks followed and
 /// must still be inside the canonical root, must be a regular file, must fit
 /// the size limit and must be UTF-8.
@@ -32,7 +32,7 @@ impl FixtureRoot {
 
     /// Read a fixture on Tokio's blocking pool, so filesystem latency never
     /// stalls the async runtime.
-    pub async fn read(&self, path: &FixturePath) -> Result<FixtureContent, ToolError> {
+    pub async fn read(&self, path: &RelativePath) -> Result<FixtureContent, ToolError> {
         let root = self.root.clone();
         let path = path.clone();
         let max_bytes = self.max_bytes;
@@ -44,7 +44,7 @@ impl FixtureRoot {
 
 fn read_blocking(
     root: &Path,
-    path: &FixturePath,
+    path: &RelativePath,
     max_bytes: u64,
 ) -> Result<FixtureContent, ToolError> {
     let mut candidate = root.to_path_buf();
@@ -117,7 +117,7 @@ fn read_blocking(
     })
 }
 
-fn io_error(path: &FixturePath, error: &io::Error) -> ToolError {
+fn io_error(path: &RelativePath, error: &io::Error) -> ToolError {
     ToolError::new(
         ToolErrorKind::Io,
         format!("cannot read fixture `{path}`: {}", error.kind()),
@@ -130,8 +130,8 @@ mod tests {
 
     use super::*;
 
-    fn path(value: &str) -> FixturePath {
-        FixturePath::try_from(value.to_owned()).unwrap()
+    fn path(value: &str) -> RelativePath {
+        RelativePath::try_from(value.to_owned()).unwrap()
     }
 
     fn setup() -> (tempfile::TempDir, FixtureRoot) {
