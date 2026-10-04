@@ -35,11 +35,12 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-    LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PSECURITY_DESCRIPTOR, PSID, SE_CHANGE_NOTIFY_NAME,
-    SE_PRIVILEGE_REMOVED, SECURITY_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_MANDATORY_LABEL,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenIsAppContainer,
-    TokenPrivileges, TokenUser,
+    AdjustTokenPrivileges, EqualSid, GetSidSubAuthority, GetSidSubAuthorityCount,
+    GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PSECURITY_DESCRIPTOR, PSID,
+    SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_REMOVED, SECURITY_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES,
+    TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenIntegrityLevel,
+    TokenIsAppContainer, TokenPrivileges, TokenUser,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
@@ -170,9 +171,10 @@ fn create_job(confinement: &Confinement, ui_restricted: bool) -> io::Result<Hand
     Ok(job)
 }
 
-/// Confirm the suspended worker's token is an AppContainer token at low
-/// integrity, then remove its privileges. Fails closed.
-fn verify_worker_token(process: HANDLE) -> io::Result<()> {
+/// Confirm the suspended worker's token is an AppContainer token for
+/// exactly our package SID, with no capabilities, at low integrity; then
+/// remove its privileges. Fails closed.
+fn verify_worker_token(process: HANDLE, sid: &appcontainer::PackageSid) -> io::Result<()> {
     let mut raw = null_mut();
     // SAFETY: a valid process handle; `raw` receives a token handle that
     // `Handle` closes.
@@ -184,6 +186,25 @@ fn verify_worker_token(process: HANDLE) -> io::Result<()> {
         return Err(io::Error::other(
             "the worker is not running in an AppContainer",
         ));
+    }
+    let container = token_information(&token, TokenAppContainerSid)?;
+    // SAFETY: the buffer holds a TOKEN_APPCONTAINER_INFORMATION whose SID
+    // points into the same buffer.
+    let token_sid =
+        unsafe { (*container.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>()).TokenAppContainer };
+    // SAFETY: both are valid SIDs (checked non-null first).
+    if token_sid.is_null() || unsafe { EqualSid(token_sid, sid.as_psid()) } == 0 {
+        return Err(io::Error::other(
+            "the worker runs in a different AppContainer",
+        ));
+    }
+    let capabilities = token_information(&token, TokenCapabilities)?;
+    // SAFETY: the buffer holds a TOKEN_GROUPS header.
+    let count = unsafe { (*capabilities.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount };
+    if count != 0 {
+        return Err(io::Error::other(format!(
+            "the worker's token carries {count} capabilities, expected none"
+        )));
     }
     let level = integrity_rid(&token)?;
     if level > SECURITY_MANDATORY_LOW_RID as u32 {

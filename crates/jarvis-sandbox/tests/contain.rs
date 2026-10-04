@@ -148,21 +148,38 @@ async fn run(code: &str) -> Outcome {
 }
 
 /// Wrap `attempt` (Python statements performing one forbidden operation) so
-/// the probe exits 44 if the OS refused it and 0 if it succeeded.
+/// the probe exits 44 and names the error class if the OS refused it, and
+/// exits 0 if it succeeded.
 fn denial_probe(attempt: &str) -> String {
     let body: Vec<String> = attempt.lines().map(|line| format!("    {line}")).collect();
     format!(
-        "import sys\ntry:\n{}\nexcept OSError as error:\n    print(repr(error), file=sys.stderr)\n    sys.exit({DENIED})\nprint('the operation succeeded', file=sys.stderr)\nsys.exit(0)",
+        "import sys\ntry:\n{}\nexcept OSError as error:\n    print('refused:', type(error).__name__, repr(error), file=sys.stderr)\n    sys.exit({DENIED})\nprint('the operation succeeded', file=sys.stderr)\nsys.exit(0)",
         body.join("\n")
     )
 }
 
+/// The refusal the OS gives for a denied file, socket, process or syscall.
+const PERMISSION: &[&str] = &["PermissionError"];
+
+/// Assert the attempt was refused with a permission error. Any other error
+/// (a missing file, a bad argument) would mean the probe tested nothing.
 async fn assert_denied(what: &str, attempt: &str) {
+    assert_refused(what, attempt, PERMISSION).await;
+}
+
+/// Assert the attempt was refused with one of the `expected` error classes.
+async fn assert_refused(what: &str, attempt: &str, expected: &[&str]) {
     let outcome = run(&denial_probe(attempt)).await;
-    assert_eq!(
+    let class = outcome
+        .stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("refused: "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or("");
+    assert!(
+        outcome.code == Some(DENIED) && expected.contains(&class),
+        "{what} was not refused as expected ({expected:?})\nexit: {:?}\nstderr: {}\ncontrols: {}",
         outcome.code,
-        Some(DENIED),
-        "{what} was not refused\nstderr: {}\ncontrols: {}",
         outcome.stderr,
         outcome.controls
     );
@@ -393,6 +410,13 @@ async fn changing_file_metadata_is_denied() {
 
 // --- hostile probes: network ----------------------------------------------------------------
 
+/// How a refused network operation surfaces: a permission error where the
+/// socket itself is refused (Linux) or the Filtering Platform rejects it,
+/// a timeout where it drops the packets silently (Windows), a resolver
+/// error for a refused DNS lookup. Never "connection refused": that would
+/// mean the packet reached the other end.
+const NETWORK: &[&str] = &["PermissionError", "TimeoutError", "gaierror"];
+
 #[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
 async fn connecting_to_a_loopback_listener_is_denied() {
@@ -405,18 +429,20 @@ async fn connecting_to_a_loopback_listener_is_denied() {
     udp_socket.set_nonblocking(true).unwrap();
     let udp = udp_socket.local_addr().unwrap().port();
 
-    assert_denied(
+    assert_refused(
         "a loopback TCP connection",
         &format!(
             "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.settimeout(5)\ns.connect(('127.0.0.1', {tcp}))"
         ),
+        NETWORK,
     )
     .await;
-    assert_denied(
+    assert_refused(
         "a loopback UDP datagram",
         &format!(
             "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.sendto(b'x', ('127.0.0.1', {udp}))\ns.settimeout(2)\ns.recv(1)"
         ),
+        NETWORK,
     )
     .await;
     // The test's own end confirms nothing arrived.
@@ -431,14 +457,16 @@ async fn reaching_the_internet_is_denied() {
     // A public address and a public name. If the machine is offline these
     // also fail, which is the same answer; on CI they are reachable for any
     // unconfined process.
-    assert_denied(
+    assert_refused(
         "a TCP connection to a public address",
         "import socket\nsocket.create_connection(('1.1.1.1', 443), timeout=5)",
+        NETWORK,
     )
     .await;
-    assert_denied(
+    assert_refused(
         "a DNS lookup",
         "import socket\nsocket.getaddrinfo('example.com', 443)",
+        NETWORK,
     )
     .await;
 }
@@ -478,15 +506,19 @@ async fn starting_a_child_process_is_denied() {
 #[cfg(windows)]
 #[tokio::test]
 async fn starting_a_child_process_is_denied() {
-    assert_denied(
+    // CreateProcess refusals surface as OSError carrying a Windows error.
+    let refused = &["PermissionError", "OSError"];
+    assert_refused(
         "subprocess",
         "import subprocess\nsubprocess.run(['cmd', '/c', 'exit 0'], check=True)",
+        refused,
     )
     .await;
     // CREATE_BREAKAWAY_FROM_JOB: an attempt to escape the job object.
-    assert_denied(
+    assert_refused(
         "a process that breaks away from the job",
         "import subprocess, sys\nsubprocess.run([sys.executable, '-c', 'pass'], creationflags=0x01000000, check=True)",
+        refused,
     )
     .await;
 }
@@ -513,6 +545,90 @@ async fn signalling_another_process_is_denied() {
     )
     .await;
     assert_denied("signalling every process", "import os\nos.kill(-1, 0)").await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn signalling_through_file_ownership_or_limits_is_denied() {
+    // Asking the kernel to deliver SIGIO (or any chosen signal) to another
+    // process, by owning a file descriptor or enabling async I/O on it.
+    assert_denied(
+        "F_SETOWN to the Core",
+        "import fcntl, os\nr, w = os.pipe()\nfcntl.fcntl(r, fcntl.F_SETOWN, os.getppid())",
+    )
+    .await;
+    assert_denied(
+        "F_SETSIG",
+        "import fcntl, os\nr, w = os.pipe()\nfcntl.fcntl(r, 10, 9)",
+    )
+    .await;
+    assert_denied(
+        "FIOASYNC",
+        "import fcntl, os, struct\nr, w = os.pipe()\nfcntl.ioctl(r, 0x5452, struct.pack('i', 1))",
+    )
+    .await;
+    // Another process's resource limits, even only reading them.
+    assert_denied(
+        "prlimit on the Core",
+        "import os, resource\nresource.prlimit(os.getppid(), resource.RLIMIT_NOFILE)",
+    )
+    .await;
+    assert_denied(
+        "changing a priority",
+        "import os\nos.setpriority(os.PRIO_PROCESS, 0, os.getpriority(os.PRIO_PROCESS, 0))",
+    )
+    .await;
+    // Its own limits stay readable (the C library and CPython read them).
+    let outcome =
+        run("import resource\nresource.prlimit(0, resource.RLIMIT_NOFILE)\nprint('ok')").await;
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ipc_watches_and_newer_metadata_calls_are_denied() {
+    let canary = Canary::new();
+    let path = py_str(&canary.path);
+    let libc = "import ctypes, os\nlibc = ctypes.CDLL(None, use_errno=True)\nlibc.syscall.restype = ctypes.c_long\n";
+    let check = |call: &str, name: &str| {
+        format!("{libc}if {call} == -1:\n    raise OSError(ctypes.get_errno(), '{name}')")
+    };
+    for (call, name) in [
+        ("libc.shmget(0, 4096, 0o1600)".to_owned(), "shmget"),
+        ("libc.msgget(0, 0o1600)".to_owned(), "msgget"),
+        ("libc.semget(0, 1, 0o1600)".to_owned(), "semget"),
+        ("libc.inotify_init1(0)".to_owned(), "inotify_init1"),
+        (
+            format!(
+                "libc.syscall(ctypes.c_long(452), ctypes.c_int(-100), ctypes.c_char_p(os.fsencode({path})), ctypes.c_uint(0o777), ctypes.c_uint(0))"
+            ),
+            "fchmodat2",
+        ),
+    ] {
+        assert_denied(name, &check(&call, name)).await;
+    }
+    #[cfg(target_arch = "x86_64")]
+    assert_denied(
+        "futimesat",
+        &check(
+            &format!("libc.syscall(ctypes.c_long(261), ctypes.c_int(-100), ctypes.c_char_p(os.fsencode({path})), ctypes.c_void_p(0))"),
+            "futimesat",
+        ),
+    )
+    .await;
+    assert_denied("truncate", &format!("import os\nos.truncate({path}, 0)")).await;
+    // Nothing changed.
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::read_to_string(&canary.path).unwrap(),
+        "canary-secret"
+    );
+    let mode = std::fs::metadata(&canary.path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_ne!(mode, 0o777);
 }
 
 #[cfg(target_os = "linux")]
@@ -568,9 +684,11 @@ async fn an_inheritable_descriptor_does_not_reach_the_worker() {
     // Make it inheritable, as a careless parent might.
     // SAFETY: clearing FD_CLOEXEC on a descriptor this test owns.
     assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
-    assert_denied(
+    // EBADF: the descriptor does not exist in the worker.
+    assert_refused(
         "using an inherited descriptor",
         &format!("import os\nos.fstat({fd})"),
+        &["OSError"],
     )
     .await;
 }
@@ -588,11 +706,12 @@ async fn an_inheritable_handle_does_not_reach_the_worker() {
     let ok = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
     assert_ne!(ok, 0);
     let value = handle as usize;
-    assert_denied(
+    assert_refused(
         "using an inherited handle",
         &format!(
             "import ctypes\nfrom ctypes import wintypes\nk = ctypes.WinDLL('kernel32', use_last_error=True)\nk.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]\nbuf = ctypes.create_unicode_buffer(1024)\nn = k.GetFinalPathNameByHandleW(wintypes.HANDLE({value}), buf, 1024, 0)\nif n == 0 or 'jarvis-canary' not in buf.value:\n    raise OSError('the handle was not inherited')"
         ),
+        &["OSError"],
     )
     .await;
 }
@@ -633,6 +752,22 @@ async fn the_worker_runs_in_an_app_container_at_low_integrity() {
     ))
     .await;
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn writing_to_its_own_container_folder_is_denied() {
+    // Windows points TEMP (and LOCALAPPDATA) into the AppContainer's own
+    // folder and gives the package full control there; the Core denies it.
+    for variable in ["TEMP", "LOCALAPPDATA"] {
+        assert_denied(
+            &format!("writing into %{variable}%"),
+            &format!(
+                "import os\nopen(os.path.join(os.environ['{variable}'], 'jarvis-probe.txt'), 'w').write('x')"
+            ),
+        )
+        .await;
+    }
 }
 
 #[cfg(windows)]

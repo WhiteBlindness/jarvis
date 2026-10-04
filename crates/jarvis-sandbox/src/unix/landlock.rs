@@ -29,11 +29,19 @@ const IOCTL_DEV: u64 = 1 << 15;
 const RULE_PATH_BENEATH: libc::c_int = 1;
 const CREATE_RULESET_VERSION: u32 = 1 << 0;
 
-/// `struct landlock_ruleset_attr` (we set only the filesystem field, so the
-/// 8-byte form is passed and the kernel zero-fills the rest).
+// Scopes (ABI 6): the domain may not connect to abstract Unix sockets or
+// signal processes outside itself. seccomp already denies both by other
+// means; this adds the kernel's own check where it exists.
+const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+const SCOPE_SIGNAL: u64 = 1 << 1;
+
+/// `struct landlock_ruleset_attr`. Kernels before ABI 6 take only the
+/// first field (8 bytes); ABI 6 and later take all three (24 bytes).
 #[repr(C)]
 struct RulesetAttr {
     handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
 }
 
 /// `struct landlock_path_beneath_attr`, which the kernel declares packed.
@@ -43,33 +51,44 @@ struct PathBeneathAttr {
     parent_fd: i32,
 }
 
-/// A built Landlock ruleset, ready to be applied in the child. `None` when no
-/// grants were given (the caller opted out of a filesystem boundary).
+/// A built Landlock ruleset, ready to be applied in the child.
 #[derive(Debug, Clone)]
 pub(crate) struct Ruleset {
-    fd: Option<Arc<OwnedFd>>,
+    fd: Arc<OwnedFd>,
 }
 
 impl Ruleset {
-    /// Build the ruleset in the parent. Fails closed if grants were requested
-    /// but Landlock is unavailable or the ruleset cannot be created.
+    /// Build the ruleset in the parent. Always built: with no grants it
+    /// denies the whole filesystem (and the worker cannot even start), so a
+    /// missing grant list never means a missing boundary. Fails closed if
+    /// Landlock is unavailable or the ruleset cannot be created.
     pub(crate) fn build(grants: &[Grant]) -> io::Result<Self> {
-        if grants.is_empty() {
-            return Ok(Self { fd: None });
-        }
         let abi = abi_version()?;
         let handled = handled_access_fs(abi);
 
         let attr = RulesetAttr {
             handled_access_fs: handled,
+            handled_access_net: 0,
+            scoped: if abi >= 6 {
+                SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL
+            } else {
+                0
+            },
         };
-        // SAFETY: create a ruleset from a valid attr of the given size; flags
-        // 0. Returns an O_CLOEXEC fd or -1.
+        // Older kernels reject a structure longer than they know unless the
+        // extra bytes are zero; pass only the fields this ABI has.
+        let size = if abi >= 6 {
+            size_of::<RulesetAttr>()
+        } else {
+            size_of::<u64>()
+        };
+        // SAFETY: create a ruleset from a valid attr of at least `size`
+        // bytes; flags 0. Returns an O_CLOEXEC fd or -1.
         let raw = unsafe {
             libc::syscall(
                 libc::SYS_landlock_create_ruleset,
                 &attr as *const RulesetAttr,
-                size_of::<RulesetAttr>(),
+                size,
                 0,
             )
         };
@@ -83,20 +102,15 @@ impl Ruleset {
             let allowed = access_rights(grant.access) & handled;
             add_path_rule(fd.as_raw_fd(), &grant.path, allowed)?;
         }
-        Ok(Self {
-            fd: Some(Arc::new(fd)),
-        })
+        Ok(Self { fd: Arc::new(fd) })
     }
 
     /// Apply the ruleset to the calling (child) process. One syscall; safe to
     /// call between fork and exec.
     pub(crate) fn restrict_self(&self) -> io::Result<()> {
-        let Some(fd) = &self.fd else {
-            return Ok(());
-        };
         // SAFETY: restrict_self takes a valid ruleset fd and a flags word; it
         // only narrows this thread's access and cannot fail from memory.
-        let rc = unsafe { libc::syscall(libc::SYS_landlock_restrict_self, fd.as_raw_fd(), 0) };
+        let rc = unsafe { libc::syscall(libc::SYS_landlock_restrict_self, self.fd.as_raw_fd(), 0) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }

@@ -293,7 +293,7 @@ fn isolation(command: IsolationCommand) -> anyhow::Result<bool> {
     match command {
         IsolationCommand::Check { config } => {
             let config = Config::load(&config.config)?;
-            let launch = isolation::launch(&config.worker)?;
+            let launch = isolation::launch(&config.worker, &isolation::protected_paths(&config))?;
             let report = jarvis_sandbox::report(&launch.confinement)?;
             println!("mechanism   {}", report.mechanism);
             for (key, value) in &report.identity {
@@ -341,7 +341,7 @@ fn isolation(command: IsolationCommand) -> anyhow::Result<bool> {
         }
         IsolationCommand::Remove { config } => {
             let config = Config::load(&config.config)?;
-            let launch = isolation::launch(&config.worker)?;
+            let launch = isolation::launch(&config.worker, &isolation::protected_paths(&config))?;
             let done = jarvis_sandbox::remove(&launch.confinement)?;
             if done.is_empty() {
                 println!("nothing to remove");

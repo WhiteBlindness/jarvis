@@ -35,20 +35,21 @@ fn worker() -> WorkerConfig {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_real_confinement_passes_every_check() {
     let scratch = tempfile::tempdir().unwrap();
-    let launch = isolation::launch(&worker()).unwrap();
+    let launch = isolation::launch(&worker(), &[]).unwrap();
     let verification = isolation::verify(&launch, scratch.path())
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     let names: Vec<_> = verification.checks.iter().map(|c| c.name).collect();
-    assert_eq!(
-        names,
-        [
-            "no loopback TCP",
-            "no loopback UDP",
-            "no access to the Core's files",
-            "no child processes"
-        ]
-    );
+    let mut expected = vec![
+        "no loopback TCP",
+        "no loopback UDP",
+        "no access to the Core's files",
+    ];
+    if isolation::home_dir().is_some() {
+        expected.push("no access to the user's home");
+    }
+    expected.push("no child processes");
+    assert_eq!(names, expected);
     assert!(verification.checks.iter().all(|c| c.passed));
     // The canary is gone again.
     assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
@@ -58,10 +59,13 @@ async fn the_real_confinement_passes_every_check() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_missing_boundary_is_detected() {
     let scratch = tempfile::tempdir().unwrap();
-    let mut launch = isolation::launch(&worker()).unwrap();
-    // No filesystem boundary and network allowed: the probe can read the
-    // canary and reach the Core's listener, and the check must say so.
-    launch.confinement.filesystem.clear();
+    let mut launch = isolation::launch(&worker(), &[]).unwrap();
+    // A grant that exposes the Core's data, and network allowed: the probe
+    // can read the canary and reach the Core's listener, and the check
+    // must say so.
+    launch.confinement = launch
+        .confinement
+        .grant(jarvis_sandbox::Grant::read(scratch.path()));
     launch.confinement.deny_network = false;
     match isolation::verify(&launch, scratch.path()).await {
         Err(IsolationError::NotEnforced(checks)) => {
@@ -89,7 +93,7 @@ async fn a_worker_with_network_access_is_refused() {
     // An AppContainer worker always runs without network; asking for
     // network access is refused rather than silently ignored.
     let scratch = tempfile::tempdir().unwrap();
-    let mut launch = isolation::launch(&worker()).unwrap();
+    let mut launch = isolation::launch(&worker(), &[]).unwrap();
     launch.confinement.deny_network = false;
     assert!(matches!(
         isolation::verify(&launch, scratch.path()).await,
@@ -101,7 +105,7 @@ async fn a_worker_with_network_access_is_refused() {
 async fn a_probe_that_cannot_run_fails_closed() {
     // A program that is not an interpreter produces no report.
     let scratch = tempfile::tempdir().unwrap();
-    let mut launch = isolation::launch(&worker()).unwrap();
+    let mut launch = isolation::launch(&worker(), &[]).unwrap();
     launch.command.program = isolation::resolve_program(if cfg!(windows) { "cmd" } else { "true" })
         .expect("a basic system program");
     let result = isolation::verify(&launch, scratch.path()).await;

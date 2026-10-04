@@ -3,8 +3,10 @@
 //! Landlock gives the filesystem boundary; this filter closes what Landlock
 //! on this kernel cannot: it denies creating any socket (so there is no
 //! network of any kind, and the worker cannot open the Core's Unix socket),
-//! denies creating child processes, denies signalling other processes, and
-//! denies a group of escape and metadata syscalls. The program is assembled in the parent and installed by
+//! denies creating child processes, denies every way of signalling or
+//! changing another process that does not need a capability, denies System
+//! V IPC and file watches, and denies a group of escape and metadata
+//! syscalls. The program is assembled in the parent and installed by
 //! the child with one `seccomp` syscall as its last pre-exec step, so only
 //! the final `execve` of the interpreter runs afterwards. See ADR 0014.
 
@@ -19,10 +21,31 @@ const JMP_JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
 const ALU_AND_K: u16 = 0x54; // BPF_ALU | BPF_AND | BPF_K
 const RET_K: u16 = 0x06; // BPF_RET | BPF_K
 
-// seccomp_data field offsets.
+// seccomp_data field offsets (the low 32 bits of each argument on the
+// little-endian architectures supported here).
 const OFF_NR: u32 = 0;
 const OFF_ARCH: u32 = 4;
 const OFF_ARG0_LOW: u32 = 16;
+const OFF_ARG1_LOW: u32 = 24;
+
+// Syscalls newer than the `libc` constants, numbered alike on x86-64 and
+// aarch64 (the unified table that starts at 403).
+const SYS_FCHMODAT2: libc::c_long = 452;
+const SYS_SETXATTRAT: libc::c_long = 463;
+const SYS_REMOVEXATTRAT: libc::c_long = 466;
+const SYS_OPEN_TREE_ATTR: libc::c_long = 467;
+const SYS_FILE_SETATTR: libc::c_long = 469;
+
+// fcntl commands that set the owner who receives SIGIO/SIGURG, or the
+// signal sent: with them a process could make the kernel signal any process
+// of the same user.
+const F_SETOWN: u32 = 8;
+const F_SETSIG: u32 = 10;
+const F_SETOWN_EX: u32 = 15;
+// ioctl requests with the same effect, and the one that enables async I/O.
+const FIOSETOWN: u32 = 0x8901;
+const SIOCSPGRP: u32 = 0x8902;
+const FIOASYNC: u32 = 0x5452;
 
 // seccomp return actions.
 const RET_KILL_PROCESS: u32 = 0x8000_0000;
@@ -95,12 +118,30 @@ impl Filter {
         for nr in ESCAPE {
             p.deny(*nr, eperm);
         }
-        for nr in SIGNAL {
+        for nr in SIGNAL.iter().chain(OTHER_PROCESSES).chain(IPC).chain(WATCH) {
             p.deny(*nr, eperm);
         }
         for nr in METADATA {
             p.deny(*nr, eperm);
         }
+
+        // Argument checks clobber A and restore it, so they come after the
+        // plain denials. Signal ownership through fcntl and ioctl:
+        p.deny_if_arg(
+            libc::SYS_fcntl,
+            OFF_ARG1_LOW,
+            &[F_SETOWN, F_SETSIG, F_SETOWN_EX],
+            eperm,
+        );
+        p.deny_if_arg(
+            libc::SYS_ioctl,
+            OFF_ARG1_LOW,
+            &[FIOSETOWN, SIOCSPGRP, FIOASYNC],
+            eperm,
+        );
+        // Resource limits of any process but itself (the C library reads
+        // its own with pid 0).
+        p.deny_unless_arg_zero(libc::SYS_prlimit64, OFF_ARG0_LOW, eperm);
 
         // clone is allowed only to create a thread (no new process, no new
         // namespace); this clobbers A, so it comes last.
@@ -161,6 +202,31 @@ impl Program {
     fn deny(&mut self, nr: libc::c_long, action: u32) {
         self.jump(JMP_JEQ_K, nr as u32, 0, 1);
         self.stmt(RET_K, action);
+    }
+
+    /// If the syscall is `nr` and the 32-bit argument at `offset` is one of
+    /// `values`, return `action`. Restores A to the syscall number.
+    fn deny_if_arg(&mut self, nr: libc::c_long, offset: u32, values: &[u32], action: u32) {
+        // Skip the whole block when the syscall differs: one load, a
+        // compare-and-return pair per value, one reload.
+        let block = u8::try_from(2 * values.len() + 2).unwrap_or(u8::MAX);
+        self.jump(JMP_JEQ_K, nr as u32, 0, block);
+        self.stmt(LD_W_ABS, offset);
+        for value in values {
+            self.jump(JMP_JEQ_K, *value, 0, 1);
+            self.stmt(RET_K, action);
+        }
+        self.stmt(LD_W_ABS, OFF_NR);
+    }
+
+    /// If the syscall is `nr` and the 32-bit argument at `offset` is not
+    /// zero, return `action`. Restores A to the syscall number.
+    fn deny_unless_arg_zero(&mut self, nr: libc::c_long, offset: u32, action: u32) {
+        self.jump(JMP_JEQ_K, nr as u32, 0, 4);
+        self.stmt(LD_W_ABS, offset);
+        self.jump(JMP_JEQ_K, 0, 1, 0); // zero: skip the return
+        self.stmt(RET_K, action);
+        self.stmt(LD_W_ABS, OFF_NR);
     }
 
     /// Allow `clone` only when it creates a thread with no new namespace;
@@ -228,6 +294,54 @@ const ESCAPE: &[libc::c_long] = &[
     libc::SYS_memfd_create,
     libc::SYS_process_madvise,
     libc::SYS_process_mrelease,
+    // The mount API (it also needs a namespace the worker cannot create).
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_fspick,
+    libc::SYS_open_tree,
+    SYS_OPEN_TREE_ATTR,
+    libc::SYS_move_mount,
+    libc::SYS_mount_setattr,
+];
+
+// Changing another process's scheduling, I/O priority or memory placement.
+// (Resource limits are checked by argument, in `build`.)
+const OTHER_PROCESSES: &[libc::c_long] = &[
+    libc::SYS_setpriority,
+    libc::SYS_ioprio_set,
+    libc::SYS_sched_setscheduler,
+    libc::SYS_sched_setparam,
+    libc::SYS_sched_setaffinity,
+    libc::SYS_sched_setattr,
+    libc::SYS_migrate_pages,
+    libc::SYS_move_pages,
+];
+
+// System V IPC, which Landlock does not mediate: shared memory, message
+// queues and semaphores of other processes of the same user.
+const IPC: &[libc::c_long] = &[
+    libc::SYS_shmget,
+    libc::SYS_shmat,
+    libc::SYS_shmctl,
+    libc::SYS_shmdt,
+    libc::SYS_msgget,
+    libc::SYS_msgsnd,
+    libc::SYS_msgrcv,
+    libc::SYS_msgctl,
+    libc::SYS_semget,
+    libc::SYS_semop,
+    libc::SYS_semtimedop,
+    libc::SYS_semctl,
+];
+
+// Watching files and directories outside the grants for activity (Landlock
+// does not mediate watches).
+const WATCH: &[libc::c_long] = &[
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_inotify_init,
+    libc::SYS_inotify_init1,
+    libc::SYS_fanotify_init,
 ];
 
 // Sending signals. The kernel lets a process signal every other process of
@@ -244,10 +358,16 @@ const SIGNAL: &[libc::c_long] = &[
 ];
 
 // File-metadata syscalls Landlock does not mediate, so a confined worker
-// cannot change ownership, mode, times or extended attributes.
+// cannot change ownership, mode, times, attributes or (on kernels whose
+// Landlock predates truncation rights) length.
 const METADATA: &[libc::c_long] = &[
     libc::SYS_fchmod,
     libc::SYS_fchmodat,
+    SYS_FCHMODAT2,
+    SYS_SETXATTRAT,
+    SYS_REMOVEXATTRAT,
+    SYS_FILE_SETATTR,
+    libc::SYS_truncate,
     libc::SYS_fchown,
     libc::SYS_fchownat,
     libc::SYS_setxattr,
@@ -267,4 +387,6 @@ const METADATA: &[libc::c_long] = &[
     libc::SYS_utime,
     #[cfg(target_arch = "x86_64")]
     libc::SYS_utimes,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_futimesat,
 ];

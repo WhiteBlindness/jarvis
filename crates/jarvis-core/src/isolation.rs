@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use jarvis_sandbox::{Confinement, Grant, Spawned, WorkerCommand};
 use tokio::io::AsyncReadExt;
 
-use crate::config::WorkerConfig;
+use crate::config::{Config, WorkerConfig};
 
 /// Variables the worker keeps from the Core's environment: enough to find
 /// and start an interpreter, nothing else. `SYSTEMROOT` is required by
@@ -47,6 +47,11 @@ const PROBE_OUTPUT_LIMIT: u64 = 16 * 1024;
 pub enum IsolationError {
     #[error("worker program {0:?} was not found (as a path, or on PATH)")]
     ProgramNotFound(String),
+    #[error(
+        "the worker would be granted {path}, which {reason}; install the interpreter in a \
+         directory of its own and keep the worker's source outside the user's data"
+    )]
+    GrantTooBroad { path: PathBuf, reason: String },
     #[error("the worker cannot be started in isolation: {0}")]
     Spawn(io::Error),
     #[error("the isolation probe did not run correctly: {0}")]
@@ -74,7 +79,15 @@ pub struct WorkerLaunch {
 }
 
 /// Resolve the worker program and build its command and confinement.
-pub fn launch(config: &WorkerConfig) -> Result<WorkerLaunch, IsolationError> {
+///
+/// No grant may be, or contain, a filesystem root, the user's home
+/// directory or any of the `protected` paths (the Core passes its database
+/// directory and the workspace): an interpreter at `~/bin/python3` would
+/// otherwise expose the whole home directory.
+pub fn launch(
+    config: &WorkerConfig,
+    protected: &[PathBuf],
+) -> Result<WorkerLaunch, IsolationError> {
     let program = resolve_program(&config.program)
         .ok_or_else(|| IsolationError::ProgramNotFound(config.program.clone()))?;
     let env = PASSTHROUGH_ENV
@@ -95,6 +108,9 @@ pub fn launch(config: &WorkerConfig) -> Result<WorkerLaunch, IsolationError> {
     if let Some(cwd) = &cwd {
         confinement = confinement.grant(Grant::read(cwd.clone()));
     }
+    let mut protected: Vec<PathBuf> = protected.to_vec();
+    protected.extend(home_dir());
+    check_grants(&confinement, &protected)?;
     Ok(WorkerLaunch {
         command: WorkerCommand {
             program,
@@ -104,6 +120,61 @@ pub fn launch(config: &WorkerConfig) -> Result<WorkerLaunch, IsolationError> {
         },
         confinement,
     })
+}
+
+/// The Core's own data the worker must never be granted: the database's
+/// directory and the workspace.
+pub fn protected_paths(config: &Config) -> Vec<PathBuf> {
+    let mut paths = vec![config.workspace.root.clone()];
+    if let Some(dir) = config
+        .database
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+    {
+        paths.push(dir.to_path_buf());
+    }
+    paths
+}
+
+/// The user's home directory (`HOME`, or `USERPROFILE` on Windows), if set
+/// and present.
+pub fn home_dir() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = PathBuf::from(std::env::var_os(name)?);
+    absolute_dir(&home).ok()
+}
+
+/// Refuse a grant that is a filesystem root or contains a protected path.
+fn check_grants(confinement: &Confinement, protected: &[PathBuf]) -> Result<(), IsolationError> {
+    for grant in &confinement.filesystem {
+        if grant.path.parent().is_none() {
+            return Err(IsolationError::GrantTooBroad {
+                path: grant.path.clone(),
+                reason: "is a filesystem root".to_owned(),
+            });
+        }
+        for path in protected {
+            let path = absolute_dir(path).unwrap_or_else(|_| path.clone());
+            if contains(&grant.path, &path) {
+                return Err(IsolationError::GrantTooBroad {
+                    path: grant.path.clone(),
+                    reason: format!("contains {}", path.display()),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `inner` is `outer` or lies beneath it, comparing components
+/// (case-insensitively on Windows).
+fn contains(outer: &Path, inner: &Path) -> bool {
+    if cfg!(windows) {
+        let lower = |path: &Path| PathBuf::from(path.to_string_lossy().to_lowercase());
+        lower(inner).starts_with(lower(outer))
+    } else {
+        inner.starts_with(outer)
+    }
 }
 
 /// The directory trees the worker may read and execute from.
@@ -211,7 +282,7 @@ pub struct Verification {
 /// independent signal the Core observes itself.
 const PROBE: &str = r#"
 import json, socket, subprocess, sys
-tcp, udp, canary = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+tcp, udp, canary, home = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
 report = {}
 def attempt(name, action):
     try:
@@ -231,11 +302,16 @@ def send_udp():
 def read_canary():
     with open(canary, "rb") as f:
         report["canary"] = f.read(128).decode("ascii", "replace")
+def list_home():
+    import os
+    report["home_entries"] = len(os.listdir(home))
 def start_process():
     subprocess.run([sys.executable, "-c", "pass"], check=True, timeout=10)
 attempt("loopback_tcp", connect_tcp)
 attempt("loopback_udp", send_udp)
 attempt("core_file", read_canary)
+if home:
+    attempt("home", list_home)
 attempt("child_process", start_process)
 print(json.dumps(report), flush=True)
 "#;
@@ -253,11 +329,19 @@ pub async fn verify(launch: &WorkerLaunch, scratch: &Path) -> Result<Verificatio
     let udp = datagrams.local_addr().map_err(probe_io)?.port();
 
     let secret = nonce();
-    // Absolute: the probe runs in the worker's working directory.
+    // Absolute: the probe runs in the worker's working directory. A fresh,
+    // unpredictable name, created exclusively, so nothing that already sits
+    // there (a link, another file) is followed or overwritten.
     let scratch = std::path::absolute(scratch).map_err(probe_io)?;
-    let canary = scratch.join(format!(".jarvis-isolation-probe-{}", std::process::id()));
-    std::fs::write(&canary, &secret).map_err(probe_io)?;
-    let outcome = run_probe(launch, tcp, udp, &canary).await;
+    let canary = scratch.join(format!(".jarvis-isolation-probe-{}", nonce()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&canary)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, secret.as_bytes()))
+        .map_err(probe_io)?;
+    let home = home_dir();
+    let outcome = run_probe(launch, tcp, udp, &canary, home.as_deref()).await;
     let _ = std::fs::remove_file(&canary);
     let (report, stdout, controls) = outcome?;
 
@@ -309,6 +393,15 @@ pub async fn verify(launch: &WorkerLaunch, scratch: &Path) -> Result<Verificatio
         },
     });
 
+    if home.is_some() {
+        let said = probe_said("home");
+        checks.push(Check {
+            name: "no access to the user's home",
+            passed: said == "denied: PermissionError",
+            detail: said,
+        });
+    }
+
     if launch.confinement.deny_child_processes {
         let said = probe_said("child_process");
         checks.push(Check {
@@ -336,6 +429,7 @@ async fn run_probe(
     tcp: u16,
     udp: u16,
     canary: &Path,
+    home: Option<&Path>,
 ) -> Result<(serde_json::Map<String, serde_json::Value>, String, String), IsolationError> {
     let mut command = launch.command.clone();
     command.args = ["-I", "-S", "-B", "-c", PROBE]
@@ -345,6 +439,7 @@ async fn run_probe(
             OsString::from(tcp.to_string()),
             OsString::from(udp.to_string()),
             canary.as_os_str().to_owned(),
+            home.map_or_else(OsString::new, |home| home.as_os_str().to_owned()),
         ])
         .collect();
     let Spawned {
@@ -433,7 +528,7 @@ mod tests {
             memory_limit_bytes: 1 << 28,
         };
         assert!(matches!(
-            launch(&config),
+            launch(&config, &[]),
             Err(IsolationError::ProgramNotFound(_))
         ));
     }
@@ -449,7 +544,7 @@ mod tests {
             handshake_timeout: Duration::from_secs(1),
             memory_limit_bytes: 1 << 28,
         };
-        let launch = launch(&config).unwrap();
+        let launch = launch(&config, &[]).unwrap();
         assert!(launch.command.program.is_absolute());
         assert!(launch.confinement.deny_network);
         assert!(launch.confinement.deny_child_processes);
@@ -465,6 +560,45 @@ mod tests {
         ));
         let keys: Vec<_> = launch.command.env.iter().map(|(k, _)| k.clone()).collect();
         assert!(keys.iter().all(|k| PASSTHROUGH_ENV.iter().any(|p| k == p)));
+    }
+
+    #[test]
+    fn a_grant_that_contains_protected_data_is_refused() {
+        // An interpreter whose directory also holds the Core's data (as
+        // ~/bin/python3 would hold the home directory).
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(bin.join("data")).unwrap();
+        let program = bin.join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python3"
+        });
+        std::fs::write(&program, b"").unwrap();
+        let config = WorkerConfig {
+            program: program.display().to_string(),
+            args: Vec::new(),
+            cwd: None,
+            handshake_timeout: Duration::from_secs(1),
+            memory_limit_bytes: 1 << 28,
+        };
+        let protected = [bin.join("data")];
+        assert!(matches!(
+            launch(&config, &protected),
+            Err(IsolationError::GrantTooBroad { .. })
+        ));
+        assert!(launch(&config, &[]).is_ok());
+    }
+
+    #[test]
+    fn filesystem_roots_are_never_granted() {
+        let mut confinement = Confinement::locked_down(1 << 28);
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        confinement = confinement.grant(Grant::read(root));
+        assert!(matches!(
+            check_grants(&confinement, &[]),
+            Err(IsolationError::GrantTooBroad { .. })
+        ));
     }
 
     #[test]

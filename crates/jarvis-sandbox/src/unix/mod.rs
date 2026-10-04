@@ -24,6 +24,15 @@ pub(crate) type Stdout = tokio::process::ChildStdout;
 pub(crate) type Stderr = tokio::process::ChildStderr;
 
 pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::Result<Spawned> {
+    // Only Linux has the filesystem, network and process boundary. Elsewhere
+    // the worker would run with the user's full authority, so it does not
+    // run at all.
+    if cfg!(not(target_os = "linux")) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "worker isolation is implemented for Linux and Windows only",
+        ));
+    }
     let mut cmd = tokio::process::Command::new(&command.program);
     cmd.args(&command.args)
         .env_clear()
@@ -184,12 +193,10 @@ fn prepare(command: &mut tokio::process::Command, confinement: &Confinement) -> 
                         return Err(io::Error::last_os_error());
                     }
                 }
-                // A Core running as root must not hand root's capabilities
-                // to the worker. After the limits above, which root may set
-                // above the current hard limit.
-                if libc::geteuid() == 0 {
-                    drop_capabilities()?;
-                }
+                // The worker gets no capabilities, whoever runs the Core.
+                // After the limits above, which root may set above the
+                // current hard limit.
+                drop_capabilities()?;
                 // Filesystem boundary, then the syscall filter last: once the
                 // filter is installed, only the final execve of the worker
                 // may run.
@@ -219,12 +226,20 @@ struct CapData {
     inheritable: u32,
 }
 
-/// Remove every capability from the bounding, ambient, effective, permitted
-/// and inheritable sets, so the interpreter runs with none even as root.
+/// Remove every capability from the ambient, effective, permitted and
+/// inheritable sets, and (for root, the only case where it matters and is
+/// possible) from the bounding set, so the interpreter runs with none.
 /// Runs between fork and exec: system calls only.
 #[cfg(target_os = "linux")]
 fn drop_capabilities() -> io::Result<()> {
+    // SAFETY: geteuid has no side effects.
+    let root = unsafe { libc::geteuid() } == 0;
     for cap in 0..64 {
+        if !root {
+            // Emptying the bounding set needs CAP_SETPCAP. Without root,
+            // no_new_privs already stops exec from adding capabilities.
+            break;
+        }
         // SAFETY: PR_CAPBSET_DROP only narrows this process's bounding set;
         // EINVAL marks a capability number this kernel does not know.
         if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
@@ -322,9 +337,7 @@ fn describe(pid: u32, confinement: &Confinement) -> Contained {
         controls.push("no_new_privs".to_owned());
         controls.push("no capabilities".to_owned());
         controls.push("no signals to other processes".to_owned());
-        if !confinement.filesystem.is_empty() {
-            controls.push("landlock filesystem".to_owned());
-        }
+        controls.push("landlock filesystem".to_owned());
         if confinement.deny_network {
             controls.push("no network".to_owned());
         }

@@ -253,7 +253,7 @@ pub async fn serve_with_executor(
 /// Build the worker's launch and run the isolation probe under it. The
 /// canary goes next to the database, which the worker is never granted.
 async fn verified_launch(config: &Config) -> Result<WorkerLaunch, IsolationError> {
-    let launch = isolation::launch(&config.worker)?;
+    let launch = isolation::launch(&config.worker, &isolation::protected_paths(config))?;
     let scratch = config
         .database
         .parent()

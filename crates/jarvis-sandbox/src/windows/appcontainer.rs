@@ -11,15 +11,17 @@
 //! The profile is created per user with no administrator rights. Creating it
 //! again is a no-op, so starting the Core twice changes nothing.
 
+use std::ffi::OsString;
 use std::io;
-use std::path::Path;
+use std::os::windows::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS,
-    SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
-    TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+    ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+    NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
+    TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -27,14 +29,16 @@ use windows_sys::Win32::Security::Isolation::{
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    EqualSid, FreeSid, GetAce, NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    EqualSid, FreeSid, GetAce, INHERIT_ONLY_ACE, NO_INHERITANCE, OBJECT_INHERIT_ACE,
+    PSECURITY_DESCRIPTOR, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
+    DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::core::PWSTR;
 
 use super::{wide, wide_str};
@@ -45,6 +49,21 @@ use crate::{Access, Grant};
 pub(crate) const PROFILE_NAME: &str = "JARVIS.Worker";
 const DISPLAY_NAME: &str = "JARVIS worker";
 const DESCRIPTION: &str = "Runs the JARVIS worker with no network and no access to user files";
+
+/// "ALL APPLICATION PACKAGES": system directories grant it, and with it
+/// every AppContainer.
+const ALL_APPLICATION_PACKAGES: &str = "S-1-15-2-1";
+
+/// Every right that changes a file or directory, without the
+/// synchronisation and read-control bits that reading also needs.
+const WRITE_RIGHTS: u32 = FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_WRITE_ATTRIBUTES
+    | FILE_DELETE_CHILD
+    | DELETE
+    | WRITE_DAC
+    | WRITE_OWNER;
 
 /// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`.
 const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7_u32 as i32;
@@ -140,17 +159,54 @@ pub(crate) fn delete_profile(sid: &PackageSid) -> io::Result<bool> {
 /// Whether the profile's folder exists. Any answer other than "not found"
 /// counts as existing, so a deletion is still attempted.
 fn profile_exists(sid: &PackageSid) -> io::Result<bool> {
+    match container_folder(sid)? {
+        Ok(_) => Ok(true),
+        Err(code) => Ok(!HRESULT_NOT_FOUND.contains(&code)),
+    }
+}
+
+/// The AppContainer's own folder (`...\Packages\<name>\AC`), or the HRESULT
+/// `GetAppContainerFolderPath` failed with.
+fn container_folder(sid: &PackageSid) -> io::Result<Result<PathBuf, i32>> {
     let text = wide_str(&sid.to_sddl()?);
     let mut path: PWSTR = null_mut();
     // SAFETY: a NUL-terminated SID string and an out pointer that, on
     // success, receives a CoTaskMemAlloc'd string freed below.
     let result = unsafe { GetAppContainerFolderPath(text.as_ptr(), &mut path) };
-    if result == 0 {
-        // SAFETY: allocated by GetAppContainerFolderPath with CoTaskMemAlloc.
-        unsafe { CoTaskMemFree(path.cast()) };
-        return Ok(true);
+    if result != 0 {
+        return Ok(Err(result));
     }
-    Ok(!HRESULT_NOT_FOUND.contains(&result))
+    // SAFETY: `path` is a NUL-terminated UTF-16 string from the call above.
+    let folder = unsafe {
+        let mut len = 0;
+        while *path.add(len) != 0 {
+            len += 1;
+        }
+        PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(path, len)))
+    };
+    // SAFETY: allocated by GetAppContainerFolderPath with CoTaskMemAlloc.
+    unsafe { CoTaskMemFree(path.cast()) };
+    Ok(Ok(folder))
+}
+
+/// Deny the package SID every write in its own AppContainer folder, which
+/// Windows otherwise gives it in full (it is where `TEMP` points). With
+/// this, the worker can write nowhere: it cannot fill the disk or keep
+/// state across restarts. Done once; later starts find the entry.
+pub(crate) fn deny_container_writes(sid: &PackageSid) -> io::Result<()> {
+    let folder =
+        container_folder(sid)?.map_err(|code| hresult_error("GetAppContainerFolderPath", code))?;
+    let dacl = Dacl::read(&folder)?;
+    if dacl.denies(sid, WRITE_RIGHTS) {
+        return Ok(());
+    }
+    dacl.apply(
+        &folder,
+        sid,
+        DENY_ACCESS,
+        WRITE_RIGHTS,
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    )
 }
 
 /// The rights a grant gives the package SID. Every grant includes
@@ -251,8 +307,8 @@ impl Dacl {
         Ok(Self { descriptor, acl })
     }
 
-    /// Every allow entry, as (SID pointer, mask, flags).
-    fn entries(&self) -> Vec<(PSID, u32, u8)> {
+    /// Every allow and deny entry, as (type, SID pointer, mask, flags).
+    fn entries(&self) -> Vec<(u32, PSID, u32, u8)> {
         if self.acl.is_null() {
             return Vec::new();
         }
@@ -268,44 +324,71 @@ impl Dacl {
             }
             // SAFETY: every ACE starts with an ACE_HEADER.
             let header = unsafe { *ace.cast::<ACE_HEADER>() };
-            if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
+            let kind = u32::from(header.AceType);
+            if kind != ACCESS_ALLOWED_ACE_TYPE && kind != ACCESS_DENIED_ACE_TYPE {
                 continue;
             }
-            let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
-            // SAFETY: an ACCESS_ALLOWED_ACE whose SID starts at SidStart and
+            // An ACCESS_DENIED_ACE has the same layout as ACCESS_ALLOWED_ACE.
+            let entry = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: an allow or deny ACE whose SID starts at SidStart and
             // lies within AceSize bytes, inside the ACL.
             let (mask, sid) = unsafe {
                 (
-                    (*allowed).Mask,
-                    (&raw mut (*allowed).SidStart).cast::<core::ffi::c_void>(),
+                    (*entry).Mask,
+                    (&raw mut (*entry).SidStart).cast::<core::ffi::c_void>(),
                 )
             };
-            entries.push((sid, mask, header.AceFlags));
+            entries.push((kind, sid, mask, header.AceFlags));
         }
         entries
     }
 
-    /// Whether an allow entry for `sid` grants all of `wanted` (and, for a
-    /// directory, is inherited by files and subdirectories). A missing DACL
-    /// means unrestricted access, which also counts.
+    /// Whether an allow entry for `sid`, or for ALL APPLICATION PACKAGES
+    /// (as on system directories such as `Program Files`), grants all of
+    /// `wanted` to this object (and, for a directory, to files and
+    /// subdirectories below it). A missing DACL means unrestricted access,
+    /// which also counts. Deny entries are not weighed here: one would make
+    /// the worker fail to start, not run with more access.
     fn grants(&self, sid: &PackageSid, wanted: u32, directory: bool) -> bool {
         if self.acl.is_null() {
             return true;
         }
+        let any_package = LocalSid::parse(ALL_APPLICATION_PACKAGES).ok();
         let inherit = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8;
-        self.entries().into_iter().any(|(entry, mask, flags)| {
-            // SAFETY: both are valid SIDs.
-            let same = unsafe { EqualSid(entry, sid.as_psid()) } != 0;
-            same && mask & wanted == wanted && (!directory || flags & inherit == inherit)
+        self.entries()
+            .into_iter()
+            .any(|(kind, entry, mask, flags)| {
+                // SAFETY: valid SIDs.
+                let ours = unsafe { EqualSid(entry, sid.as_psid()) } != 0;
+                // SAFETY: valid SIDs.
+                let everyone = any_package
+                    .as_ref()
+                    .is_some_and(|any| unsafe { EqualSid(entry, any.0) } != 0);
+                kind == ACCESS_ALLOWED_ACE_TYPE
+                    && (ours || everyone)
+                    && flags & INHERIT_ONLY_ACE as u8 == 0
+                    && mask & wanted == wanted
+                    && (!directory || flags & inherit == inherit)
+            })
+    }
+
+    /// Whether a deny entry for `sid` covers all of `rights`.
+    fn denies(&self, sid: &PackageSid, rights: u32) -> bool {
+        self.entries().into_iter().any(|(kind, entry, mask, _)| {
+            kind == ACCESS_DENIED_ACE_TYPE
+                // SAFETY: valid SIDs.
+                && unsafe { EqualSid(entry, sid.as_psid()) } != 0
+                && mask & rights == rights
         })
     }
 
     /// Whether any allow entry names `sid`.
     fn names(&self, sid: &PackageSid) -> bool {
-        self.entries()
-            .into_iter()
-            // SAFETY: both are valid SIDs.
-            .any(|(entry, _, _)| unsafe { EqualSid(entry, sid.as_psid()) } != 0)
+        self.entries().into_iter().any(|(kind, entry, _, _)| {
+            kind == ACCESS_ALLOWED_ACE_TYPE
+                // SAFETY: both are valid SIDs.
+                && unsafe { EqualSid(entry, sid.as_psid()) } != 0
+        })
     }
 
     /// Merge one entry for `sid` into this DACL and write it back.
@@ -364,6 +447,29 @@ impl Dacl {
             return Err(win32_error("SetNamedSecurityInfoW", status));
         }
         Ok(())
+    }
+}
+
+/// A SID parsed from its string form, freed on drop.
+struct LocalSid(PSID);
+
+impl LocalSid {
+    fn parse(text: &str) -> io::Result<Self> {
+        let text = wide_str(text);
+        let mut sid: PSID = null_mut();
+        // SAFETY: a NUL-terminated SID string; the SID is freed on drop.
+        let ok = unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(sid))
+    }
+}
+
+impl Drop for LocalSid {
+    fn drop(&mut self) {
+        // SAFETY: allocated by ConvertStringSidToSidW.
+        unsafe { LocalFree(self.0) };
     }
 }
 

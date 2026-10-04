@@ -97,6 +97,7 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
     let _launching = LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
 
     let sid = PackageSid::ensure()?;
+    appcontainer::deny_container_writes(&sid)?;
     appcontainer::grant_paths(&sid, &confinement.filesystem)?;
 
     // A job with UI restrictions cannot be nested under another job; the
@@ -205,7 +206,7 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
 
     // The worker is suspended and has run no code. Check what it got, strip
     // its privileges, then let it run. Any failure kills it.
-    let started = super::verify_worker_token(process.0)
+    let started = super::verify_worker_token(process.0, &sid)
         .and_then(|()| super::require_in_job(process.0, &job))
         .and_then(|()| resume(&thread))
         .and_then(|()| Waiter::start(Arc::clone(&process)));

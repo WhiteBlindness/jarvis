@@ -68,7 +68,7 @@ impl Worker {
     }
 
     /// Wait up to `grace` for the worker to exit on its own (its stdin
-    /// should already be closed), then kill it and anything it started.
+    /// should already be closed), then kill it.
     pub async fn stop(mut self, grace: Duration) -> io::Result<WorkerExit> {
         let exit = match tokio::time::timeout(grace, self.process.wait()).await {
             Ok(status) => WorkerExit {
@@ -77,8 +77,7 @@ impl Worker {
             },
             Err(_) => self.kill_now().await?,
         };
-        // Nothing the worker started may outlive it.
-        let _ = self.contained.kill_all();
+        self.after_exit();
         self.drain_stderr().await;
         Ok(exit)
     }
@@ -93,7 +92,7 @@ impl Worker {
     async fn kill_now(&mut self) -> io::Result<WorkerExit> {
         // The process may exit between the timeout and the kill.
         if let Some(status) = self.process.try_wait()? {
-            let _ = self.contained.kill_all();
+            self.after_exit();
             return Ok(WorkerExit {
                 status,
                 killed: false,
@@ -111,6 +110,15 @@ impl Worker {
             status,
             killed: true,
         })
+    }
+
+    /// Clean up after the worker has been reaped. On Windows the job handle
+    /// still names exactly its processes, so anything left in it is killed.
+    /// On Unix nothing is signalled: the worker could start no process, and
+    /// its process group ID may already belong to an unrelated process.
+    fn after_exit(&self) {
+        #[cfg(windows)]
+        let _ = self.contained.kill_all();
     }
 
     async fn drain_stderr(&mut self) {
