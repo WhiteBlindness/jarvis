@@ -1,46 +1,52 @@
-# 0013. Isolate the Windows worker with an AppContainer
+# 0013. Isolate the Windows worker in an AppContainer, and prove it at start-up
 
 **Status:** Accepted
 
 ## Context
 
-Phase 2 contained the worker with a job object and a low-integrity token (ADR 0012). That stops the worker writing to the user's files and opening the Core's pipe, but it does **not** stop the worker *reading* the user's profile, and it does **not** stop the worker opening network connections. A compromised or hallucinating worker could still read `C:\Users\<user>\Documents`, exfiltrate over the network, or call a model API directly. Phase 3's objective is to make the Rust Core the meaningful broker of authority, so that a worker calling `open`, `socket` or the Windows API directly is denied by the operating system.
+Phase 2 contained the worker with a job object and a low-integrity token (ADR 0012). Low integrity stops the worker writing the user's files and opening the Core's pipe, but it does **not** stop the worker reading the user's profile, and it does **not** stop network access. A compromised worker could read `Documents`, send it anywhere, or call a model API directly. Phase 3 makes the Rust Core the only broker of authority: a worker that calls `open`, `socket` or the Windows API directly must be refused by the operating system.
 
-Windows is the real deployment target, so it gets the stronger boundary. The options evaluated against authoritative Microsoft documentation were: restricted token + low integrity (the Phase 2 baseline), AppContainer, less-privileged AppContainer (LPAC), a dedicated local account, and hybrids.
+Windows is the real deployment target, so it gets the strongest boundary that needs no administrator rights for normal use, no second account and no visible session (owner decisions 1 and 2). The options evaluated:
 
-| Option | Profile reads | Network | No admin | CPython | Overhead |
+| Option | Profile reads | Network | Admin needed | Second identity | Overhead |
 | --- | --- | --- | --- | --- | --- |
-| Restricted token + low IL (Phase 2) | open (MIC blocks writes only) | open | yes | fine | ~0 |
-| **AppContainer** | denied by default | denied by default | yes | fine once the runtime is granted | very low |
-| LPAC | stricter | denied by default | yes | registry/COM denied, needs tuning | very low |
-| Dedicated account | strong | open without an admin firewall rule | needs admin + a stored password | fine | logon + profile |
+| Restricted token + low integrity (Phase 2) | allowed (integrity checks block writes only) | allowed | no | no | ~0 |
+| **AppContainer, no capabilities** | denied unless granted | denied, loopback included | no | no (a package SID, not an account) | very low |
+| Less-privileged AppContainer (LPAC) | stricter | denied | no | no | very low; registry, COM and some system files need extra grants |
+| Dedicated local account | denied by ACLs | allowed unless an administrator adds firewall rules | yes, plus a stored password | yes | logon session and profile |
 
-An AppContainer process has a package SID and runs at low integrity. File access is a *dual check*: both the user's SID and the package SID must grant access, and legacy ACLs do not name the package SID, so the user's profile is unreadable by default. With no capabilities declared, the Windows Filtering Platform blocks all of its network traffic, including loopback. It needs no administrator rights, no second account and no password. It is the cleanest strong boundary, so it is preferred over a dedicated account (owner decision 2 allows an account only if it is *stronger*; it is not).
+An AppContainer process carries a package SID and runs at low integrity. Every file access is checked twice, once for the user and once for the package SID, and ordinary ACLs never name the package SID, so the user's profile is unreadable by default. With no capabilities, the Windows Filtering Platform blocks all of its network traffic, including loopback. It is the strongest option that keeps normal use free of administrator rights and of a second identity to manage, so it is preferred over a dedicated account, which would be weaker on the network without administrator help and heavier to run. LPAC would be stricter still, but needs per-machine tuning that CI cannot validate; it is a candidate for later.
 
 ## Decision
 
-On Windows the worker runs inside an AppContainer with **no capabilities**, created and torn down by the Core per run, with no administrator rights for normal use. All of the controls below are applied atomically in one `CreateProcessW` call (via `STARTUPINFOEXW` and a proc-thread attribute list), because `std`/`tokio` `Command` cannot carry an attribute list:
+On Windows the worker runs in an AppContainer with **no capabilities**. `std` and Tokio cannot pass a process-thread attribute list, so `jarvis-sandbox` creates the process itself, with every control in one `CreateProcessW` call (`STARTUPINFOEXW` with a proc-thread attribute list):
 
-1. **Identity.** `CreateAppContainerProfile` (idempotent; `ERROR_ALREADY_EXISTS` is treated as success) and `DeriveAppContainerSidFromAppContainerName` give a stable per-user package SID. `SECURITY_CAPABILITIES` with that SID and zero capabilities is passed as `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`.
-2. **Filesystem.** The worker gets read+execute on the Python runtime directory and the worker package, and read+write on a per-run workspace and temp directory, granted to the package SID with inheritable ACEs (`SetEntriesInAclW` + `SetNamedSecurityInfoW`). `TEMP`/`TMP` point at the granted temp directory. Nothing else is granted, so the user's profile is unreadable (ADR 0015 covers the filesystem model for both platforms).
-3. **Network.** Zero capabilities means the Filtering Platform denies all traffic, loopback included. This is not left to trust: the worker runs a startup self-test against a Core-held loopback listener and a DNS lookup, and **fails closed** if either succeeds (the firewall service could be off; see residual risk).
-4. **Child processes.** `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`, backed by a job object (`JOB_LIST` attribute, atomic at creation) with an active-process limit of one, no breakaway, a commit limit, and kill-on-close.
-5. **Handles.** `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` names only the three stdio pipe ends; `bInheritHandles = TRUE` with everything else non-inheritable, so no stray handle reaches the worker.
-6. **Mitigations.** `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` enables extension-point disable, no-remote image loads, no-low-label image loads, font disable, heap-terminate and ASLR. `BLOCK_NON_MICROSOFT_BINARIES` is **never** set: CPython and its `.pyd` files are PSF-signed and it would break them.
-7. **RPC.** The owner-only pipe DACL already excludes the package SID by the dual check; a `NO_READ_UP` mandatory label is added so a low-IL worker cannot even read Core process or pipe objects (ADR 0016).
+1. **Identity.** `CreateAppContainerProfile("JARVIS.Worker")`, per user, as the user; an existing profile is reused (`DeriveAppContainerSidFromAppContainerName`). `SECURITY_CAPABILITIES` with that package SID and zero capabilities.
+2. **Filesystem.** The package SID is granted read and execute on the interpreter's directory and read on the worker's source directory, as inherited entries (`SetEntriesInAclW`, `SetNamedSecurityInfoW`). A path that already grants it is not touched, so later starts change nothing. Nothing is writable. Windows system directories stay readable because they grant "ALL APPLICATION PACKAGES".
+3. **Network.** Zero capabilities: the Filtering Platform drops all traffic. This is not taken on trust (see "Start-up proof").
+4. **Child processes.** `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`, backed by the job's active-process limit of one.
+5. **Job.** `PROC_THREAD_ATTRIBUTE_JOB_LIST` puts the worker in a job at creation: kill on job close, one active process, a commit limit, die on unhandled exception, no breakaway, and UI restrictions unless the Core itself runs inside a job (Windows refuses to nest a UI-restricted job).
+6. **Handles.** `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` names only the three stdio pipe ends. The Core's ends are overlapped named-pipe servers whose DACL admits only the current user; the worker's ends are synchronous and inherited.
+7. **Mitigations.** Heap terminate, bottom-up and high-entropy ASLR, extension points disabled, non-system fonts disabled, no images from remote shares or with a low integrity label. `BLOCK_NON_MICROSOFT_BINARIES` is never set (CPython is not Microsoft-signed), nor `PROHIBIT_DYNAMIC_CODE` (ctypes callbacks). `WIN32K_SYSTEM_CALL_DISABLE` and `STRICT_HANDLE_CHECKS` are not yet validated with CPython.
+8. **Token check.** The process is created suspended. Before it runs, the Core confirms its token is an AppContainer token at low integrity and that it is inside the job, removes every privilege except `SeChangeNotifyPrivilege`, and only then resumes it. Any failure terminates it.
+9. **Environment.** The Core passes `PATH` and `SYSTEMROOT`. `CreateProcessW` also reads `LOCALAPPDATA`, `APPDATA`, `USERPROFILE`, `HOMEDRIVE` and `HOMEPATH` from the block to set up an AppContainer, and fails without them, so the launcher adds them from the Core's environment. They name directories the worker cannot open.
 
-The worker must be the base `python.exe`, not `py.exe` or a venv launcher, because those spawn a child process that the child-process policy would block.
+The worker must be a real `python.exe`. The `py` launcher and virtual-environment shims start a second process, which the child-process policy refuses.
+
+**RPC.** The Core's pipe DACL names only the user, so the package SID fails the second access check and the worker cannot open it. The RPC server additionally refuses any client whose token is an AppContainer token or below medium integrity, and refuses clients it cannot inspect.
+
+**Start-up proof (both platforms).** Before the first worker starts, the Core runs a probe under the identical isolation: same program, environment, working directory and confinement, with a short script instead of the worker. The Core checks from its own side that its loopback TCP listener accepted nothing, its loopback UDP socket received nothing, a file it wrote next to its database was not read (only a permission error counts), and no process could be started. If any check fails, or the probe cannot run, the Core records why and does not start. `jarvis-core isolation check` runs the same probe on demand.
 
 ## Consequences
 
-- The worker cannot read the user's profile, cannot reach the network, cannot start a child process, and cannot open the Core's pipe or process, all enforced by the OS rather than by trust.
-- The normal user notices nothing: no account, no password, no second session, no admin prompt during use. Creating the AppContainer profile and granting the runtime ACLs happen in-process at start-up as the ordinary user.
-- The implementation is substantial unsafe FFI in `jarvis-sandbox`, compiled only on Windows and exercised by adversarial probes on CI; some properties need a real desktop (ADR 0017, `docs/windows-validation.md`).
-- An **optional** one-time administrator step can add a Windows Firewall rule keyed on the package SID as defence in depth for the network block. It is never required.
+- The worker cannot read the user's profile, write anywhere, reach the network, start a process, or open the Core's pipe or process, enforced by Windows and proved by the probes in `crates/jarvis-sandbox/tests/contain.rs` on CI.
+- Nothing changes for the person using it: no account, password, second session, desktop switch or administrator prompt. The first start grants the interpreter's directory to the package SID; with a large Python installation that takes a few seconds once.
+- What the Core changes on the machine is small and reversible: an AppContainer profile (a registry mapping and an empty folder under `%LOCALAPPDATA%\Packages`) and access entries for the package SID on two directories. `jarvis-core isolation remove` undoes both.
+- An **optional**, one-time administrator step (`scripts/windows/isolation.ps1 -Action Install`) adds Windows Firewall block rules keyed on the package SID as defence in depth, and grants the interpreter's directory when the user may not change its ACL (a Python installed for all users outside `Program Files`). It is never needed for normal use.
 
 ## Residual risk
 
-- Network enforcement is the Filtering Platform's. If the Base Filtering Engine or the firewall service is disabled, the WFP block may not apply; the worker's fail-closed self-test is the compensating control, and the optional firewall rule is defence in depth.
-- Whether a standard user can create an AppContainer profile, whether DNS resolution is possible with no capabilities, and whether loopback is fully blocked in every configuration are not all confirmable from documentation alone; the Windows validation guide lists them as **LOCAL WINDOWS VERIFICATION REQUIRED**, and the runtime self-test fails closed regardless.
-- A kernel-level or Windows-API escape from an AppContainer is outside this project's threat model (ADR 0012 and the threat model say so).
-- This is isolation of an untrusted local process, not a guarantee against all malicious code. The README and threat model avoid the word "sandbox" for properties the implementation does not provide.
+- Network enforcement belongs to the Filtering Platform. If the Base Filtering Engine were stopped, the block might not apply; the start-up proof would then fail and the Core would not run a worker.
+- The worker learns the user's profile path (and so the user name) from the profile variables Windows requires. It cannot open those directories.
+- Some properties need a real desktop session to observe (UI restrictions, behaviour under a standard, non-administrator account, and Windows editions other than the CI image); `docs/windows-validation.md` lists them as **LOCAL WINDOWS VERIFICATION REQUIRED**.
+- A kernel or Windows-component vulnerability that escapes an AppContainer is out of scope.

@@ -505,13 +505,22 @@ async fn signalling_another_process_is_denied() {
 #[tokio::test]
 async fn the_worker_has_no_capabilities() {
     // Read by the test, from outside: the worker itself cannot open /proc.
-    // Meaningful when the tests run as root, and trivially true otherwise.
     let Spawned {
         process, contained, ..
     } = start("import time\ntime.sleep(30)");
     let status = std::fs::read_to_string(format!("/proc/{}/status", process.id())).unwrap();
     contained.kill_all().unwrap();
-    for set in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
+    // The bounding set can only be emptied by root, and only matters for
+    // root: for anyone else no_new_privs already stops exec from adding
+    // capabilities.
+    // SAFETY: geteuid has no side effects.
+    let root = unsafe { libc::geteuid() } == 0;
+    let sets: &[&str] = if root {
+        &["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"]
+    } else {
+        &["CapInh", "CapPrm", "CapEff", "CapAmb"]
+    };
+    for set in sets {
         let line = status
             .lines()
             .find(|line| line.starts_with(set))

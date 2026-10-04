@@ -30,7 +30,7 @@ use windows_sys::Win32::Security::{
     SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
 };
 use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 
@@ -130,12 +130,16 @@ pub(crate) fn delete_profile() -> io::Result<bool> {
     }
 }
 
-/// The rights a grant gives the package SID.
+/// The rights a grant gives the package SID. Every grant includes
+/// `FILE_TRAVERSE`: a directory must grant it to be opened as a working
+/// directory or walked into. On a file the same bit means execute, which
+/// for a read-only source tree of Python files is harmless (the worker can
+/// neither start a process nor write a file there).
 fn rights(access: Access) -> u32 {
     match access {
         Access::ReadExecute => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
-        Access::Read => FILE_GENERIC_READ,
-        Access::ReadWrite => FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+        Access::Read => FILE_GENERIC_READ | FILE_TRAVERSE,
+        Access::ReadWrite => FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | DELETE,
     }
 }
 

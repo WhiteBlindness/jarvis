@@ -58,6 +58,18 @@ jobs:
         run: cargo test -p jarvis-sandbox --test contain --locked -- --include-ignored --nocapture measure_isolation_overhead only_the_given_environment_reaches_the_worker
         env:
           JARVIS_TEST_PYTHON: python
+      # The optional provisioning script, end to end on a throwaway runner:
+      # install twice (idempotent), check, remove twice.
+      - name: Isolation script
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $config = 'config/jarvis.ci.toml'
+          scripts/windows/isolation.ps1 -Action Install -Config $config -Yes
+          scripts/windows/isolation.ps1 -Action Install -Config $config -Yes
+          scripts/windows/isolation.ps1 -Action Check -Config $config
+          scripts/windows/isolation.ps1 -Action Remove -Config $config -Yes
+          scripts/windows/isolation.ps1 -Action Remove -Config $config -Yes
 
   msrv:
     name: Minimum Rust version

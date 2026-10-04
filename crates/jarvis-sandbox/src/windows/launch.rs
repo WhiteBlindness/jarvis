@@ -40,6 +40,10 @@ use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    GetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX,
+    SetErrorMode,
+};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
@@ -138,6 +142,19 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
         | DETACHED_PROCESS
         | EXTENDED_STARTUPINFO_PRESENT
         | CREATE_UNICODE_ENVIRONMENT;
+
+    // The worker inherits the Core's error mode. Without these flags a
+    // loader failure in the worker (a missing or unreadable DLL) would wait
+    // on a system dialog nobody sees, instead of ending the process.
+    // SAFETY: reads and sets this process's error mode; no memory involved.
+    unsafe {
+        SetErrorMode(
+            GetErrorMode()
+                | SEM_FAILCRITICALERRORS
+                | SEM_NOGPFAULTERRORBOX
+                | SEM_NOOPENFILEERRORBOX,
+        )
+    };
 
     // SAFETY: an all-zero PROCESS_INFORMATION is valid; CreateProcessW fills it.
     let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
@@ -364,7 +381,24 @@ fn pipe(direction: Direction) -> io::Result<(NamedPipeServer, Handle)> {
         )
     };
     let client = Handle::new(raw).ok_or_else(|| last_error("CreateFileW(worker pipe)"))?;
+    // The server was registered with Tokio before the client connected, so
+    // no read was scheduled and no write readiness reported. Completing the
+    // (already satisfied) connect does both.
+    connect_now(&server)?;
     Ok((server, client))
+}
+
+/// Complete `connect` on a server whose client has already opened it.
+/// `ConnectNamedPipe` then succeeds at once, so one poll finishes it.
+fn connect_now(server: &NamedPipeServer) -> io::Result<()> {
+    let mut connect = std::pin::pin!(server.connect());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match connect.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => Err(io::Error::other(
+            "the worker's pipe did not connect immediately",
+        )),
+    }
 }
 
 /// Build a command line that the Microsoft C runtime (and so CPython) splits
