@@ -15,4 +15,6 @@ Short records of decisions that shape the codebase. Each one states the context,
 | [0009](0009-approvals-do-not-survive-restart.md) | Pending approvals do not survive a restart |
 | [0010](0010-local-rpc-transport.md) | Local RPC over a Unix socket or a named pipe |
 | [0011](0011-long-lived-core.md) | A long-lived Core that supervises its worker |
-| [0012](0012-worker-containment.md) | OS containment of the worker, without claiming a sandbox |
+| [0012](0012-worker-containment.md) | OS containment of the worker, without claiming a sandbox (superseded in part by 0013 and 0014) |
+| [0013](0013-windows-appcontainer.md) | Isolate the Windows worker in an AppContainer, and prove it at start-up |
+| [0014](0014-linux-landlock-seccomp.md) | Isolate the Linux worker with Landlock and seccomp |

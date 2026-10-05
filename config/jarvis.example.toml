@@ -6,8 +6,14 @@ database = "../var/jarvis.db"
 [worker]
 # Started directly, never through a shell, with an empty environment apart
 # from PATH and SYSTEMROOT; there is no option to add variables back.
+# The worker runs isolated by the OS (an AppContainer on Windows, Landlock
+# and seccomp on Linux): it can read the interpreter's directory and `cwd`
+# (plus the system runtime directories on Linux) and nothing else, and has
+# no network and no child processes. The Core proves this at start-up and
+# refuses to run a worker without it; `jarvis-core isolation check` runs the
+# same proof on demand.
 # On Windows use the real interpreter ("python", or its full path), not the
-# "py" launcher: the worker may not start child processes there.
+# "py" launcher or a virtual environment: both start a second process.
 program = "python3"
 args = ["-m", "jarvis_worker"]
 cwd = "../services/intelligence-python/src"

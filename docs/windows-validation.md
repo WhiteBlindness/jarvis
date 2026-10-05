@@ -1,153 +1,166 @@
 # Windows validation
 
-CI runs the full Rust test suite on `windows-latest`, including the containment probes in `crates/jarvis-sandbox/tests/contain.rs` and the daemon tests in `crates/jarvis-core/tests/process.rs`. A CI runner is not a desktop session, though: it has no interactive user, it may already place processes inside a job, and nobody looks at the result with Windows tools. This guide is the checklist for a person to run on a real Windows 10 or 11 machine.
+CI runs the full Rust test suite on `windows-latest`: the isolation probes in `crates/jarvis-sandbox/tests/contain.rs` (a real Python child in the worker's AppContainer tries to read the profile, write files, reach the network, start processes, open the Core's pipe and process, and use a leaked handle), the start-up check in `crates/jarvis-core/tests/isolation.rs`, the daemon tests in `crates/jarvis-core/tests/process.rs`, `jarvis-core isolation check`, and the optional provisioning script end to end. A CI runner is not a desktop, though: it runs as an administrator, inside a job, with no interactive user and nobody watching with Windows tools. This guide is the checklist for a person on a real Windows 10 or 11 machine.
 
-Items marked **LOCAL WINDOWS VERIFICATION REQUIRED** are not proven by CI. Record what you observe; do not mark an item as passed without running it.
+Items marked **LOCAL WINDOWS VERIFICATION REQUIRED** are not proven by CI. Record what you observe in the table at the end; do not mark an item as passed without running it.
 
-All commands are for PowerShell, from the repository root.
+All commands are for PowerShell, from the repository root, as your **normal (non-administrator) account** unless a step says otherwise.
 
-## 1. Toolchain
+## 1. Toolchain and interpreter
 
 ```powershell
 rustc --version          # 1.89 or newer
-cargo --version
 (Get-Command python).Source
 python --version         # 3.11 or newer
 ```
 
-- Use the real interpreter in `config/jarvis.example.toml`: `program = "python"` if `(Get-Command python).Source` is a `python.exe` inside a Python installation, or its full path. Do not use the `py` launcher or the Microsoft Store alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`: both start a second process, which the job object refuses (the worker may not start child processes).
-- Build once: `cargo build -p jarvis-core`.
-
-Set a helper for the rest of the guide:
+The worker must be a real `python.exe` from a Python installation (python.org installer, per user or for all users). Not the `py` launcher, not the Microsoft Store alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`, not a virtual-environment `python.exe`: each of those starts a second process, which the worker's child-process policy refuses. Set `program` in `config/jarvis.example.toml` to `"python"` if `(Get-Command python).Source` is such a `python.exe`, or to its full path.
 
 ```powershell
+cargo build -p jarvis-core
 $cfg = "config\jarvis.example.toml"
 function jarvis { & target\debug\jarvis-core.exe @args --config $cfg }
 ```
 
-## 2. Start the Core and check health
+## 2. Isolation check, as a normal user
+
+**LOCAL WINDOWS VERIFICATION REQUIRED** (CI runs as an administrator).
+
+```powershell
+Measure-Command { jarvis isolation check | Out-Host }
+```
+
+Expected:
+
+- `mechanism AppContainer (no capabilities) + job object + child-process policy + mitigations (...)`, the AppContainer name `JARVIS.Worker` and its package SID (`S-1-15-2-...`).
+- `ui restrictions yes` on a normal desktop session. Record which terminal you used (Windows Terminal, conhost, VS Code); some start programs inside a job, which turns UI restrictions off.
+- Two grants: read+execute on your Python directory, read on `services\intelligence-python\src`.
+- Five `ok` lines: no loopback TCP, no loopback UDP (on Windows the send itself may succeed: `sent, nothing arrived`), no access to the Core's files, no access to the user's home, no child processes. Exit code 0.
+
+Record the time for a first run (it grants your Python directory to the worker's identity, which takes seconds for a large installation) and for a second run.
+
+If Python is installed for all users outside `Program Files` and the check says it cannot grant access, run the optional provisioning once from an elevated PowerShell (section 9) and check again as a normal user.
+
+No administrator prompt, password prompt, new account, sign-in or desktop switch may appear at any point. Record any that does.
+
+## 3. Start the Core, check health
 
 ```powershell
 target\debug\jarvis-core.exe serve --config $cfg
 ```
 
-Expected: the first line on stdout is `ready \\.\pipe\jarvis`, logs follow on stderr. In a second PowerShell window:
+Expected: the log line `worker isolation verified` with the five checks, then `ready \\.\pipe\jarvis` on stdout. In a second PowerShell:
 
 ```powershell
 jarvis health
 ```
 
-Expected: `status ok`, worker `idle` with a pid, and `containment` listing `job object (killed with the Core, no child processes)`, `commit limit 512 MiB`, `low integrity`, `privileges removed`, and either `UI restrictions` or `no UI restrictions (already inside a job)`.
+Expected: `status ok`, worker `idle` with a pid, and `containment` listing the AppContainer, low integrity, privileges removed, the job object, the commit limit, the handle list, the mitigations, no child processes and the UI restriction state.
 
-**LOCAL WINDOWS VERIFICATION REQUIRED:** on a normal desktop session the worker should not already be in a job, so `UI restrictions` should be listed. Record which one you see and from which terminal (Windows Terminal, conhost, VS Code).
-
-## 3. Class A request
+## 4. Jobs and approvals
 
 ```powershell
 Measure-Command { jarvis submit "describe the runtime, then read welcome.txt" --wait }
-```
-
-Expected: job `completed`, summary `2 call(s): completed=2 ...`. Record the time (this includes starting the CLI process).
-
-## 4. Approval flow and the class B write
-
-```powershell
 jarvis submit "write notes.txt: remember the milk"
 jarvis approvals list
-```
-
-Expected: one pending approval for `workspace.write_file` with `path = notes.txt`, `bytes = 17`, the preview, the SHA-256, capabilities `workspace.write`, task, request and job IDs, its age and expiry, and a fingerprint. `var\workspace\notes.txt` does not exist yet.
-
-```powershell
 jarvis approvals approve <approval-id>
 ```
 
-Expected: the request is shown again and the CLI asks for `yes`. Answer anything else first and check that nothing happened (`approvals list` still shows it pending). Then approve with `yes`. `var\workspace\notes.txt` now contains `remember the milk`, the job is `completed`, and `jarvis audit` shows `approval_granted`, `approval_consumed`, `execution_started`, `execution_finished` in that order.
+Expected: the class A job completes. The write waits; the approval shows path, size, preview, SHA-256, capabilities, IDs, expiry and fingerprint; `var\workspace\notes.txt` does not exist until you answer `yes`; afterwards it contains `remember the milk` and `jarvis audit` shows `approval_granted`, `approval_consumed`, `execution_started`, `execution_finished`. Deny a second write and check the file is unchanged. Record the times.
 
-Repeat with `jarvis approvals deny <id>` on a second write and check the file is unchanged.
+## 5. The worker as Windows sees it
 
-To time an approved write end to end:
+**LOCAL WINDOWS VERIFICATION REQUIRED.** With the Core running, open Process Explorer (Sysinternals) and select the worker `python.exe`:
+
+- It is a child of `jarvis-core.exe` with no `conhost.exe` child.
+- Security tab: **AppContainer** flag set, integrity **AppContainer** (low), package SID `S-1-15-2-...` matching section 2, no privileges except `SeChangeNotifyPrivilege`, no capabilities listed.
+- Job tab: one job with active process limit 1, process memory limit 512 MiB, kill on job close, and (if `health` says so) UI restrictions.
+- Handles view: the three stdio pipe handles (`\Device\NamedPipe\jarvis-worker-...`) and no handle to `jarvis.db`, `jarvis.db.lock`, the WAL file, the `\Device\NamedPipe\jarvis` RPC pipe, or any file in your profile.
+- Environment tab: `PATH`, `SYSTEMROOT`, the profile variables (`APPDATA`, `HOMEDRIVE`, `HOMEPATH`, `USERPROFILE`), and `LOCALAPPDATA`, `TEMP` and `TMP`, which Windows points into `%LOCALAPPDATA%\Packages\jarvis.worker\AC` (CI observed this), and nothing else. Set `$env:JARVIS_SECRET_PROBE = "x"` before starting the Core and confirm it is absent.
+- Security of `%LOCALAPPDATA%\Packages\jarvis.worker\AC` (Properties, Security, Advanced): Windows gives the package SID full control there (`icacls` shows it as `(CR)`, a critical entry). This is the one folder the worker can write. Write a file into `AC\Temp` as yourself, restart the Core, and check the file is gone: the Core empties the folder before every start.
+
+End `jarvis-core.exe` from Task Manager (End task). Expected: the worker disappears with it.
+
+## 6. Hostile probes on a real profile
+
+**LOCAL WINDOWS VERIFICATION REQUIRED.** CI proves these against the runner's profile; a real profile has real files, OneDrive folders and per-user Python. Run the probe suite on your machine:
 
 ```powershell
-$job = (jarvis submit "write timing.txt: x" --json | ConvertFrom-Json).job_id
-$id = (jarvis approvals list --wait 30s --json | ConvertFrom-Json).approval_id
-Measure-Command { jarvis approvals approve $id --yes; jarvis job $job --wait }
+$env:JARVIS_TEST_PYTHON = (Get-Command python).Source
+cargo test -p jarvis-sandbox --test contain -- --nocapture
 ```
 
-## 5. Job object and process tree
+Every test must pass. They are read-only towards your files: the canaries they create live in a temporary directory and are removed, and the only directory listings attempted are of your profile, `Documents`, `Desktop`, `Downloads` and `.ssh`, which must all be refused. Then check by hand, pointing `[worker] args` in a copy of the config at a throwaway script that prints each result to stderr (the Core logs worker stderr):
 
-**LOCAL WINDOWS VERIFICATION REQUIRED.** With the Core running, open Process Explorer (Sysinternals):
+- reading a file in `Documents`, `Desktop`, and a OneDrive-synced folder fails with access denied;
+- reading `%APPDATA%\Microsoft\Credentials` and a browser profile directory fails;
+- `socket.getaddrinfo("example.com", 443)` and `socket.create_connection(("1.1.1.1", 443), timeout=5)` fail;
+- connecting to a local service you run (for example `python -m http.server 8000` in another window) fails, and that server logs no request;
+- `subprocess.run(["cmd", "/c", "exit"])` fails;
+- `ctypes.windll.kernel32.OpenProcess(0x1F0FFF, False, <pid of jarvis-core>)` returns 0.
 
-- `python.exe` (the worker) is a child of `jarvis-core.exe`, has no console host child, and its Job tab lists the job with an active process limit of 1, a process memory limit of 512 MiB, kill on job close and, if listed in `health`, the UI restrictions.
-- The worker's Security tab shows integrity level **Low** and no privileges except `SeChangeNotifyPrivilege`.
-- The worker's Handles view shows the three pipe handles for stdio and no handle to `jarvis.db`, `jarvis.db.lock`, `jarvis.db-wal` or the `\Device\NamedPipe\jarvis` pipe.
+## 7. Lifecycle
 
-Then end `jarvis-core.exe` from Task Manager (End task, not Ctrl+C). Expected: the worker disappears with it.
+In the window running `serve`, press Ctrl+C once: logs show `shutdown requested`, the worker exits with code 0, the Core exits with code 0, `jarvis audit` ends with `session_closed`, `worker_exited`, `core_stopped`. Start again and press Ctrl+C twice quickly: exit code 130; the next start records recovery events. Also check `jarvis shutdown` and closing the console window.
 
-## 6. Low integrity behaviour
+Kill the worker (`Stop-Process -Id <worker pid> -Force`): `health` shows `restarting`, then `idle` with a new pid. Kill it more than `restart_budget` times within `restart_window_ms`: `health` reports the worker failed and `submit` is refused. Kill it while a write waits for approval: the approval becomes `expired`.
 
-**LOCAL WINDOWS VERIFICATION REQUIRED.** CI proves that a low-integrity child cannot write to `%TEMP%` and cannot open the Core's pipe (`low_integrity_cannot_write_user_files`, `the_worker_cannot_open_an_owner_only_pipe`). On a desktop also check, with a throwaway script run as the worker (for example by pointing `[worker] args` at a script that tries each action and prints the result to stderr, which the Core logs):
+Submit a write, leave it pending, end `jarvis-core.exe` from Task Manager, start it again: `approvals list` is empty and the old approval is `expired`.
 
-- writing to `%USERPROFILE%\Documents` fails with access denied;
-- creating a key under `HKCU\Software` fails with access denied;
-- reading a file in `%USERPROFILE%\Documents` still works (low integrity does not stop reads; this is a known gap);
-- `subprocess.run(["cmd", "/c", "exit"])` fails (job process limit).
+## 8. Performance
 
-## 7. Ctrl+C and shutdown
-
-In the window running `serve`, press Ctrl+C once. Expected: logs show `shutdown requested`, the session closes, the worker exits with code 0, and the process exits with code 0 (`$LASTEXITCODE`). `jarvis audit` ends with `session_closed`, `worker_exited`, `core_stopped`.
-
-Start it again and press Ctrl+C twice quickly. Expected: exit code 130 without a clean shutdown; the next start records `task_recovered` or `approval_expired` events for anything left open.
-
-Also check `jarvis shutdown` (allowed by the example config) and closing the console window.
-
-## 8. Worker crash and restart budget
-
-With the Core running, kill the worker from Task Manager or with `Stop-Process -Id <worker pid> -Force`. Expected: `jarvis health` shows `restarting`, then `idle` with a new pid and `restarts 1`; the audit log shows `worker_exited` and `worker_restart_scheduled`. Kill it repeatedly (more than `restart_budget` times within `restart_window_ms`): `health` reports `worker failed`, exit code 2, and `submit` is refused as `unavailable`.
-
-Kill the worker while a write waits for approval: the approval becomes `expired` and approving it afterwards is refused.
-
-## 9. Restart and recovery
-
-Submit a write, leave it pending, and end `jarvis-core.exe` from Task Manager. Start the Core again. Expected: `approvals list` is empty, `approvals show <id>` says `expired`, approving it fails, and the job is `interrupted`.
-
-## 10. Environment leak
+**LOCAL WINDOWS VERIFICATION REQUIRED.** CI prints its own numbers in the "Isolation overhead" step; desktop hardware, antivirus and a per-user Python change them.
 
 ```powershell
-$env:JARVIS_SECRET_PROBE = "must-not-leak"
-target\debug\jarvis-core.exe serve --config $cfg
-```
-
-CI checks the worker's environment with a probe worker (`the_worker_environment_is_cleared`): only `PATH` and `SYSTEMROOT` are passed. **LOCAL WINDOWS VERIFICATION REQUIRED:** confirm in Process Explorer (worker, Environment tab) that `JARVIS_SECRET_PROBE`, `USERPROFILE`, `APPDATA` and `TEMP` are absent.
-
-## 11. Resource baseline
-
-**LOCAL WINDOWS VERIFICATION REQUIRED.** With the Core idle for a minute:
-
-```powershell
+cargo test -p jarvis-sandbox --test contain -- --ignored --nocapture measure_isolation_overhead
+Measure-Command { jarvis isolation check | Out-Null }     # start-up probe cost
+Measure-Command { jarvis health | Out-Null }              # one RPC round trip, including CLI start
 Get-Process jarvis-core, python | Select-Object Name, Id, CPU, WorkingSet64, PrivateMemorySize64
 ```
 
-Record idle CPU (should not grow while idle) and memory for both processes, then the same while a job runs.
+Record: interpreter start with and without isolation, the idle worker's memory, the start-up probe time (most of it is the 2 s the blocked loopback connection takes to give up), the `health` time, and idle CPU of both processes over a minute (it should not grow).
+
+## 9. Optional provisioning, and removal
+
+Normal use needs neither step. The script never starts `jarvis-core.exe` with administrator rights: it derives the worker's package SID itself.
+
+```powershell
+scripts\windows\isolation.ps1 -Action Sid                    # the package SID
+scripts\windows\isolation.ps1 -Action Check -Config $cfg     # as your normal user
+```
+
+`Sid` must print the same SID as `jarvis isolation check`. `Check` refuses to run from an elevated PowerShell.
+
+From an **elevated** PowerShell, once:
+
+```powershell
+scripts\windows\isolation.ps1 -Action Install
+```
+
+It lists what it will do and asks first: add Windows Firewall rules in the group `JARVIS worker isolation` that block all traffic for the package SID. If the isolation check failed because your Python, installed for all users outside `Program Files`, could not be granted, add `-GrantPath <python directory>`; the script refuses anything but a directory holding `python.exe` that is neither a drive root nor above `C:\Users`. Run it twice: the second run changes nothing. Check the rules in `wf.msc` (group `JARVIS worker isolation`, scoped to the package), then run `Check` again as your normal user.
+
+To undo everything: elevated, `scripts\windows\isolation.ps1 -Action Remove [-GrantPath <python directory>]` removes the firewall rules and grants; then, as your normal user, `jarvis isolation remove` removes the Core's access entries and the AppContainer profile. Expected afterwards: no rules in the group, `icacls <python dir>` no longer lists the package SID, and `%LOCALAPPDATA%\Packages\jarvis.worker` no longer exists. A later `jarvis isolation check` recreates the profile and grants.
+
+**LOCAL WINDOWS VERIFICATION REQUIRED:** with the Windows Defender Firewall service stopped (only on a test machine), `jarvis isolation check` must either still pass (the Filtering Platform still enforces AppContainer isolation) or fail and make the Core refuse to start. It must never report `ok` while the probe actually reached the network. Record which.
 
 ## Results
 
 | Item | Result | Notes |
 | --- | --- | --- |
-| Rust and Python versions | | |
-| Ready line and health | | |
-| UI restrictions in a desktop session | | |
-| Class A job time | | |
-| Approval shown, refused without `yes`, approved with `yes` | | |
-| Denied write leaves the file unchanged | | |
-| Approved class B write time | | |
-| Job limits, no console host child (Process Explorer) | | |
-| Low integrity, privileges (Process Explorer) | | |
-| Only stdio handles inherited | | |
+| Rust and Python versions, interpreter kind | | |
+| Isolation check as a normal user (first and second run time) | | |
+| No prompt, account, sign-in or desktop switch | | |
+| UI restrictions on a desktop session (terminal used) | | |
+| Health lists the AppContainer controls | | |
+| Class A job, approved write, denied write (times) | | |
+| Process Explorer: AppContainer, low integrity, privileges, no capabilities | | |
+| Process Explorer: job limits, no console host child | | |
+| Process Explorer: only stdio handles, environment | | |
 | Worker dies when the Core is ended | | |
-| Low integrity: Documents write, HKCU write, child process refused | | |
-| Ctrl+C once / twice, `shutdown`, console close | | |
-| Worker crash, restart, budget exhausted | | |
-| Restart recovery of a pending approval | | |
-| No environment leak | | |
-| Idle CPU and memory | | |
+| Probe suite on a real profile | | |
+| Manual probes: Documents, OneDrive, credentials, DNS, internet, local service, child process, Core process | | |
+| Ctrl+C once and twice, `shutdown`, console close | | |
+| Crash, restart, budget, pending approval expiry, restart recovery | | |
+| Overhead: interpreter start, idle memory, probe, RPC, idle CPU | | |
+| Provisioning install twice, check, remove | | |
+| Firewall service stopped (test machine only) | | |

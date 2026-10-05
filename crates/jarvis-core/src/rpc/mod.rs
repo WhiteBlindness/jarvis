@@ -3,7 +3,8 @@
 //! One JSON request per line, one response per line, over a local transport
 //! (see [`transport`]). Every connection is identified by the OS before any
 //! request is read: connections from the worker process (or anything in its
-//! job or process group) and connections that cannot be identified are
+//! job or process group), from a restricted token on Windows (AppContainer
+//! or below medium integrity), and connections that cannot be identified are
 //! refused and audited. Requests are size-limited, connections time out when
 //! idle, and the number of concurrent connections is capped.
 
@@ -166,6 +167,13 @@ fn refusal(state: &RpcState, peer: &Peer) -> Option<&'static str> {
     #[cfg(unix)]
     if peer.uid != Some(jarvis_sandbox::current_uid()) {
         return Some("the client runs as a different user");
+    }
+    // The pipe's DACL already keeps AppContainer processes out; this also
+    // refuses a same-user client at low integrity, and fails closed if the
+    // client cannot be inspected.
+    #[cfg(windows)]
+    if !matches!(jarvis_sandbox::is_restricted_process(pid), Ok(false)) {
+        return Some("the client runs with a restricted token, or could not be inspected");
     }
     None
 }
@@ -405,4 +413,99 @@ fn internal(error: &StoreError) -> RpcError {
         RpcErrorCode::Internal,
         "the Core could not complete the request",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::config::WorkerConfig;
+    use crate::isolation;
+
+    fn state(dir: &Path) -> RpcState {
+        RpcState {
+            store: Store::open(&dir.join("jarvis.db")).unwrap(),
+            hub: Arc::new(Hub::default()),
+            config: RpcConfig {
+                socket: dir.join("rpc.sock"),
+                pipe: "jarvis-refusal-test".to_owned(),
+                allow_shutdown: false,
+                max_connections: 1,
+                idle_timeout: Duration::from_secs(1),
+            },
+            shutdown: CancellationToken::new(),
+            started: Instant::now(),
+            core_version: "test",
+        }
+    }
+
+    fn this_process() -> Peer {
+        Peer {
+            pid: Some(std::process::id()),
+            #[cfg(unix)]
+            uid: Some(jarvis_sandbox::current_uid()),
+            #[cfg(not(unix))]
+            uid: None,
+        }
+    }
+
+    #[test]
+    fn unidentified_peers_and_other_users_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        assert_eq!(refusal(&state, &this_process()), None);
+        let unknown = Peer {
+            pid: None,
+            uid: None,
+        };
+        assert!(refusal(&state, &unknown).is_some());
+        #[cfg(unix)]
+        {
+            let other = Peer {
+                uid: Some(jarvis_sandbox::current_uid().wrapping_add(1)),
+                ..this_process()
+            };
+            assert!(refusal(&state, &other).is_some());
+        }
+    }
+
+    /// The second layer behind the OS boundary: even if the isolated worker
+    /// could connect, the peer check would refuse it. Needs Python, like the
+    /// other process tests.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_worker_is_refused_even_if_it_could_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let python = std::env::var("JARVIS_TEST_PYTHON")
+            .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.to_owned());
+        let config = WorkerConfig {
+            program: python,
+            args: ["-I", "-S", "-c", "import time; time.sleep(30)"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            cwd: None,
+            handshake_timeout: Duration::from_secs(5),
+            memory_limit_bytes: 256 * 1024 * 1024,
+        };
+        let launch = isolation::launch(&config, &[]).unwrap();
+        let spawned = jarvis_sandbox::spawn(&launch.command, &launch.confinement).unwrap();
+        let worker = Peer {
+            pid: Some(spawned.process.id()),
+            ..this_process()
+        };
+        let contained = Arc::new(spawned.contained);
+        state.hub.set_contained(Some(Arc::clone(&contained)));
+        assert_eq!(
+            refusal(&state, &worker),
+            Some("connections from the worker are not allowed")
+        );
+        // Not registered as the worker: on Windows its AppContainer token is
+        // still refused; on Linux the OS boundary is what keeps it out.
+        state.hub.set_contained(None);
+        #[cfg(windows)]
+        assert!(refusal(&state, &worker).is_some());
+        contained.kill_all().unwrap();
+    }
 }

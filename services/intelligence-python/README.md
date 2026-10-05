@@ -9,8 +9,10 @@ stub that maps a goal to typed tool calls.
 python -m jarvis_worker
 ```
 
-Run it from `src/`. The Core does that with a cleared environment and OS containment, so the
-worker needs no installation and no environment variables. It uses only the Python standard
+Run it from `src/`. The Core does that with a cleared environment and inside an OS isolation
+boundary (an AppContainer on Windows, Landlock and seccomp on Linux): the worker can read its
+interpreter and its own source, and has no network, no child processes and no other files. It
+needs no installation and no environment variables. It uses only the Python standard
 library (3.11 or newer). After the handshake it waits for jobs: for each goal it plans the calls,
 asks the Core to run them one at a time, and reports a one-line summary. A call that needs a
 person simply takes longer to answer; the worker never sees or handles approvals.

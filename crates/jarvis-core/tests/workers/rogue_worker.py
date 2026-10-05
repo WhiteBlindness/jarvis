@@ -168,6 +168,11 @@ def env() -> None:
     # Python itself may set LC_CTYPE (PEP 538), and macOS adds one variable
     # to every process. Everything else must come from the Core's allowlist.
     allowed = {"PATH", "SYSTEMROOT", "LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+    # Starting a Windows AppContainer needs the profile variables, and
+    # Windows may point TEMP and TMP into the container's own folder.
+    if os.name == "nt":
+        allowed |= {"APPDATA", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "USERPROFILE"}
+        allowed |= {"TEMP", "TMP"}
     # Windows keeps per-drive working directories in variables named "=C:".
     leaked = sorted(
         key for key in os.environ if key.upper() not in allowed and not key.startswith("=")
@@ -175,18 +180,23 @@ def env() -> None:
     if leaked:
         failures.append(f"environment leaked into the worker: {leaked}")
     # On Linux, no descriptor of the Core (database, lock file, RPC socket)
-    # may be open in the worker: only stdin, stdout and stderr.
-    if os.path.isdir("/proc/self/fd"):
-        inherited = []
-        for fd in os.listdir("/proc/self/fd"):
-            try:
-                target = os.readlink(f"/proc/self/fd/{fd}")
-            except OSError:
-                continue  # the descriptor listdir itself used, now closed
-            if int(fd) > 2 and not target.startswith("/proc/"):
-                inherited.append(target)
-        if inherited:
-            failures.append(f"descriptors leaked into the worker: {inherited}")
+    # may be open in the worker: only stdin, stdout and stderr. Under Phase 3
+    # confinement the worker cannot even read /proc, which is itself the
+    # stronger guarantee; fall back to the fd scan only when /proc is open.
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError:
+        names = []
+    inherited = []
+    for fd in names:
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue  # the descriptor listdir itself used, now closed
+        if int(fd) > 2 and not target.startswith("/proc/"):
+            inherited.append(target)
+    if inherited:
+        failures.append(f"descriptors leaked into the worker: {inherited}")
     wait_for_end_of_input()
 
 

@@ -1,35 +1,29 @@
-//! Starting, containing, watching and stopping the worker process.
+//! Starting, watching and stopping the worker process.
 //!
 //! The worker is started directly (no shell) with a cleared environment, so
 //! secrets in the Core's environment are not inherited, and there is no way
-//! to add variables back from the config. OS containment
-//! ([`jarvis_sandbox`]) is applied before the worker runs any code; if it
-//! cannot be applied, the worker is killed and the start fails. Its stdin and
-//! stdout carry the protocol; its stderr is forwarded to the Core's log, one
-//! escaped and length-limited line at a time.
+//! to add variables back from the config. It starts inside its OS isolation
+//! ([`jarvis_sandbox::spawn`], configured by [`crate::isolation`]); if any
+//! part of that cannot be applied, no worker runs and the start fails. Its
+//! stdin and stdout carry the protocol; its stderr is forwarded to the
+//! Core's log, one escaped and length-limited line at a time.
 
 use std::io;
-use std::process::{ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
-use jarvis_sandbox::{Contained, Limits};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use jarvis_sandbox::{Contained, Process, Spawned, WorkerStderr, WorkerStdin, WorkerStdout};
 use tokio::task::JoinHandle;
 
-use crate::config::WorkerConfig;
 use crate::framing::{Frame, FrameReader};
-
-/// Variables the worker keeps from the Core's environment: enough to find
-/// and start an interpreter, nothing else. `SYSTEMROOT` is required by
-/// Windows system libraries.
-pub const PASSTHROUGH_ENV: &[&str] = &["PATH", "SYSTEMROOT"];
+use crate::isolation::WorkerLaunch;
 
 const MAX_LOG_LINE: usize = 4096;
 
 #[derive(Debug)]
 pub struct Worker {
-    child: Child,
+    process: Process,
     contained: Arc<Contained>,
     stderr: Option<JoinHandle<()>>,
 }
@@ -42,49 +36,23 @@ pub struct WorkerExit {
     pub killed: bool,
 }
 
-/// Start and contain the worker; return it with its protocol pipes.
-pub fn spawn(config: &WorkerConfig) -> io::Result<(Worker, ChildStdin, ChildStdout)> {
-    let limits = Limits {
-        memory_bytes: config.memory_limit_bytes,
-    };
-    let mut command = Command::new(&config.program);
-    command
-        .args(&config.args)
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    for key in PASSTHROUGH_ENV {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
-    if let Some(cwd) = &config.cwd {
-        command.current_dir(cwd);
-    }
-    jarvis_sandbox::prepare(&mut command, &limits);
-
-    let mut child = command.spawn()?;
-    let contained = match jarvis_sandbox::contain(&child, &limits) {
-        Ok(contained) => Arc::new(contained),
-        Err(error) => {
-            // Still suspended on Windows: it has run no code.
-            let _ = child.start_kill();
-            return Err(io::Error::new(
-                error.kind(),
-                format!("cannot contain the worker: {error}"),
-            ));
-        }
-    };
-    let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-    let (Some(stdin), Some(stdout), Some(stderr)) = pipes else {
-        let _ = contained.kill_all();
-        return Err(io::Error::other("worker pipes were not created"));
-    };
-    let worker = Worker {
-        child,
+/// Start the worker in isolation; return it with its protocol pipes.
+pub fn spawn(launch: &WorkerLaunch) -> io::Result<(Worker, WorkerStdin, WorkerStdout)> {
+    let Spawned {
+        process,
         contained,
+        stdin,
+        stdout,
+        stderr,
+    } = jarvis_sandbox::spawn(&launch.command, &launch.confinement).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot start the worker in isolation: {error}"),
+        )
+    })?;
+    let worker = Worker {
+        process,
+        contained: Arc::new(contained),
         stderr: Some(tokio::spawn(forward_stderr(stderr))),
     };
     Ok((worker, stdin, stdout))
@@ -92,7 +60,7 @@ pub fn spawn(config: &WorkerConfig) -> io::Result<(Worker, ChildStdin, ChildStdo
 
 impl Worker {
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        Some(self.process.id())
     }
 
     pub fn contained(&self) -> Arc<Contained> {
@@ -100,17 +68,16 @@ impl Worker {
     }
 
     /// Wait up to `grace` for the worker to exit on its own (its stdin
-    /// should already be closed), then kill it and anything it started.
+    /// should already be closed), then kill it.
     pub async fn stop(mut self, grace: Duration) -> io::Result<WorkerExit> {
-        let exit = match tokio::time::timeout(grace, self.child.wait()).await {
+        let exit = match tokio::time::timeout(grace, self.process.wait()).await {
             Ok(status) => WorkerExit {
                 status: status?,
                 killed: false,
             },
             Err(_) => self.kill_now().await?,
         };
-        // Nothing the worker started may outlive it.
-        let _ = self.contained.kill_all();
+        self.after_exit();
         self.drain_stderr().await;
         Ok(exit)
     }
@@ -124,25 +91,34 @@ impl Worker {
 
     async fn kill_now(&mut self) -> io::Result<WorkerExit> {
         // The process may exit between the timeout and the kill.
-        if let Some(status) = self.child.try_wait()? {
-            let _ = self.contained.kill_all();
+        if let Some(status) = self.process.try_wait()? {
+            self.after_exit();
             return Ok(WorkerExit {
                 status,
                 killed: false,
             });
         }
         self.contained.kill_all()?;
-        let status = match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
+        let status = match tokio::time::timeout(Duration::from_secs(5), self.process.wait()).await {
             Ok(status) => status?,
             Err(_) => {
-                self.child.kill().await?;
-                self.child.wait().await?
+                self.process.start_kill()?;
+                self.process.wait().await?
             }
         };
         Ok(WorkerExit {
             status,
             killed: true,
         })
+    }
+
+    /// Clean up after the worker has been reaped. On Windows the job handle
+    /// still names exactly its processes, so anything left in it is killed.
+    /// On Unix nothing is signalled: the worker could start no process, and
+    /// its process group ID may already belong to an unrelated process.
+    fn after_exit(&self) {
+        #[cfg(windows)]
+        let _ = self.contained.kill_all();
     }
 
     async fn drain_stderr(&mut self) {
@@ -159,7 +135,7 @@ impl Worker {
     }
 }
 
-async fn forward_stderr(stderr: ChildStderr) {
+async fn forward_stderr(stderr: WorkerStderr) {
     let mut reader = FrameReader::new(stderr, MAX_LOG_LINE);
     loop {
         match reader.next_frame().await {

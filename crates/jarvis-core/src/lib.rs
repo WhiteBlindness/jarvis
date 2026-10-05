@@ -13,6 +13,7 @@ pub mod daemon;
 pub mod framing;
 pub mod gateway;
 pub mod hub;
+pub mod isolation;
 pub mod policy;
 pub mod rpc;
 pub mod session;
