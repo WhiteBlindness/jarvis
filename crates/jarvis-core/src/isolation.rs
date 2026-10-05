@@ -372,10 +372,12 @@ pub async fn verify(launch: &WorkerLaunch, scratch: &Path) -> Result<Verificatio
     checks.push(Check {
         name: "no loopback UDP",
         passed: !received,
-        detail: if received {
-            "the Core's socket received a datagram".to_owned()
-        } else {
-            probe_said("loopback_udp")
+        // Windows accepts the send and drops the datagram, so the probe's
+        // own report may say "allowed"; what counts is that none arrived.
+        detail: match (received, probe_said("loopback_udp")) {
+            (true, _) => "the Core's socket received a datagram".to_owned(),
+            (false, said) if said == "allowed" => "sent, nothing arrived".to_owned(),
+            (false, said) => said,
         },
     });
 

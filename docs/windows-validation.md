@@ -35,7 +35,7 @@ Expected:
 - `mechanism AppContainer (no capabilities) + job object + child-process policy + mitigations (...)`, the AppContainer name `JARVIS.Worker` and its package SID (`S-1-15-2-...`).
 - `ui restrictions yes` on a normal desktop session. Record which terminal you used (Windows Terminal, conhost, VS Code); some start programs inside a job, which turns UI restrictions off.
 - Two grants: read+execute on your Python directory, read on `services\intelligence-python\src`.
-- Four `ok` lines: no loopback TCP, no loopback UDP, no access to the Core's files, no child processes. Exit code 0.
+- Five `ok` lines: no loopback TCP, no loopback UDP (on Windows the send itself may succeed: `sent, nothing arrived`), no access to the Core's files, no access to the user's home, no child processes. Exit code 0.
 
 Record the time for a first run (it grants your Python directory to the worker's identity, which takes seconds for a large installation) and for a second run.
 
@@ -49,7 +49,7 @@ No administrator prompt, password prompt, new account, sign-in or desktop switch
 target\debug\jarvis-core.exe serve --config $cfg
 ```
 
-Expected: the log line `worker isolation verified` with the four checks, then `ready \\.\pipe\jarvis` on stdout. In a second PowerShell:
+Expected: the log line `worker isolation verified` with the five checks, then `ready \\.\pipe\jarvis` on stdout. In a second PowerShell:
 
 ```powershell
 jarvis health
