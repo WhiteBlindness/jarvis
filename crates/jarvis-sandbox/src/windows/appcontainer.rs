@@ -19,7 +19,7 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
     NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
     TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
@@ -29,13 +29,11 @@ use windows_sys::Win32::Security::Isolation::{
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    EqualSid, FreeSid, GetAce, INHERIT_ONLY_ACE, INHERITED_ACE, NO_INHERITANCE, OBJECT_INHERIT_ACE,
+    EqualSid, FreeSid, GetAce, INHERIT_ONLY_ACE, NO_INHERITANCE, OBJECT_INHERIT_ACE,
     PSECURITY_DESCRIPTOR, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
-    WRITE_DAC, WRITE_OWNER,
+    DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
@@ -53,17 +51,6 @@ const DESCRIPTION: &str = "Runs the JARVIS worker with no network and no access 
 /// "ALL APPLICATION PACKAGES": system directories grant it, and with it
 /// every AppContainer.
 const ALL_APPLICATION_PACKAGES: &str = "S-1-15-2-1";
-
-/// Every right that changes a file or directory, without the
-/// synchronisation and read-control bits that reading also needs.
-const WRITE_RIGHTS: u32 = FILE_WRITE_DATA
-    | FILE_APPEND_DATA
-    | FILE_WRITE_EA
-    | FILE_WRITE_ATTRIBUTES
-    | FILE_DELETE_CHILD
-    | DELETE
-    | WRITE_DAC
-    | WRITE_OWNER;
 
 /// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`.
 const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7_u32 as i32;
@@ -189,47 +176,52 @@ fn container_folder(sid: &PackageSid) -> io::Result<Result<PathBuf, i32>> {
     Ok(Ok(folder))
 }
 
-/// Deny the package SID every write in its own AppContainer folder, which
-/// Windows otherwise gives it in full (it is where `TEMP` points). With
-/// this, the worker can write nowhere: it cannot fill the disk or keep
-/// state across restarts.
+/// The folders Windows creates inside an AppContainer's own folder. They
+/// are kept, and emptied; anything else found there is removed.
+const STANDARD_FOLDERS: [&str; 4] = ["Temp", "INetCache", "INetCookies", "INetHistory"];
+
+/// Empty the AppContainer's own folder before a worker starts.
 ///
-/// Windows gives the subfolders their own explicit allow entries, and an
-/// explicit allow is weighed before an inherited deny, so the deny is set
-/// explicitly on the folder and on every directory below it. Done once;
-/// later starts find the entries.
-pub(crate) fn deny_container_writes(sid: &PackageSid) -> io::Result<()> {
-    const MAX_DIRECTORIES: usize = 256;
-    let folder =
-        container_folder(sid)?.map_err(|code| hresult_error("GetAppContainerFolderPath", code))?;
-    let mut pending = vec![folder];
-    let mut visited = 0;
-    while let Some(dir) = pending.pop() {
-        visited += 1;
-        if visited > MAX_DIRECTORIES {
-            return Err(io::Error::other(
-                "the AppContainer folder holds more directories than expected",
-            ));
-        }
-        let dacl = Dacl::read(&dir)?;
-        if !dacl.denies_explicitly(sid, WRITE_RIGHTS) {
-            dacl.apply(
-                &dir,
-                sid,
-                DENY_ACCESS,
-                WRITE_RIGHTS,
-                SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-            )?;
-        }
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            // Directories only; links and junctions are not followed.
-            if entry.file_type()?.is_dir() {
-                pending.push(entry.path());
+/// Windows gives an AppContainer full control of its own folder (where
+/// `TEMP` points) through a critical access entry, which no deny entry can
+/// override, so the worker can write there. Emptying the folder before every
+/// start means nothing one worker writes reaches the next one. Best effort:
+/// an entry another running worker of the same user still holds open is
+/// left. Links and junctions are removed, never followed.
+pub(crate) fn clear_container_folder(sid: &PackageSid) -> io::Result<()> {
+    let Ok(folder) = container_folder(sid)? else {
+        return Ok(()); // No folder yet: nothing to clear.
+    };
+    for entry in std::fs::read_dir(&folder)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let standard = kind.is_dir()
+            && STANDARD_FOLDERS
+                .iter()
+                .any(|name| entry.file_name().eq_ignore_ascii_case(name));
+        if standard {
+            for inner in std::fs::read_dir(entry.path())? {
+                let inner = inner?;
+                remove_entry(&inner.path(), inner.file_type()?);
             }
+        } else {
+            remove_entry(&entry.path(), kind);
         }
     }
     Ok(())
+}
+
+/// Remove one directory entry without following links: a link (to a file or
+/// a directory, including a junction) is removed itself, and
+/// `remove_dir_all` does not traverse links below a directory.
+fn remove_entry(path: &Path, kind: std::fs::FileType) {
+    let _ = if kind.is_symlink() {
+        std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path))
+    } else if kind.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
 }
 
 /// The rights a grant gives the package SID. Every grant includes
@@ -392,20 +384,6 @@ impl Dacl {
                     && flags & INHERIT_ONLY_ACE as u8 == 0
                     && mask & wanted == wanted
                     && (!directory || flags & inherit == inherit)
-            })
-    }
-
-    /// Whether an explicit (not inherited) deny entry for `sid` covers all
-    /// of `rights`.
-    fn denies_explicitly(&self, sid: &PackageSid, rights: u32) -> bool {
-        self.entries()
-            .into_iter()
-            .any(|(kind, entry, mask, flags)| {
-                kind == ACCESS_DENIED_ACE_TYPE
-                && flags & INHERITED_ACE as u8 == 0
-                // SAFETY: valid SIDs.
-                && unsafe { EqualSid(entry, sid.as_psid()) } != 0
-                && mask & rights == rights
             })
     }
 

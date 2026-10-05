@@ -756,34 +756,23 @@ async fn the_worker_runs_in_an_app_container_at_low_integrity() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn writing_to_its_own_container_folder_is_denied() {
-    // Windows points TEMP (and LOCALAPPDATA) into the AppContainer's own
-    // folder and gives the package full control there; the Core denies it.
-    for variable in ["TEMP", "LOCALAPPDATA"] {
-        let outcome = run(&denial_probe(&format!(
-            "import os, sys\nprint(os.environ['{variable}'])\nsys.stdout.flush()\nopen(os.path.join(os.environ['{variable}'], 'jarvis-probe.txt'), 'w').write('x')"
-        )))
-        .await;
-        let refused =
-            outcome.code == Some(DENIED) && outcome.stderr.contains("refused: PermissionError");
-        if !refused {
-            // Show how Windows sees the folder, from outside the container.
-            let folder = outcome.stdout.trim().to_owned();
-            let acl = std::process::Command::new("icacls").arg(&folder).output();
-            let links = std::process::Command::new("cmd")
-                .args(["/c", "dir", "/a", &format!("{folder}\\..")])
-                .output();
-            let show = |o: std::io::Result<std::process::Output>| {
-                o.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                    .unwrap_or_else(|e| e.to_string())
-            };
-            panic!(
-                "writing into %{variable}% was not refused\n{outcome:?}\nicacls:\n{}\ndir:\n{}",
-                show(acl),
-                show(links)
-            );
-        }
-    }
+async fn what_it_writes_in_its_container_folder_does_not_outlive_it() {
+    // Windows lets an AppContainer write in its own folder (where TEMP
+    // points); the Core empties that folder before every start. Checked
+    // from this process, which can see the folder whatever the worker can.
+    let write = run(
+        "import os\npath = os.path.join(os.environ['TEMP'], 'jarvis-probe', 'kept.txt')\nos.makedirs(os.path.dirname(path), exist_ok=True)\nopen(path, 'w').write('x')\nprint(path)",
+    )
+    .await;
+    assert_eq!(write.code, Some(0), "{write:?}");
+    let path = std::path::PathBuf::from(write.stdout.trim());
+    let next = run("pass").await;
+    assert_eq!(next.code, Some(0), "{next:?}");
+    assert!(
+        !path.exists() && !path.parent().unwrap().exists(),
+        "{} survived into the next start",
+        path.display()
+    );
 }
 
 #[cfg(windows)]

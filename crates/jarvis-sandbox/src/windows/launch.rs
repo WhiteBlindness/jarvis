@@ -97,7 +97,7 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
     let _launching = LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
 
     let sid = PackageSid::ensure()?;
-    appcontainer::deny_container_writes(&sid)?;
+    appcontainer::clear_container_folder(&sid)?;
     appcontainer::grant_paths(&sid, &confinement.filesystem)?;
 
     // A job with UI restrictions cannot be nested under another job; the

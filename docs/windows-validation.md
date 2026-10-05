@@ -77,7 +77,7 @@ Expected: the class A job completes. The write waits; the approval shows path, s
 - Job tab: one job with active process limit 1, process memory limit 512 MiB, kill on job close, and (if `health` says so) UI restrictions.
 - Handles view: the three stdio pipe handles (`\Device\NamedPipe\jarvis-worker-...`) and no handle to `jarvis.db`, `jarvis.db.lock`, the WAL file, the `\Device\NamedPipe\jarvis` RPC pipe, or any file in your profile.
 - Environment tab: `PATH`, `SYSTEMROOT`, the profile variables (`APPDATA`, `HOMEDRIVE`, `HOMEPATH`, `USERPROFILE`), and `LOCALAPPDATA`, `TEMP` and `TMP`, which Windows points into `%LOCALAPPDATA%\Packages\jarvis.worker\AC` (CI observed this), and nothing else. Set `$env:JARVIS_SECRET_PROBE = "x"` before starting the Core and confirm it is absent.
-- Security of `%LOCALAPPDATA%\Packages\jarvis.worker\AC` (Properties, Security, Advanced): an entry denying the package SID write access, inherited by everything below.
+- Security of `%LOCALAPPDATA%\Packages\jarvis.worker\AC` (Properties, Security, Advanced): Windows gives the package SID full control there (`icacls` shows it as `(CR)`, a critical entry). This is the one folder the worker can write. Write a file into `AC\Temp` as yourself, restart the Core, and check the file is gone: the Core empties the folder before every start.
 
 End `jarvis-core.exe` from Task Manager (End task). Expected: the worker disappears with it.
 
