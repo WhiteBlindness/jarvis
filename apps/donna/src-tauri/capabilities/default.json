@@ -13,6 +13,8 @@
     "allow-load-model",
     "allow-unload-model",
     "allow-set-context-size",
+    "allow-set-retention",
+    "allow-export-conversation",
     "allow-chat-send",
     "allow-chat-regenerate",
     "allow-chat-cancel",

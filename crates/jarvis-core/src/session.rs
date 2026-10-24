@@ -27,18 +27,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jarvis_protocol::{
-    AgentReceipt, ApprovalId, ApprovalStatus, AuditEventKind, CallError, CoreMessage, DecodeError,
-    ErrorCode, ErrorMessage, Fingerprint, JobId, JobStatus, PolicyDecision, RequestId, SessionId,
-    SessionLimits, Summary, TaskId, TaskStatus, ToolCall, ToolName, ToolOutcome, ToolRequest,
-    ToolResponse, ToolResult, Welcome, WireError, WorkerMessage, WorkerState,
-    decode_worker_message, encode_core_message,
+    AgentReceipt, ApprovalId, ApprovalStatus, AuditEventKind, CallError, ClipboardText,
+    CoreMessage, DecodeError, ErrorCode, ErrorMessage, Fingerprint, JobId, JobStatus,
+    PolicyDecision, RequestId, SessionId, SessionLimits, Summary, TaskId, TaskStatus, ToolCall,
+    ToolName, ToolOutcome, ToolRequest, ToolResponse, ToolResult, Welcome, WireError,
+    WorkerMessage, WorkerState, decode_worker_message, encode_core_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::approval;
+use crate::approval::{self, Resolution};
 use crate::config::Limits;
 use crate::framing::{Frame, FrameReader};
 use crate::gateway::{Execution, Gateway};
@@ -665,6 +665,35 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         let mut events = vec![AuditEventKind::ExecutionStarted {
             tool: call.tool_name().to_owned(),
         }];
+        // A clipboard write names its text by payload (ADR 0022). The text is
+        // resolved and checked against the SHA-256 the person approved
+        // before anything is consumed: a payload that is gone or was changed
+        // is refused here and nothing is written.
+        let text = match call {
+            ToolCall::WriteClipboardText(args) => {
+                let args = args.clone();
+                let job_id = self.job.as_ref().map(|job| job.id);
+                let resolved = self
+                    .ctx
+                    .store
+                    .call(move |s| Ok(approval::resolve_payload(s, &args, job_id)))
+                    .await?;
+                match resolved {
+                    Resolution::Text(text) => Some(text),
+                    Resolution::Missing | Resolution::Changed => {
+                        let refusal = Refusal::PayloadUnavailable;
+                        tracing::warn!(session = %self.id, task = %task_id, approval = %approval_id, "clipboard text refused before consumption: {resolved:?}");
+                        self.expire_with(
+                            approval_id,
+                            format!("the Session Agent cannot take this operation: {refusal}"),
+                        )
+                        .await?;
+                        return Ok(Handled::Reply(ToolOutcome::Expired { approval_id }));
+                    }
+                }
+            }
+            _ => None,
+        };
         if call.is_agent_operation() {
             // The grant checks run, and a live agent is started, before the
             // approval is used, so these refusals leave nothing consumed. A
@@ -672,7 +701,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             let ready = match &self.ctx.session_agent {
                 None => Err(Refusal::Unavailable),
                 Some(agent) => {
-                    let (ready, lifecycle) = agent.prepare(call).await;
+                    let (ready, lifecycle) = agent.prepare(call, text.as_ref()).await;
                     for event in lifecycle {
                         self.audit(Some(task_id), event).await?;
                     }
@@ -706,7 +735,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         match consumed {
             Ok(consumed) if call.is_agent_operation() => {
                 tracing::info!(session = %self.id, task = %task_id, approval = %approval_id, "approval consumed for the Session Agent");
-                self.perform_agent(task_id, consumed, call, shutdown)
+                self.perform_agent(task_id, consumed, call, text.as_ref(), shutdown)
                     .await
                     .map(Handled::Reply)
             }
@@ -765,6 +794,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         task_id: TaskId,
         consumed: ConsumedApproval,
         call: &ToolCall,
+        text: Option<&ClipboardText>,
         shutdown: &CancellationToken,
     ) -> Result<ToolOutcome, SessionError> {
         let started = std::time::Instant::now();
@@ -774,7 +804,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                 Performed::Refused(Refusal::Unavailable.to_string()),
                 Vec::new(),
             ),
-            Some(agent) => match agent.issue(consumed, call).await {
+            Some(agent) => match agent.issue(consumed, call, text).await {
                 Err(refusal) => (Performed::Refused(refusal.to_string()), Vec::new()),
                 Ok(grant) => {
                     let report = agent.perform(grant, call, shutdown).await;

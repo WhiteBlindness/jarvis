@@ -40,6 +40,9 @@ pub fn spawn(exe: &Path, config: &Path) -> Result<(Child, ChildStdout), DonnaErr
         .arg("serve")
         .arg("--config")
         .arg(config)
+        // The Core stops by itself if this app is killed.
+        .arg("--exit-with")
+        .arg(std::process::id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(stderr)

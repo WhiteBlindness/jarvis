@@ -5,6 +5,7 @@
 mod commands;
 mod core_proc;
 mod error;
+mod export;
 mod log;
 mod loops;
 mod paths;
@@ -44,6 +45,8 @@ pub fn run() {
             commands::load_model,
             commands::unload_model,
             commands::set_context_size,
+            commands::set_retention,
+            commands::export_conversation,
             commands::chat_send,
             commands::chat_regenerate,
             commands::chat_cancel,

@@ -42,13 +42,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "durable_jobs",
         sql: include_str!("migrations/0003_durable_jobs.sql"),
     },
+    Migration {
+        version: 4,
+        name: "payloads",
+        sql: include_str!("migrations/0004_payloads.sql"),
+    },
 ];
 
 mod approvals;
 mod jobs;
+mod payloads;
 
 pub use approvals::{ApprovalError, ApprovalRecord, ConsumedApproval, NewApproval};
 pub use jobs::JobRecord;
+pub use payloads::{MAX_PENDING_PAYLOADS, Payload, salted_sha256, text_sha256};
 
 const OPEN_STATES: [TaskStatus; 3] = [
     TaskStatus::Received,
@@ -81,6 +88,8 @@ pub enum StoreError {
     },
     #[error("task {0} does not exist")]
     UnknownTask(TaskId),
+    #[error("{0} clipboard texts are already waiting")]
+    TooManyPayloads(u32),
     #[error("stored data is corrupt: {0}")]
     Corrupt(String),
     #[error("database task did not complete")]
@@ -206,6 +215,9 @@ impl Store {
         // Without this, `INSERT OR REPLACE` deletes the old row without firing
         // the DELETE triggers that keep the audit log append-only.
         conn.pragma_update(None, "recursive_triggers", "ON")?;
+        // A deleted clipboard payload (ADR 0022) is overwritten with zeros
+        // instead of left in a free page.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         migrate(&mut conn, path)?;
         Ok(Self::wrap(conn, Some(lock)))
     }
@@ -390,7 +402,7 @@ impl Store {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let approvals = approvals::expire_all_open(&tx, "the Core restarted")?;
-        let jobs = jobs::settle_running(&tx, max_job_attempts)?;
+        let (jobs, mut had_payload) = jobs::settle_running(&tx, max_job_attempts)?;
         let open: Vec<(TaskId, SessionId, TaskStatus)> = {
             let mut statement = tx.prepare(
                 "SELECT task_id, session_id, status FROM tasks
@@ -450,7 +462,12 @@ impl Store {
                 )?;
             }
         }
+        // A payload only lives as long as an open job.
+        had_payload |= payloads::delete_orphans(&tx)?;
         tx.commit()?;
+        if had_payload {
+            payloads::scrub(&conn);
+        }
         Ok(Recovery {
             tasks: count(open.len()),
             approvals,

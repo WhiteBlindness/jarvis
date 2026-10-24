@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use jarvis_protocol::{
     AgentOperation, AgentOutcome, AgentReport, AgentToCore, AgentVersion, AuditEventKind,
-    CoreToAgent, Fingerprint, MAX_AGENT_FRAME_BYTES, ToolCall, decode_agent_to_core,
+    ClipboardText, CoreToAgent, Fingerprint, MAX_AGENT_FRAME_BYTES, ToolCall, decode_agent_to_core,
     encode_agent_frame,
 };
 use sha2::{Digest, Sha256};
@@ -245,11 +245,17 @@ impl SessionAgent {
     /// agent is ready to take it, starting one if needed. Called before the
     /// approval is consumed, so a refusal leaves it unused. A race with
     /// another operation can still refuse later; that is recorded as not
-    /// performed. Returns the agent lifecycle events it caused.
-    pub async fn prepare(&self, call: &ToolCall) -> (Result<(), Refusal>, Vec<AuditEventKind>) {
+    /// performed. `text` is the clipboard text the Core resolved for a
+    /// clipboard write (ADR 0022). Returns the agent lifecycle events it
+    /// caused.
+    pub async fn prepare(
+        &self,
+        call: &ToolCall,
+        text: Option<&ClipboardText>,
+    ) -> (Result<(), Refusal>, Vec<AuditEventKind>) {
         let mut state = self.state.lock().await;
         let mut events = Vec::new();
-        if let Err(refusal) = state.grants.check(call, self.now_ms()) {
+        if let Err(refusal) = state.grants.check(call, text, self.now_ms()) {
             return (Err(refusal), events);
         }
         let ready = self
@@ -299,17 +305,19 @@ impl SessionAgent {
         }
     }
 
-    /// Issue a grant for `call` from its consumed approval.
+    /// Issue a grant for `call` from its consumed approval. `text` is the
+    /// resolved clipboard text of a clipboard write.
     pub async fn issue(
         &self,
         consumed: ConsumedApproval,
         call: &ToolCall,
+        text: Option<&ClipboardText>,
     ) -> Result<GrantId, Refusal> {
         let mut state = self.state.lock().await;
         let now_ms = self.now_ms();
         state
             .grants
-            .issue(consumed, call, now_ms, self.grant_ttl_ms)
+            .issue(consumed, call, text, now_ms, self.grant_ttl_ms)
     }
 
     /// Use grant `grant` for `call` and have the agent perform it once.

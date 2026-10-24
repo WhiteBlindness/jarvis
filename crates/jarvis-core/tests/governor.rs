@@ -1000,7 +1000,7 @@ impl Env {
             session,
         };
         harness
-            .send(json!({"protocol": 2, "type": "hello", "worker": "test", "worker_version": "1"}))
+            .send(json!({"protocol": 3, "type": "hello", "worker": "test", "worker_version": "1"}))
             .await;
         assert!(matches!(harness.recv().await, CoreMessage::Welcome(_)));
         harness
@@ -1049,7 +1049,7 @@ impl Harness {
     }
 
     async fn completes(&mut self, job: JobId) {
-        self.send(json!({"protocol": 2, "type": "job_result", "job_id": job,
+        self.send(json!({"protocol": 3, "type": "job_result", "job_id": job,
                          "outcome": "completed", "summary": "done"}))
             .await;
     }
@@ -1174,7 +1174,7 @@ async fn a_hold_that_starts_while_a_job_runs_leaves_it_running() {
 
     env.hold();
     h.send(
-        json!({"protocol": 2, "type": "tool_request", "request_id": "r1",
+        json!({"protocol": 3, "type": "tool_request", "request_id": "r1",
                   "job_id": job, "tool": "system.info", "args": {}}),
     )
     .await;

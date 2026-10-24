@@ -58,6 +58,10 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE (conversation_id, seq)
 );
 CREATE INDEX IF NOT EXISTS messages_by_conversation ON messages (conversation_id, seq);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS verified_models (
     path        TEXT PRIMARY KEY,
     size        INTEGER NOT NULL,
@@ -88,7 +92,9 @@ impl ChatStore {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        Self::init(conn)
+        let store = Self::init(conn)?;
+        restrict_to_owner(path)?;
+        Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self, ChatStoreError> {
@@ -130,6 +136,28 @@ impl ChatStore {
     ) -> Result<T, ChatStoreError> {
         f(&mut lock(&self.conn))
     }
+}
+
+/// Conversations are personal text: on Unix the database and its sidecar
+/// files are readable by their owner only, whatever the umask. On Windows
+/// the files inherit the per-user profile folder's access list.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> Result<(), ChatStoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let file = Path::new(&file);
+        if file.exists() {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> Result<(), ChatStoreError> {
+    Ok(())
 }
 
 fn lock(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
@@ -441,6 +469,24 @@ pub fn verified_sha256(
             |row| row.get(0),
         )
         .optional()?)
+}
+
+/// A setting a person chose, if any.
+pub fn setting(conn: &Connection, key: &str) -> Result<Option<String>, ChatStoreError> {
+    Ok(conn
+        .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), ChatStoreError> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 pub fn record_verified(
@@ -801,6 +847,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(view.status, MessageStatus::Interrupted);
+    }
+
+    #[test]
+    fn settings_are_remembered_and_replaced() {
+        store()
+            .with(|conn| {
+                assert_eq!(setting(conn, "retention_days")?, None);
+                set_setting(conn, "retention_days", "30")?;
+                set_setting(conn, "retention_days", "7")?;
+                assert_eq!(setting(conn, "retention_days")?.as_deref(), Some("7"));
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

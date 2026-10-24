@@ -5,7 +5,7 @@ JARVIS has two wire protocols with separate version keys:
 | Protocol | Between | Version key | Version |
 | --- | --- | --- | --- |
 | Worker protocol | The Core and its worker process, over the worker's stdio | `protocol` | 2 |
-| Local RPC | Local clients (the CLI, the desktop app) and the long-lived Core | `rpc` | 3 |
+| Local RPC | Local clients (the CLI, the desktop app) and the long-lived Core | `rpc` | 4 |
 
 The Rust types in `crates/jarvis-protocol` are the reference implementation. The fixtures in `tests/protocol/` are checked by the Rust suite (both protocols) and the Python suite (worker protocol).
 
@@ -17,7 +17,7 @@ The Rust types in `crates/jarvis-protocol` are the reference implementation. The
 - Duplicate keys inside one object are not rejected; as in most JSON parsers, the last value wins.
 - Identifiers that are UUIDs use the hyphenated form only. Text that a person or worker supplies and that may be shown in a terminal (goals, summaries, reasons) must not contain control characters.
 
-## Worker protocol, version 2
+## Worker protocol, version 3
 
 ### Transport and framing
 
@@ -57,7 +57,7 @@ When policy returns `require_confirmation`, the Core records an approval request
 `hello`:
 
 ```json
-{"protocol": 2, "type": "hello", "worker": "jarvis-worker", "worker_version": "0.2.0"}
+{"protocol": 3, "type": "hello", "worker": "jarvis-worker", "worker_version": "0.2.0"}
 ```
 
 `worker` and `worker_version` are 1 to 64 characters from `[A-Za-z0-9._+-]`.
@@ -65,7 +65,7 @@ When policy returns `require_confirmation`, the Core records an approval request
 `tool_request`:
 
 ```json
-{"protocol": 2, "type": "tool_request", "request_id": "req-0001",
+{"protocol": 3, "type": "tool_request", "request_id": "req-0001",
  "job_id": "01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b", "tool": "system.info", "args": {}}
 ```
 
@@ -81,7 +81,7 @@ There is no field for capabilities, approvals, task IDs or policy. Adding one ma
 `job_result`:
 
 ```json
-{"protocol": 2, "type": "job_result", "job_id": "…", "outcome": "completed", "summary": "2 call(s): completed=2"}
+{"protocol": 3, "type": "job_result", "job_id": "…", "outcome": "completed", "summary": "2 call(s): completed=2"}
 ```
 
 `outcome` is `completed` or `failed`. `summary` is 0 to 1000 characters without control characters.
@@ -91,7 +91,7 @@ There is no field for capabilities, approvals, task IDs or policy. Adding one ma
 `welcome`:
 
 ```json
-{"protocol": 2, "type": "welcome", "session_id": "…", "core_version": "0.2.0",
+{"protocol": 3, "type": "welcome", "session_id": "…", "core_version": "0.2.0",
  "tools": ["filesystem.read_fixture", "system.info", "workspace.write_file"],
  "limits": {"max_frame_bytes": 65536, "tool_timeout_ms": 5000, "max_requests": 1000}}
 ```
@@ -99,7 +99,7 @@ There is no field for capabilities, approvals, task IDs or policy. Adding one ma
 `job`:
 
 ```json
-{"protocol": 2, "type": "job", "job_id": "…", "goal": "describe the runtime, then read welcome.txt"}
+{"protocol": 3, "type": "job", "job_id": "…", "goal": "describe the runtime, then read welcome.txt"}
 ```
 
 `goal` is 1 to 2000 characters without control characters.
@@ -107,7 +107,7 @@ There is no field for capabilities, approvals, task IDs or policy. Adding one ma
 `tool_response`, sent for every `tool_request` that becomes a task (it decodes, belongs to the current job, is within the request cap and does not reuse a `request_id`), and for a request answered from the job's earlier work (below):
 
 ```json
-{"protocol": 2, "type": "tool_response", "request_id": "req-0001", "task_id": "…",
+{"protocol": 3, "type": "tool_response", "request_id": "req-0001", "task_id": "…",
  "outcome": {"status": "completed", "result": {"os": "linux", "...": "..."}}}
 ```
 
@@ -125,7 +125,7 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 `error`, sent for frames that did not create a task. `request_id` is always present, `null` when it could not be recovered. `fatal: true` means the Core is closing the session:
 
 ```json
-{"protocol": 2, "type": "error", "request_id": null,
+{"protocol": 3, "type": "error", "request_id": null,
  "error": {"code": "unsupported_protocol_version", "message": "…"}, "fatal": true}
 ```
 
@@ -158,7 +158,7 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 | `session_agent.healthcheck` | `session_agent.healthcheck` | B | `{"label"}` | `agent_operation` (a receipt) |
 | `desktop.capture_window` | `desktop.screen.observe` | B, `deny` only | `{"target"}` | none: not performable |
 | `desktop.read_clipboard_text` | `desktop.clipboard.read` | B, `deny` only | `{}` | none: not performable |
-| `desktop.write_clipboard_text` | `desktop.clipboard.write` | B, `deny` by default; may be `require_confirmation` | `{"text"}` | `{"agent_operation"}` receipt |
+| `desktop.write_clipboard_text` | `desktop.clipboard.write` | B, `deny` by default; may be `require_confirmation` | `{"payload_id", "sha256"}` | `{"agent_operation"}` receipt |
 | `desktop.type_text` | `desktop.input.send` | B, `deny` only | `{"target", "text"}` | none: not performable |
 
 `system.info` never returns hostname, username, environment variables or paths.
@@ -169,7 +169,7 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 
 `session_agent.healthcheck` is performed by the Session Agent, a separate process the Core starts (ADR 0019). `label` is 1 to 64 visible characters. The Core keeps the agent's report and answers the worker with a receipt, `{"agent_operation": "session_agent.healthcheck"}`, whatever an agent operation returns.
 
-`desktop.write_clipboard_text` is performed by the Session Agent when the owner has set `desktop.clipboard.write` to `require_confirmation` (ADR 0020). `text` is 1 to 1024 characters, each a newline, tab, space, printable ASCII, a letter or digit of any script, or common typographic punctuation (ADR 0020 lists what is refused). The text is written exactly as given, and the worker gets the same receipt as for the health check. The other `desktop.*` tools are typed so that a person can be shown exactly what one would do, but none can run: the configuration may only `deny` their capabilities. `target` is a window number; for `desktop.type_text`, `text` is at most 4096 visible characters with no control characters at all.
+`desktop.write_clipboard_text` is performed by the Session Agent when the owner has set `desktop.clipboard.write` to `require_confirmation` (ADR 0020). The request names the text, it does not carry it (ADR 0022; this is what changed in worker protocol version 3). `payload_id` is the identifier of a clipboard payload, a hyphenated UUID, and `sha256` is the SHA-256 of the payload's random 16-byte salt followed by its text, as 64 lowercase hexadecimal characters. The salt is deleted with the payload, so the value cannot be tested against guesses of the text afterwards. A client creates the payload with `submit_clipboard_job`; the Core gives the worker the goal `copy payload:<payload_id>:<sha256>`, and the planner turns exactly that form into the call. The worker never sees the text. Before showing the request and again before running it, the Core resolves the payload, checks that it belongs to the job and that its salted SHA-256 is `sha256`, and refuses the request otherwise. The text is 1 to 1024 characters, each a newline, tab, space, printable ASCII, a letter or digit of any script, or common typographic punctuation (ADR 0020 lists what is refused; the Core checks it when the payload is created). It is written exactly as stored, and the worker gets the same receipt as for the health check. The other `desktop.*` tools are typed so that a person can be shown exactly what one would do, but none can run: the configuration may only `deny` their capabilities. `target` is a window number; for `desktop.type_text`, `text` is at most 4096 visible characters with no control characters at all.
 
 ## Session Agent channel, version 1
 
@@ -181,7 +181,7 @@ Between the Core and the Session Agent only, over the agent's standard input and
 
 Anything else from the agent, or no answer within the configured time, ends the agent; see ADR 0019 for how each outcome is recorded.
 
-## Local RPC, version 3
+## Local RPC, version 4
 
 ### Transport
 
@@ -194,13 +194,14 @@ Anything else from the agent, or no answer within the configured time, ends the 
 ### Requests
 
 ```json
-{"rpc": 3, "type": "approve", "approval_id": "…", "fingerprint": "3f3f…"}
+{"rpc": 4, "type": "approve", "approval_id": "…", "fingerprint": "3f3f…"}
 ```
 
 | `type` | Fields | Reply |
 | --- | --- | --- |
 | `health` | | `health` |
 | `submit_job` | `goal` | `job` |
+| `submit_clipboard_job` | `text` | `job` (see Clipboard jobs below) |
 | `get_job` | `job_id`, `wait_ms` | `job` (waits up to `wait_ms` for the job to finish) |
 | `list_jobs` | `limit` | `jobs` |
 | `list_approvals` | `wait_ms` | `approvals` (pending only; waits up to `wait_ms` for one to appear) |
@@ -220,6 +221,7 @@ Anything else from the agent, or no answer within the configured time, ends the 
 | `load_model` | | `inference` |
 | `unload_model` | | `inference` |
 | `set_context_size` | `context_size` | `inference` |
+| `set_retention` | `days` (one of 0, 7, 30, 90, 365; 0 keeps conversations) | `inference` |
 
 `wait_ms` is capped at 60 000. There is no operation that runs a command or a tool directly. The conversation operations (everything from `chat_send` on) talk to the local model and the conversation store only; they never reach the policy, the worker or the approval store (ADR 0021). Every field is required; a field that may be `null` must still be present.
 
@@ -237,7 +239,7 @@ Anything else from the agent, or no answer within the configured time, ends the 
 | `held_ms` | While held or releasing: how long the hold has lasted; otherwise `null` |
 | `overdue` | True once a hold has lasted longer than the configured alert time |
 
-Version 2 added `governor` and version 3 the conversation and model operations (see Compatibility below).
+Version 2 added `governor`, version 3 the conversation and model operations, and version 4 `submit_clipboard_job`, `set_retention` and the retention and warm-up fields of `inference` (see Compatibility below).
 
 The governor also writes three audit events, which are not part of either wire protocol: `governor_hold` (`reason`, and `process` when a game caused it), `governor_released` (`held_ms`) and `governor_hold_overdue` (`held_ms`). They carry the configured process name that matched and nothing else about the process list (ADR 0016).
 
@@ -270,13 +272,13 @@ Value types:
 #### Sending a message
 
 ```json
-{"rpc": 3, "type": "chat_send", "conversation_id": null, "text": "Olá Donna,\ntens um minuto?", "language": "pt_pt"}
+{"rpc": 4, "type": "chat_send", "conversation_id": null, "text": "Olá Donna,\ntens um minuto?", "language": "pt_pt"}
 ```
 
 A `null` `conversation_id` starts a new conversation. The Core stores the person's message, starts the reply and answers at once:
 
 ```json
-{"rpc": 3, "type": "chat_turn", "conversation_id": "…", "user_message_id": "…", "turn_id": "…"}
+{"rpc": 4, "type": "chat_turn", "conversation_id": "…", "user_message_id": "…", "turn_id": "…"}
 ```
 
 `turn_id` is the id of the reply being written. `user_message_id` is `null` for `chat_regenerate`, which discards the conversation's last reply and generates another from the same history. One reply is generated at a time, across all conversations and clients. If the model is not loaded the Core loads it in the background; the reply stays `streaming` with no text until the model is ready.
@@ -284,13 +286,13 @@ A `null` `conversation_id` starts a new conversation. The Core stores the person
 #### Reading a reply
 
 ```json
-{"rpc": 3, "type": "chat_poll", "turn_id": "…", "cursor": 0, "wait_ms": 20000}
+{"rpc": 4, "type": "chat_poll", "turn_id": "…", "cursor": 0, "wait_ms": 20000}
 ```
 
 `cursor` is a UTF-8 byte offset into the reply text, not a character count. The answer carries the text after it:
 
 ```json
-{"rpc": 3, "type": "chat_delta", "turn_id": "…", "text": "Sempre. ", "next_cursor": 8,
+{"rpc": 4, "type": "chat_delta", "turn_id": "…", "text": "Sempre. ", "next_cursor": 8,
  "status": "complete", "error": null,
  "stats": {"prompt_tokens": 412, "completion_tokens": 3, "first_token_ms": 180, "tokens_per_second_x10": 552},
  "proposal": "Reunião às 15h"}
@@ -312,28 +314,29 @@ The client appends `text` and passes `next_cursor` on the next poll, until `stat
 
 #### Proposals
 
-`proposal` is at most one line of 1 to 1024 characters, from the clipboard allowlist (ADR 0020), without newline or tab, so that it can be sent unchanged as the goal `copy "<text>"`. The Core sets it only when the person's own last message asked for something to be copied, outside any quoted or pasted text, and the reply held one fenced block marked `clipboard` that passes those rules. It is a suggestion: it has no authority and nothing happens unless a client submits it with `submit_job`, after which it is an ordinary job. The worker plans it, policy asks for confirmation, and a person approves the exact text as in the approval flow above. Clients must show the text in full and must not submit it without an explicit action by the person.
+`proposal` is at most one line of 1 to 1024 characters, from the clipboard allowlist (ADR 0020), without newline or tab, so that it can be sent unchanged as `submit_clipboard_job`. The Core sets it only when the person's own last message asked for something to be copied, outside any quoted or pasted text, and the reply held one fenced block marked `clipboard` that passes those rules. It is a suggestion: it has no authority and nothing happens unless a client submits it with `submit_clipboard_job`, after which it is an ordinary job. The worker plans it, policy asks for confirmation, and a person approves the exact text as in the approval flow above. Clients must show the text in full and must not submit it without an explicit action by the person.
 
 #### Reading and deleting conversations
 
 `list_conversations` returns the most recently updated first. With a `query`, only conversations with a message containing it (wildcard characters in the query are matched literally), each with a `snippet`: a short excerpt around the first match. Without one, `snippet` is `null`.
 
 ```json
-{"rpc": 3, "type": "conversations", "conversations": [
+{"rpc": 4, "type": "conversations", "conversations": [
   {"conversation_id": "…", "title": "Olá Donna", "created_at": "2026-10-03T18:49:12.994Z",
    "updated_at": "2026-10-03T18:50:01.120Z", "message_count": 4, "snippet": null}]}
 ```
 
 `get_conversation` answers `conversation` with `conversation_id`, `title`, `created_at`, `updated_at` and `messages`, oldest first. Each message has `message_id`, `role` (`user` or `assistant`), `content`, `status` (as above; a person's message is `complete`), `created_at`, `stats` and `proposal`.
 
-`delete_conversation` and `delete_all_conversations` answer `{"rpc": 3, "type": "deleted", "conversations": 1}` with the number removed. The text is removed from the database file and its write-ahead log, not only marked deleted. A conversation can be deleted while a reply is being written for it; the reply is cancelled.
+`delete_conversation` and `delete_all_conversations` answer `{"rpc": 4, "type": "deleted", "conversations": 1}` with the number removed. The text is removed from the database file and its write-ahead log, not only marked deleted. A conversation can be deleted while a reply is being written for it; the reply is cancelled.
 
 #### The model
 
 ```json
-{"rpc": 3, "type": "inference", "state": "ready", "profile": "primary", "model": "…",
+{"rpc": 4, "type": "inference", "state": "ready", "profile": "primary", "model": "…",
  "model_sha256": "…", "context_size": 16384, "gpu_layers": 999,
- "last_error": null, "load_ms": 6200, "last_stats": null}
+ "last_error": null, "load_ms": 6200, "last_stats": null,
+ "retention_days": 0, "warmup_tokens_per_second_x10": 552, "slow": false}
 ```
 
 | `state` | Meaning |
@@ -346,7 +349,7 @@ The client appends `text` and passes `next_cursor` on the next poll, until `stat
 | `paused_for_game` | The governor reports a game and the configuration says `unload` (ADR 0016) |
 | `failed` | The server could not be started or stopped answering; `last_error` says why |
 
-`profile` is `primary`, or `fallback` while a game runs and `on_game = "fallback"`. `load_model` starts loading and answers at once; follow the load with `inference_status`. `unload_model` stops the server and frees its memory, cancelling a reply in progress. `set_context_size` changes the size and reloads a loaded model. `gpu_layers` is the number of layers on the GPU (0 means CPU only), and `load_ms` how long the last load took.
+`profile` is `primary`, or `fallback` while a game runs and `on_game = "fallback"`. `load_model` starts loading and answers at once; follow the load with `inference_status`. `unload_model` stops the server and frees its memory, cancelling a reply in progress. `set_context_size` changes the size and reloads a loaded model. `gpu_layers` is the number of layers on the GPU (0 means CPU only), and `load_ms` how long the last load took. `set_retention` stores the retention period in the conversation database, applies it at once and keeps it across restarts; `retention_days` reports it (the configuration's value until a person chooses one). After each load the Core generates a few tokens and reports the measured speed as `warmup_tokens_per_second_x10`; `slow` is true when a model on the GPU measured below the configured `slow_below_tokens_per_second`, which usually means part of it was placed outside video memory.
 
 #### Errors specific to this section
 
@@ -359,9 +362,13 @@ The client appends `text` and passes `next_cursor` on the next poll, until `stat
 
 Text that does not satisfy `ChatText` or `SearchQuery` fails to decode and is refused as `malformed_request` like any other invalid field.
 
+### Clipboard jobs
+
+`submit_clipboard_job` takes `text` (the clipboard text rules of ADR 0020: 1 to 1024 characters, plain) and answers with the queued `job`, like `submit_job`. In one transaction the Core stores the text as a payload, creates the job with the goal `copy payload:<payload_id>:<sha256>` and records `job_submitted`; the text is in no job, task, approval or audit record (ADR 0022). At most 16 payloads wait at once; beyond that the request is refused as `unavailable`. The payload is deleted in the transaction that ends its job, and by start-up recovery for a job that already ended. A job put back in the queue keeps it.
+
 ### Approvals
 
-An `approval` reply carries what a person needs to decide: the tool, the derived capabilities, a display-safe description of the arguments (for a write: path, size, SHA-256 and a short escaped preview), the task, request and job IDs, the request time, the expiry and the time left. It also carries the `fingerprint`, a SHA-256 over the task ID, request ID, tool, normalised arguments and capabilities.
+An `approval` reply carries what a person needs to decide: the tool, the derived capabilities, a display-safe description of the arguments (for a write: path, size, SHA-256 and a short escaped preview), the task, request and job IDs, the request time, the expiry and the time left. It also carries the `fingerprint`, a SHA-256 over the task ID, request ID, tool, normalised arguments and capabilities. For a clipboard write the Core resolves the payload while it exists and shows the text in full (`text`, `characters`, `lines`, `bytes`, and the request's `sha256`). Once the payload is gone, `arguments` holds `sha256` and `text` says `the text is no longer kept`; if the stored text no longer has the SHA-256 the request binds, `text` says it was changed and that the request must be refused. Approvals written before ADR 0022 hold the text in their arguments; they stay viewable as a short escaped preview of the stored arguments. Since ADR 0022 the `sha256` a clipboard request binds is taken over a random salt and the text, so it is shown but cannot be checked against a text.
 
 `approve` succeeds only if the approval is still pending, has not expired, and the supplied fingerprint equals the stored one. Before the tool runs, the Core consumes the approval only if the stored fingerprint also equals the one it computes from the exact call it is about to execute. The CLI fetches the approval, shows it, and sends the fingerprint it showed, so a person can only approve exactly what was displayed.
 

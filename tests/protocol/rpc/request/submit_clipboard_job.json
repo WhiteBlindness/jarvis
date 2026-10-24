@@ -1,0 +1,5 @@
+{
+  "rpc": 4,
+  "type": "submit_clipboard_job",
+  "text": "Demo: hello from the clipboard\nsecond line"
+}

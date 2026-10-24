@@ -1,5 +1,5 @@
 {
-  "rpc": 3,
+  "rpc": 4,
   "type": "submit_job",
   "goal": "write notes/today.md: buy milk"
 }

@@ -513,7 +513,7 @@ fn a_database_written_at_migration_two_upgrades_to_the_ledger() {
 
     let store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), latest_version());
-    assert_eq!(latest_version(), 3);
+    assert_eq!(latest_version(), 4);
 
     let before = store.job(running).unwrap().unwrap();
     assert_eq!(before.status, JobStatus::Running);

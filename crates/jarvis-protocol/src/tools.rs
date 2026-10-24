@@ -396,6 +396,39 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_write_names_a_payload_and_never_carries_text() {
+        let payload = crate::PayloadId::new();
+        let sha256 = "ab".repeat(32);
+        let call = ToolCall::from_request(
+            &tool("desktop.write_clipboard_text"),
+            &json!({"sha256": sha256, "payload_id": payload}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&call.arguments()).unwrap(),
+            format!(r#"{{"payload_id":"{payload}","sha256":"{sha256}"}}"#)
+        );
+        for args in [
+            json!({"text": "hello"}),
+            json!({"payload_id": payload, "sha256": sha256, "text": "hello"}),
+            json!({"payload_id": payload}),
+            json!({"sha256": sha256}),
+            json!({"payload_id": "not-a-uuid", "sha256": sha256}),
+            json!({"payload_id": payload.to_string().replace('-', ""), "sha256": sha256}),
+            json!({"payload_id": payload, "sha256": "AB".repeat(32)}),
+            json!({"payload_id": payload, "sha256": "ab"}),
+        ] {
+            assert!(
+                matches!(
+                    ToolCall::from_request(&tool("desktop.write_clipboard_text"), &args),
+                    Err(CallError::InvalidArguments { .. })
+                ),
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
     fn untagged_results_decode_to_the_right_variant() {
         let written: ToolResult =
             serde_json::from_value(json!({"path": "a.txt", "bytes": 2, "created": true})).unwrap();

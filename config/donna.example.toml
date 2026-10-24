@@ -51,6 +51,10 @@ on_game = "unload"
 # you delete them.
 retention_days = 0
 load_on_start = true
+# After each load a short warm-up measures generation speed. A GPU model
+# below this many tokens per second is reported as slow, which usually means
+# part of it was placed outside video memory (0 turns the check off).
+slow_below_tokens_per_second = 30
 
 [inference.primary]
 name = "Huihui Qwen3.5 9B abliterated · Q5_K_M"

@@ -7,6 +7,7 @@ use serde_json::json;
 use super::*;
 
 mod jobs;
+mod payloads;
 
 fn new_task(session_id: SessionId, request_id: &str) -> NewTask {
     NewTask {
@@ -1079,7 +1080,7 @@ fn consuming_an_approval_hands_out_its_proof_once() {
         label: AgentLabel::try_from("ping".to_owned()).unwrap(),
     });
     assert_eq!(
-        Grants::default().issue(consumed, &check, 0, 5_000),
+        Grants::default().issue(consumed, &check, None, 0, 5_000),
         Err(Refusal::NotApproved)
     );
 }

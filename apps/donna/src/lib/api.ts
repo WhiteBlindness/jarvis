@@ -53,6 +53,9 @@ export const api = {
   unloadModel: () => call<InferenceView>("unload_model"),
   setContextSize: (contextSize: number) =>
     call<InferenceView>("set_context_size", { contextSize }),
+  setRetention: (days: number) => call<InferenceView>("set_retention", { days }),
+  exportConversation: (conversationId: string, lang: "pt" | "en") =>
+    call<string>("export_conversation", { conversationId, lang }),
   chatSend: (conversationId: string | null, text: string, language: ChatLanguage) =>
     call<ChatTurn>("chat_send", { conversationId, text, language }),
   chatRegenerate: (conversationId: string, language: ChatLanguage) =>

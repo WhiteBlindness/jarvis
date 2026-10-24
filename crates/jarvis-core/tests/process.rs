@@ -348,8 +348,8 @@ fn the_daemon_runs_jobs_from_clients_with_the_python_worker() {
     setup.wait_for_worker("idle");
     let health = setup.health();
     assert_eq!(health["ok"], true);
-    assert_eq!(health["worker_protocol"], 2);
-    assert_eq!(health["rpc_protocol"], 3);
+    assert_eq!(health["worker_protocol"], 3);
+    assert_eq!(health["rpc_protocol"], 4);
     assert!(health["worker"]["pid"].is_u64());
     assert!(!health["worker"]["containment"].as_str().unwrap().is_empty());
 
@@ -538,6 +538,76 @@ fn a_write_runs_only_after_a_person_approves_it_through_another_client() {
             _ => None,
         });
     assert!(granted_by.unwrap().starts_with("local client pid "));
+}
+
+/// A clipboard text submitted through the CLI is shown to the person in full
+/// while its job exists, is in no immutable record, and is gone from the
+/// database file and its log once the job has ended (ADR 0022).
+#[test]
+fn a_clipboard_text_lives_only_as_long_as_its_job() {
+    const TEXT: &str = "clipboard-canary-91c2d7";
+    let policy = format!("{POLICY}\n\"desktop.clipboard.write\" = \"require_confirmation\"");
+    let setup = Setup::new("real", &policy, "");
+    let daemon = setup.serve();
+    let grep = |needle: &str| {
+        ["jarvis.db", "jarvis.db-wal"].iter().any(|name| {
+            std::fs::read(setup.dir.path().join(name)).is_ok_and(|bytes| {
+                bytes
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_bytes())
+            })
+        })
+    };
+
+    // Text the Core would refuse as clipboard text never becomes a job.
+    let output = setup.run(&["clipboard", "bad \u{1b}[2J text"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("invalid clipboard text"));
+
+    let job = setup
+        .json(&["clipboard", &format!("copy me {TEXT}")])
+        .remove(0);
+    let goal = job["goal"].as_str().unwrap();
+    assert!(goal.starts_with("copy payload:"), "{goal}");
+    assert!(!goal.contains(TEXT));
+    let job = job["job_id"].as_str().unwrap().to_owned();
+
+    // The person is shown the text in full.
+    let approval = setup.pending_approval();
+    assert_eq!(approval["tool"], "desktop.write_clipboard_text");
+    assert_eq!(approval["arguments"]["text"], format!("copy me {TEXT}"));
+    assert!(grep(TEXT), "the payload holds the text meanwhile");
+    // No immutable record has it.
+    let store = setup.store();
+    for task in store.tasks(10).unwrap() {
+        assert!(!task.args.contains(TEXT));
+    }
+    for job in store.jobs(10).unwrap() {
+        assert!(!job.goal.as_str().contains(TEXT));
+    }
+    let events: Vec<_> = setup.events().into_iter().map(|e| e.event).collect();
+    assert!(!serde_json::to_string(&events).unwrap().contains(TEXT));
+    drop(store);
+
+    let id = approval["approval_id"].as_str().unwrap().to_owned();
+    let output = setup.run(&["approvals", "deny", &id, "--reason", "not now"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let done = setup.json(&["job", &job, "--wait"]).remove(0);
+    assert_eq!(done["status"], "failed", "{done}");
+    // The job has ended: the text is in neither file.
+    assert!(!grep(TEXT), "the text outlived its job");
+
+    let store = setup.store();
+    let record = store
+        .tasks(10)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.tool == "desktop.write_clipboard_text")
+        .unwrap();
+    assert!(!record.args.contains(TEXT));
+    drop(store);
+    assert!(setup.shutdown(daemon).success());
+    assert!(!grep(TEXT));
 }
 
 /// Pending approvals do not survive a restart, and a consumed approval stays
@@ -943,18 +1013,18 @@ fn the_rpc_interface_is_strict_and_bounded() {
     let endpoint = setup.endpoint();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
-        let health = br#"{"rpc":3,"type":"health"}"#;
+        let health = br#"{"rpc":4,"type":"health"}"#;
         let replies = raw_exchange(
             &endpoint,
             &[
                 b"not json",
-                br#"{"rpc":3,"type":"health","extra":1}"#,
-                br#"{"rpc":3,"type":"run_command","command":"id"}"#,
-                br#"{"rpc":4,"type":"health"}"#,
-                br#"{"rpc":2,"type":"health"}"#,
-                br#"{"protocol":2,"type":"hello","worker":"w","worker_version":"1"}"#,
-                br#"{"rpc":3,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aa","approved":true}"#,
-                br#"{"rpc":3,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                br#"{"rpc":4,"type":"health","extra":1}"#,
+                br#"{"rpc":4,"type":"run_command","command":"id"}"#,
+                br#"{"rpc":5,"type":"health"}"#,
+                br#"{"rpc":3,"type":"health"}"#,
+                br#"{"protocol":3,"type":"hello","worker":"w","worker_version":"1"}"#,
+                br#"{"rpc":4,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aa","approved":true}"#,
+                br#"{"rpc":4,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
                 health,
             ],
         )
@@ -979,13 +1049,13 @@ fn the_rpc_interface_is_strict_and_bounded() {
         );
         // A client of the previous version is refused, and the answer is
         // encoded at this version: an older client cannot decode it either.
-        assert_eq!(replies[4]["rpc"], 3);
-        assert!(replies[4]["message"].as_str().unwrap().contains("version 2"));
+        assert_eq!(replies[4]["rpc"], 4);
+        assert!(replies[4]["message"].as_str().unwrap().contains("version 3"));
         assert_eq!(replies[8]["type"], "health", "the connection survives bad requests");
 
         // An oversized request is answered once, then the connection closes.
         let huge = format!(
-            r#"{{"rpc":3,"type":"submit_job","goal":"{}"}}"#,
+            r#"{{"rpc":4,"type":"submit_job","goal":"{}"}}"#,
             "x".repeat(20 * 1024)
         );
         let replies = raw_exchange(&endpoint, &[huge.as_bytes(), health]).await;
@@ -1296,4 +1366,88 @@ fn queued_jobs_wait_while_a_game_runs_and_start_after_it_exits() {
     });
     assert_eq!(process.as_deref(), Some(game.as_str()));
     assert!(setup.shutdown(daemon).success(), "{}", setup.log());
+}
+
+/// A stand-in for the desktop app: any process the test can end.
+fn start_parent() -> Child {
+    let (program, args): (&str, &[&str]) = if cfg!(windows) {
+        (r"C:\Windows\System32\PING.EXE", &["-n", "60", "127.0.0.1"])
+    } else {
+        ("/bin/sleep", &["60"])
+    };
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn a_core_started_with_exit_with_stops_when_that_process_exits() {
+    let setup = Setup::new("real", POLICY, "");
+    let mut parent = start_parent();
+    let pid = parent.id().to_string();
+    let log = std::fs::File::create(setup.dir.path().join("core-exit-with.log")).unwrap();
+    let mut core = setup
+        .cli(&["serve", "--exit-with", &pid])
+        .stdout(Stdio::piped())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(core.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    assert!(first.starts_with("ready "), "{first:?}: {}", setup.log());
+    setup.wait_for_worker("idle");
+
+    parent.kill().unwrap();
+    parent.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = core.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the Core outlived the process it follows: {}",
+            setup.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.success(), "{status:?}: {}", setup.log());
+    let events = Store::open_read_only(&setup.database())
+        .unwrap()
+        .audit_events(None, 10_000)
+        .unwrap();
+    assert_eq!(
+        events.last().map(|e| e.event.name()),
+        Some("core_stopped"),
+        "the Core stopped cleanly"
+    );
+    assert!(setup.log().contains("--exit-with"), "{}", setup.log());
+}
+
+#[test]
+fn a_core_told_to_follow_a_missing_process_does_not_start() {
+    let setup = Setup::new("real", POLICY, "");
+    let mut gone = start_parent();
+    let pid = gone.id();
+    gone.kill().unwrap();
+    gone.wait().unwrap();
+    let output = setup
+        .cli(&["serve", "--exit-with", &pid.to_string()])
+        .output()
+        .unwrap();
+    // On Windows a reaped ID may already belong to another process; then
+    // the Core would follow that one, which this test cannot rule out.
+    if cfg!(unix) || !jarvis_sandbox::process_exists(pid) {
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).is_empty(),
+            "never ready"
+        );
+    }
 }

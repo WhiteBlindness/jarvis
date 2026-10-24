@@ -163,10 +163,34 @@ export const pt = {
   contextFailed: "Não foi possível mudar o contexto.",
   storageHeading: "Armazenamento e retenção",
   storageBody:
-    "As conversas ficam guardadas apenas neste computador, na base de dados local do Core. Nada é enviado para a Internet e a aplicação não faz cópias. Ficam até as apagares (uma a uma, na lista, ou todas de uma vez abaixo), a não ser que o Core tenha um período de retenção configurado, que apaga as conversas mais antigas.",
+    "As conversas ficam guardadas apenas neste computador, na base de dados local do Core. Nada é enviado para a Internet. Ficam até as apagares, a não ser que definas um período de retenção abaixo. Os ficheiros que exportares são cópias simples, que passam a ser tuas: apaga-os tu. Se a pasta Transferências sincronizar com a nuvem, os ficheiros exportados também são sincronizados.",
+  warmupSpeed: "Velocidade medida ao carregar",
+  slowTitle: "Placa gráfica lenta",
+  slowBody:
+    "A placa gráfica está lenta (~{tps} tok/s): parte do modelo ficou fora da memória de vídeo. Recarregar pode ajudar; se continuar lenta, fecha aplicações que usem a placa gráfica ou termina a sessão do Windows.",
+  reloadModel: "Recarregar modelo",
+  retentionHeading: "Retenção",
+  retentionHelp: "Apaga automaticamente as conversas que não são atualizadas há mais do que este período.",
+  retentionKeep: "Manter",
+  retentionDays: "{n} dias",
+  retentionChanged: "Retenção atualizada.",
+  retentionConfirmTitle: "Mudar a retenção?",
+  retentionConfirmZero:
+    "Neste momento não há conversas sem atividade há mais de {days} dias, por isso nada é apagado já. Continuar?",
+  retentionConfirmOne:
+    "Isto apaga já {n} conversa sem atividade há mais de {days} dias. Continuar?",
+  retentionConfirmMany:
+    "Isto apaga já {n} conversas sem atividade há mais de {days} dias. Continuar?",
+  continueAction: "Continuar",
+  retentionFailed: "Não foi possível mudar a retenção.",
+  conversationsHeading: "Conversas",
+  conversationsEmpty: "Ainda não há conversas.",
+  exportConversation: "Exportar",
+  exportDone: "Exportada para {path}",
+  exportFailed: "Não foi possível exportar.",
   clipboardHeading: "Área de transferência",
   clipboardBody:
-    "A Donna nunca escreve na área de transferência por conta própria. Quando sugere copiar um texto, só o pedido aparece nos pedidos de aprovação, com o texto exato. Só depois de aprovares é que o Core o copia, uma única vez. Ler a área de transferência não está disponível.",
+    "A Donna nunca escreve na área de transferência por conta própria. Quando sugere copiar um texto, só o pedido aparece nos pedidos de aprovação, com o texto exato. Só depois de aprovares é que o Core o copia, uma única vez. Ler a área de transferência não está disponível. A partir de agora, o texto copiado não fica guardado depois de a cópia terminar.",
   dangerHeading: "Zona de perigo",
   deleteAll: "Apagar todas as conversas",
   deleteAllTitle: "Apagar todas as conversas?",
@@ -339,10 +363,34 @@ export const en: Record<StringKey, string> = {
   contextFailed: "Could not change the context.",
   storageHeading: "Storage and retention",
   storageBody:
-    "Conversations are kept only on this computer, in the Core's local database. Nothing is sent to the Internet and the app makes no copies. They stay until you delete them (one by one in the list, or all at once below), unless the Core has a retention period configured, which deletes older conversations.",
+    "Conversations are kept only on this computer, in the Core's local database. Nothing is sent to the Internet. They stay until you delete them, unless you set a retention period below. Files you export are plain copies that become yours: delete them yourself. If your Downloads folder syncs with the cloud, exported files sync too.",
+  warmupSpeed: "Speed measured on load",
+  slowTitle: "Slow graphics card",
+  slowBody:
+    "The graphics card is running slowly (~{tps} tok/s): part of the model ended up outside video memory. Reloading may help; if it stays slow, close applications that use the graphics card or sign out of Windows.",
+  reloadModel: "Reload model",
+  retentionHeading: "Retention",
+  retentionHelp: "Automatically deletes conversations not updated for longer than this period.",
+  retentionKeep: "Keep",
+  retentionDays: "{n} days",
+  retentionChanged: "Retention updated.",
+  retentionConfirmTitle: "Change retention?",
+  retentionConfirmZero:
+    "Right now no conversation has been inactive for more than {days} days, so nothing is deleted yet. Continue?",
+  retentionConfirmOne:
+    "This deletes {n} conversation inactive for more than {days} days right now. Continue?",
+  retentionConfirmMany:
+    "This deletes {n} conversations inactive for more than {days} days right now. Continue?",
+  continueAction: "Continue",
+  retentionFailed: "Could not change the retention.",
+  conversationsHeading: "Conversations",
+  conversationsEmpty: "No conversations yet.",
+  exportConversation: "Export",
+  exportDone: "Exported to {path}",
+  exportFailed: "Could not export.",
   clipboardHeading: "Clipboard",
   clipboardBody:
-    "Donna never writes to the clipboard on its own. When it suggests copying some text, only the request appears in the approval requests, with the exact text. Only after you approve does the Core copy it, once. Reading the clipboard is not available.",
+    "Donna never writes to the clipboard on its own. When it suggests copying some text, only the request appears in the approval requests, with the exact text. Only after you approve does the Core copy it, once. Reading the clipboard is not available. From now on, the copied text is not kept once the copy has finished.",
   dangerHeading: "Danger zone",
   deleteAll: "Delete all conversations",
   deleteAllTitle: "Delete all conversations?",

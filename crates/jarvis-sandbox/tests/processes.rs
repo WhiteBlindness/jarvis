@@ -134,3 +134,26 @@ fn a_linux_name_is_compared_as_the_kernel_keeps_it() {
     );
     assert_eq!(shorter, None, "14 bytes is not the 15 the kernel kept");
 }
+
+#[test]
+fn a_watched_process_is_seen_to_exit() {
+    // The system binary itself, not a fresh copy: running a file just
+    // written can fail with "text file busy" on Linux while other tests fork.
+    let (program, args): (&str, &[&str]) = if cfg!(windows) {
+        (r"C:\Windows\System32\PING.EXE", &["-n", "30", "127.0.0.1"])
+    } else {
+        ("/bin/sleep", &["30"])
+    };
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let watched = jarvis_sandbox::WatchedProcess::new(child.id()).unwrap();
+    assert!(!watched.has_exited());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(wait_until(|| watched.has_exited()));
+}

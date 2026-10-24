@@ -177,6 +177,68 @@ async fn a_client_that_hides_its_token_is_refused_audited_and_does_not_block_oth
     core.server.await.unwrap();
 }
 
+/// Windows lets a pipe server impersonate a client that opened the pipe
+/// without security flags (as a plain file open does) only after it has
+/// read from the pipe. Such a client that is slow to send its first request,
+/// as a client can be just after the computer resumes, is still served.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_writes_late_is_still_served() {
+    use std::io::{BufRead, Write};
+
+    use jarvis_protocol::decode_rpc_response;
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(rpc_state(dir.path(), &unique_pipe("late")));
+    let Endpoint::Pipe(name) = core.endpoint.clone();
+    for _ in 0..3 {
+        let name = name.clone();
+        let line = tokio::task::spawn_blocking(move || {
+            let mut pipe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&name)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            pipe.write_all(b"{\"rpc\":4,\"type\":\"health\"}\n")
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(pipe).read_line(&mut line).unwrap();
+            line
+        })
+        .await
+        .unwrap();
+        match decode_rpc_response(line.trim_end().as_bytes()).unwrap() {
+            RpcResponse::Health(_) => {}
+            other => panic!("expected health, got {other:?}"),
+        }
+    }
+    assert!(rejections(&core.state).await.is_empty());
+
+    // One that sends nothing cannot be identified and is still refused.
+    let silent = tokio::task::spawn_blocking(move || {
+        let pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(pipe).read_line(&mut line).unwrap();
+        line
+    })
+    .await
+    .unwrap();
+    match decode_rpc_response(silent.trim_end().as_bytes()).unwrap() {
+        RpcResponse::Error(error) => {
+            assert_eq!(error.code, jarvis_protocol::RpcErrorCode::Forbidden);
+        }
+        other => panic!("expected forbidden, got {other:?}"),
+    }
+    assert_eq!(rejections(&core.state).await.len(), 1);
+    core.stop.cancel();
+    core.server.await.unwrap();
+}
+
 /// The Core's pipe is owned by the user who started it, at medium
 /// integrity, which is what the client checks before it sends anything.
 #[cfg(windows)]

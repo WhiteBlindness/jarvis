@@ -67,7 +67,7 @@ EXPECTED_CORE: dict[str, CoreMessage] = {
                 arch="x86_64",
                 logical_cpus=8,
                 core_version="0.2.0",
-                protocol_version=2,
+                protocol_version=3,
                 core_uptime_ms=42,
             )
         ),
@@ -131,7 +131,7 @@ EXPECTED_CORE: dict[str, CoreMessage] = {
         request_id=None,
         error=WireError(
             ErrorCode.UNSUPPORTED_PROTOCOL_VERSION,
-            "unsupported protocol version 3; this side speaks 2",
+            "unsupported protocol version 4; this side speaks 3",
         ),
         fatal=True,
     ),
@@ -164,7 +164,10 @@ EXPECTED_WORKER: dict[str, WorkerMessage] = {
         request_id="req-0008",
         job_id=JOB_ID,
         tool="desktop.write_clipboard_text",
-        args={"text": "Demo: hello from the Session Agent"},
+        args={
+            "payload_id": "01928f5e-7c4a-7b30-8c1d-2e3f4a5b6c7d",
+            "sha256": "5d41402abc4b2a76b9719d911017c592a5d41402abc4b2a76b9719d911017c59",
+        },
     ),
     "job_result_completed.json": JobResult(
         job_id=JOB_ID, outcome=JobOutcome.COMPLETED, summary="2 call(s): completed=2"

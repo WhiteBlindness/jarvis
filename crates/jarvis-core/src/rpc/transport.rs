@@ -194,6 +194,10 @@ mod windows {
     /// `ERROR_PIPE_BUSY`: every instance is in use; try again shortly.
     const ERROR_PIPE_BUSY: i32 = 231;
 
+    /// How long a client that must send before it can be identified gets.
+    /// Accepting waits for it, so it stays short.
+    const FIRST_BYTES: Duration = Duration::from_secs(1);
+
     #[derive(Debug)]
     pub struct Listener {
         name: String,
@@ -223,7 +227,22 @@ mod windows {
             let fresh = jarvis_sandbox::create_owner_only_pipe(&options, &self.name)?;
             let connected = std::mem::replace(&mut self.next, fresh);
             let pid = jarvis_sandbox::named_pipe_client_pid(connected.as_raw_handle()).ok();
-            let token = jarvis_sandbox::inspect_pipe_client(connected.as_raw_handle())
+            let mut token = jarvis_sandbox::inspect_pipe_client(connected.as_raw_handle());
+            if token
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+            {
+                // Some clients can be identified only after they have sent
+                // something; wait briefly for it. A client that sends nothing
+                // is refused as before.
+                if tokio::time::timeout(FIRST_BYTES, connected.readable())
+                    .await
+                    .is_ok_and(|ready| ready.is_ok())
+                {
+                    token = jarvis_sandbox::inspect_pipe_client(connected.as_raw_handle());
+                }
+            }
+            let token = token
                 .inspect_err(|error| tracing::warn!(%error, "cannot read the RPC client's token"))
                 .ok();
             Ok((connected, Peer { pid, token }))

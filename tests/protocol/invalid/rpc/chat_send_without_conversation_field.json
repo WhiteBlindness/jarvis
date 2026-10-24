@@ -1,4 +1,4 @@
 {
-  "frame": "{\"rpc\":3,\"type\":\"chat_send\",\"text\":\"ok\",\"language\":\"pt_pt\"}",
+  "frame": "{\"rpc\":4,\"type\":\"chat_send\",\"text\":\"ok\",\"language\":\"pt_pt\"}",
   "error": "malformed_frame"
 }

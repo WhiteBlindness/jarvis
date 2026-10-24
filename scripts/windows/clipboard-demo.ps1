@@ -14,11 +14,12 @@
     temporary directory) with the clipboard write capability set to
     require_confirmation, and walks the operation through it:
 
-      1. A client submits: copy "<synthetic text>". The worker proposes the
+      1. A client submits the text with the clipboard command. The Core keeps it
+         as a temporary payload and the worker proposes the
          typed call desktop.write_clipboard_text, which is class B.
       2. The Core asks for approval. The request is shown as a person sees
-         it: the action, the destination, the full text, its size and its
-         SHA-256.
+         it: the action, the destination, the full text, its size and the
+         salted SHA-256 the request binds (ADR 0022).
       3. The approval is granted for that exact fingerprint. The Session
          Agent writes the text once. The task shows outcome COMPLETED.
       4. The disposable editor pastes and reports the SHA-256 of what it
@@ -161,7 +162,7 @@ try {
     Get-Content $out
 
     Step '1. A client asks to put synthetic text on the clipboard'
-    $job = (Core @('submit', "copy `"$firstText`"", '--json')) | ConvertFrom-Json
+    $job = (Core @('clipboard', $firstText, '--json')) | ConvertFrom-Json
     "job $($job.job_id): $($job.goal)"
 
     Step '2. The Core asks a person, in words'
@@ -173,8 +174,13 @@ try {
         if (-not ($shown | Select-String -Pattern "(^|\s)$label = " -Quiet)) { throw "the approval does not show $label" }
     }
     if (-not ($shown | Select-String -SimpleMatch $firstText -Quiet)) { throw 'the approval does not show the full text' }
-    if (-not ($shown | Select-String -SimpleMatch (Sha256 $firstText) -Quiet)) { throw 'the approval shows a different sha256' }
-    "the approval shows the full text and its sha256 ($(Sha256 $firstText))"
+    # The request binds a salted SHA-256 (ADR 0022): the value in the job's
+    # goal, not the plain SHA-256 of the text.
+    $bound = ($job.goal -split ':')[-1]
+    if ($bound -notmatch '^[0-9a-f]{64}$') { throw 'the job goal does not name a sha256' }
+    if ($bound -eq (Sha256 $firstText)) { throw 'the request binds an unsalted sha256' }
+    if (-not ($shown | Select-String -Pattern "(^|\s)sha256 = $bound" -Quiet)) { throw 'the approval shows a different sha256' }
+    "the approval shows the full text and the salted sha256 the request binds ($bound)"
 
     Step '3. Approve exactly what was shown'
     Core @('approvals', 'approve', $approval.approval_id, '--fingerprint', $approval.fingerprint, '--yes')
@@ -214,7 +220,7 @@ if ([Demo.Clip]::OpenClipboard([IntPtr]::Zero)) {
     if ((Get-Content $ready -Raw).Trim() -ne 'held') { throw 'the holder could not open the clipboard' }
     'another process now holds the clipboard open'
 
-    $busy = (Core @('submit', "copy `"$secondText`"", '--json')) | ConvertFrom-Json
+    $busy = (Core @('clipboard', $secondText, '--json')) | ConvertFrom-Json
     $second = @((Core @('approvals', 'list', '--wait', '30s', '--json')) | ConvertFrom-Json)[0]
     if ($second.approval_id -eq $approval.approval_id) { throw 'the old approval was reused' }
     Core @('approvals', 'approve', $second.approval_id, '--fingerprint', $second.fingerprint, '--yes')
@@ -233,7 +239,7 @@ if ([Demo.Clip]::OpenClipboard([IntPtr]::Zero)) {
     EditorReceived $firstText
 
     Step '7. A third request is denied'
-    $third = (Core @('submit', "copy `"$thirdText`"", '--json')) | ConvertFrom-Json
+    $third = (Core @('clipboard', $thirdText, '--json')) | ConvertFrom-Json
     $denied = @((Core @('approvals', 'list', '--wait', '30s', '--json')) | ConvertFrom-Json)[0]
     "approval $($denied.approval_id) for job $($third.job_id); denying it"
     Core @('approvals', 'deny', $denied.approval_id, '--reason', 'demo: not this one')

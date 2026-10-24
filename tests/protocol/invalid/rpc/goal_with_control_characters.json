@@ -1,4 +1,4 @@
 {
-  "frame": "{\"rpc\":3,\"type\":\"submit_job\",\"goal\":\"x\\n\\u001b[2J\"}",
+  "frame": "{\"rpc\":4,\"type\":\"submit_job\",\"goal\":\"x\\n\\u001b[2J\"}",
   "error": "malformed_frame"
 }

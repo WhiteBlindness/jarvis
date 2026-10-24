@@ -217,10 +217,45 @@ export async function setContextSize(size: number): Promise<void> {
 }
 
 export async function loadModel(): Promise<void> {
+  // Optimistic: show "loading" at once; the Core's answer or the next status
+  // event replaces it, and a failure puts the previous state back.
+  const previous = state.inference;
+  if (previous) setState({ inference: { ...previous, state: "loading", last_error: null } });
   try {
     setState({ inference: await api.loadModel() });
   } catch (error) {
+    setState({ inference: previous });
     toast(errorText(error), "error");
+  }
+}
+
+/** Unload, then load again (frees video memory that other programs held). */
+export async function reloadModel(): Promise<void> {
+  try {
+    setState({ inference: await api.unloadModel() });
+  } catch (error) {
+    toast(errorText(error), "error");
+    return;
+  }
+  await loadModel();
+}
+
+export async function setRetention(days: number): Promise<void> {
+  try {
+    setState({ inference: await api.setRetention(days) });
+    toast(t("retentionChanged"));
+    void refreshConversations();
+  } catch (error) {
+    toast(`${t("retentionFailed")} ${errorText(error)}`, "error");
+  }
+}
+
+export async function exportConversation(id: string): Promise<void> {
+  try {
+    const path = await api.exportConversation(id, state.lang);
+    toast(t("exportDone", { path }));
+  } catch (error) {
+    toast(`${t("exportFailed")} ${errorText(error)}`, "error");
   }
 }
 

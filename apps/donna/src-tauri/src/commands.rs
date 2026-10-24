@@ -5,14 +5,15 @@ use std::sync::Arc;
 
 use jarvis_protocol::{
     ApprovalId, ApprovalView, CONTEXT_SIZES, ChatLanguage, ChatText, ChatTurn, ClipboardProposal,
-    ConversationId, ConversationSummary, ConversationView, Fingerprint, Goal, InferenceView, JobId,
-    JobView, MessageId, RpcRequest, RpcResponse, SearchQuery, Summary, encode_rpc_request,
-    strip_hidden,
+    ClipboardText, ConversationId, ConversationSummary, ConversationView, Fingerprint,
+    InferenceView, JobId, JobView, MessageId, RETENTION_DAYS, RpcRequest, RpcResponse, SearchQuery,
+    Summary, encode_rpc_request, strip_hidden,
 };
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::error::DonnaError;
+use crate::export;
 use crate::loops;
 use crate::state::AppState;
 
@@ -260,16 +261,17 @@ pub async fn deny(state: Shared<'_>, approval_id: String, reason: String) -> Rep
     result.map(|_| ())
 }
 
-/// Submit the model's clipboard proposal as the goal `copy "<text>"`. The
-/// person still has to approve the resulting request.
+/// Submit the model's clipboard proposal as a clipboard job. The Core keeps
+/// the text as a temporary payload and never writes it into the job (ADR
+/// 0022). The person still has to approve the resulting request.
 #[tauri::command]
 pub async fn submit_copy_proposal(state: Shared<'_>, text: String) -> Reply<JobView> {
     let proposal = parse("proposal", ClipboardProposal::try_from(text))?;
-    let goal = parse(
-        "goal",
-        Goal::try_from(format!("copy \"{}\"", proposal.as_str())),
+    let text = parse(
+        "proposal",
+        ClipboardText::try_from(proposal.as_str().to_owned()),
     )?;
-    let result = state.call(&RpcRequest::SubmitJob { goal }).await;
+    let result = state.call(&RpcRequest::SubmitClipboardJob { text }).await;
     state.approvals_wake.notify_one();
     match result? {
         RpcResponse::Job(job) => Ok(job),
@@ -287,4 +289,35 @@ pub async fn get_job(state: Shared<'_>, job_id: String, wait_ms: u32) -> Reply<J
         RpcResponse::Job(job) => Ok(job),
         other => Err(DonnaError::unexpected(&other)),
     }
+}
+
+/// Delete conversations not updated for `days` (0 keeps them).
+#[tauri::command]
+pub async fn set_retention(state: Shared<'_>, days: u32) -> Reply<InferenceView> {
+    if !RETENTION_DAYS.contains(&days) {
+        return Err(DonnaError::invalid("unsupported retention period"));
+    }
+    inference(&state, &RpcRequest::SetRetention { days }).await
+}
+
+/// Write one conversation as Markdown into the Downloads folder and return
+/// the full path. Never overwrites an existing file.
+#[tauri::command]
+pub async fn export_conversation(
+    state: Shared<'_>,
+    conversation_id: String,
+    lang: Option<String>,
+) -> Reply<String> {
+    let request = RpcRequest::GetConversation {
+        conversation_id: self::conversation_id(conversation_id)?,
+    };
+    let view = match state.call(&request).await? {
+        RpcResponse::Conversation(view) => view,
+        other => return Err(DonnaError::unexpected(&other)),
+    };
+    let english = lang.as_deref() == Some("en");
+    let unexpected = |message: String| DonnaError::Unexpected { message };
+    let dir = export::downloads_dir().map_err(unexpected)?;
+    let path = export::write_unique(&dir, &view, english).map_err(unexpected)?;
+    Ok(path.display().to_string())
 }

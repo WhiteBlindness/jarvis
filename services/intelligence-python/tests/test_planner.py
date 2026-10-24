@@ -213,71 +213,65 @@ def test_healthcheck_asks_the_session_agent_to_echo_a_label() -> None:
     assert plan("healthcheck ,") == []
 
 
-def copy(text: str) -> PlannedCall:
-    return PlannedCall("desktop.write_clipboard_text", {"text": text})
+PAYLOAD = "01928f5e-7c4a-7b30-8c1d-2e3f4a5b6c7d"
+SHA256 = "5d41402abc4b2a76b9719d911017c592a5d41402abc4b2a76b9719d911017c59"
+COPY_GOAL = f"copy payload:{PAYLOAD}:{SHA256}"
 
 
-def test_copy_asks_to_write_the_quoted_text_to_the_clipboard() -> None:
-    assert plan('copy "Demo: hello from the Session Agent"') == [
-        copy("Demo: hello from the Session Agent")
-    ]
-    assert plan('COPY "caf\u00e9\ttab"') == [copy("caf\u00e9\ttab")]
+def copy(payload_id: str = PAYLOAD, sha256: str = SHA256) -> PlannedCall:
+    return PlannedCall("desktop.write_clipboard_text", {"payload_id": payload_id, "sha256": sha256})
 
 
-def test_copy_text_runs_to_the_last_quote_of_the_goal() -> None:
-    assert plan('copy "say "hi" now" please') == [copy('say "hi" now')]
-    assert plan('copy "read a.txt, system"') == [copy("read a.txt, system")]
+def test_copy_names_a_payload_and_never_carries_text() -> None:
+    assert plan(COPY_GOAL) == [copy()]
+    assert plan(
+        COPY_GOAL.upper().replace(PAYLOAD.upper(), PAYLOAD).replace(SHA256.upper(), SHA256)
+    ) == [copy()]
+    [call] = plan(COPY_GOAL)
+    assert set(call.args) == {"payload_id", "sha256"}
 
 
 def test_copy_comes_in_order_of_appearance() -> None:
-    assert plan('system, copy "x"') == [SYSTEM_INFO, copy("x")]
-    assert plan('read a.txt, copy "x"') == [read("a.txt"), copy("x")]
+    assert plan(f"system, {COPY_GOAL}") == [SYSTEM_INFO, copy()]
+    assert plan(f"read a.txt, {COPY_GOAL}") == [read("a.txt"), copy()]
 
 
 @pytest.mark.parametrize(
     "goal",
     [
-        'copy ""',
+        'copy "Demo: hello from the Session Agent"',
+        'copy "x"',
+        'COPY "caf\u00e9"',
         "copy hello",
-        'copy "hello',
-        'copy"hello"',
-        'recopy "x"',
-        'copy "' + "x" * 1025 + '"',
-        'copy "a\u202eb"',
-        'copy "a\u200bb"',
-        'copy "a\ufeffb"',
-        'copy "a\x07b"',
-        'copy "a\rb"',
-        'copy "line\u2028break"',
-        'copy "tag\U000e0041"',
-        'copy "vs\ufe0f"',
-        'copy "hangul\u3164filler"',
-        'copy "braille\u2800blank"',
-        'copy "nb\u00a0space"',
-        'copy "private\ue000"',
-        'copy "e\u0301"',
-        'copy "emoji \U0001f600"',
+        "copy payload:",
+        f"copy payload:{PAYLOAD}",
+        f"copy payload:{PAYLOAD}:",
+        f"copy payload:{PAYLOAD}:{SHA256[:63]}",
+        f"copy payload:{PAYLOAD}:{SHA256}0",
+        f"copy payload:{PAYLOAD}:{SHA256.upper()}",
+        f"copy payload:{PAYLOAD.upper()}:{SHA256}",
+        f"copy payload:{PAYLOAD.replace('-', '')}:{SHA256}",
+        f"copy payload:not-a-uuid:{SHA256}",
+        f"recopy payload:{PAYLOAD}:{SHA256}",
+        f"copy  payload :{PAYLOAD}:{SHA256}",
+        f"copy payload:{PAYLOAD}:{SHA256[:-1]}g",
     ],
 )
-def test_copy_with_unusable_text_yields_no_call(goal: str) -> None:
+def test_any_other_form_of_copy_yields_no_call(goal: str) -> None:
     assert plan(goal) == []
 
 
-def test_copy_accepts_the_longest_text() -> None:
-    assert plan('copy "' + "x" * 1024 + '"') == [copy("x" * 1024)]
-    assert plan('copy "' + "\u00e9" * 1024 + '"') == [copy("\u00e9" * 1024)]
+def test_the_old_inline_form_is_gone() -> None:
+    # `copy "<text>"` used to carry the text to the Core through the worker.
+    assert plan('copy "hello"') == []
+    assert plan('copy "' + "x" * 1024 + '"') == []
 
 
 def test_copy_does_not_interfere_with_write_or_healthcheck() -> None:
-    assert plan('write notes.txt: copy "x"') == [write("notes.txt", 'copy "x"')]
-    assert plan('healthcheck x copy "y"') == [
+    assert plan(f"write notes.txt: {COPY_GOAL}") == [write("notes.txt", COPY_GOAL)]
+    assert plan(f"healthcheck x {COPY_GOAL}") == [
         PlannedCall("session_agent.healthcheck", {"label": "x"}),
-        copy("y"),
+        copy(),
     ]
     assert plan("healthcheck copy") == [PlannedCall("session_agent.healthcheck", {"label": "copy"})]
     assert plan("read copy") == [read("copy")]
-
-
-def test_copy_accepts_letters_of_any_script_and_common_punctuation() -> None:
-    text = "10\u20ac \u2014 \u201cok\u201d \u041f\u0440\u0438\u0432\u0435\u0442 \u4e16\u754c"
-    assert plan('copy "' + text + '"') == [copy(text)]

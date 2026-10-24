@@ -165,7 +165,7 @@ def test_a_job_is_planned_and_every_call_is_sent_in_order() -> None:
     assert len(set(ids)) == 2
     assert run.results == [
         {
-            "protocol": 2,
+            "protocol": 3,
             "type": "job_result",
             "job_id": support.JOB_ID,
             "outcome": "completed",

@@ -3,7 +3,7 @@
 //! Every frame is a JSON object with a `protocol` field and a `type` tag:
 //!
 //! ```json
-//! {"protocol":2,"type":"tool_request","request_id":"r1","job_id":"…","tool":"system.info","args":{}}
+//! {"protocol":3,"type":"tool_request","request_id":"r1","job_id":"…","tool":"system.info","args":{}}
 //! ```
 
 use std::fmt;
@@ -338,13 +338,13 @@ mod tests {
     #[test]
     fn decodes_hello_and_tool_request() {
         let hello = decode_worker_message(&frame(json!({
-            "protocol": 2, "type": "hello", "worker": "jarvis-worker", "worker_version": "0.1.0"
+            "protocol": 3, "type": "hello", "worker": "jarvis-worker", "worker_version": "0.1.0"
         })))
         .unwrap();
         assert!(matches!(hello, WorkerMessage::Hello(_)));
 
         let request = decode_worker_message(&frame(json!({
-            "protocol": 2, "type": "tool_request", "request_id": "r1",
+            "protocol": 3, "type": "tool_request", "request_id": "r1",
             "job_id": JOB, "tool": "system.info", "args": {}
         })))
         .unwrap();
@@ -358,14 +358,14 @@ mod tests {
             worker_version: Label::try_from("1".to_owned()).unwrap(),
         });
         let bytes = encode_worker_message(&message).unwrap();
-        assert!(bytes.starts_with(br#"{"protocol":2,"type":"hello""#));
+        assert!(bytes.starts_with(br#"{"protocol":3,"type":"hello""#));
         assert_eq!(decode_worker_message(&bytes).unwrap(), message);
     }
 
     #[test]
     fn version_is_checked_before_schema() {
         let error = decode_worker_message(&frame(json!({
-            "protocol": 3, "type": "something_new", "request_id": "r9"
+            "protocol": 4, "type": "something_new", "request_id": "r9"
         })))
         .unwrap_err();
         assert_eq!(error.code(), ErrorCode::UnsupportedProtocolVersion);
@@ -381,7 +381,7 @@ mod tests {
             json!({"policy": "allow"}),
         ] {
             let mut value = json!({
-                "protocol": 2, "type": "tool_request", "request_id": "r1",
+                "protocol": 3, "type": "tool_request", "request_id": "r1",
                 "job_id": JOB, "tool": "system.info", "args": {}
             });
             value
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn workers_cannot_send_core_messages() {
         let error = decode_worker_message(&frame(json!({
-            "protocol": 2, "type": "welcome", "session_id": SessionId::new(),
+            "protocol": 3, "type": "welcome", "session_id": SessionId::new(),
             "core_version": "0", "tools": [],
             "limits": {"max_frame_bytes": 1, "tool_timeout_ms": 1, "max_requests": 1}
         })))
@@ -415,12 +415,12 @@ mod tests {
             b"{}",
             br#"{"protocol":"2","type":"hello","worker":"w","worker_version":"1"}"#,
             br#"{"protocol":-1,"type":"hello","worker":"w","worker_version":"1"}"#,
-            br#"{"protocol":2}"#,
-            br#"{"protocol":2,"type":"hello"}"#,
-            br#"{"protocol":2,"type":"tool_request","request_id":"r1","tool":"system.info","args":{}}"#,
-            br#"{"protocol":2,"type":"hello","worker":"bad name","worker_version":"1"}"#,
-            br#"{"protocol":2,"type":"tool_request","request_id":"r 1","job_id":"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b","tool":"system.info","args":{}}"#,
-            br#"{"protocol":2,"type":"tool_request","request_id":"r1","job_id":"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b","tool":"System","args":{}}"#,
+            br#"{"protocol":3}"#,
+            br#"{"protocol":3,"type":"hello"}"#,
+            br#"{"protocol":3,"type":"tool_request","request_id":"r1","tool":"system.info","args":{}}"#,
+            br#"{"protocol":3,"type":"hello","worker":"bad name","worker_version":"1"}"#,
+            br#"{"protocol":3,"type":"tool_request","request_id":"r 1","job_id":"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b","tool":"system.info","args":{}}"#,
+            br#"{"protocol":3,"type":"tool_request","request_id":"r1","job_id":"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b","tool":"System","args":{}}"#,
             b"\xff\xfe{}",
         ];
         for case in cases {

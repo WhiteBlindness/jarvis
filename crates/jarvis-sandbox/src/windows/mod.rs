@@ -29,7 +29,8 @@ use std::ptr::{null, null_mut};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LUID, LocalFree, STILL_ACTIVE,
+    CloseHandle, ERROR_CANNOT_IMPERSONATE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LUID,
+    LocalFree, STILL_ACTIVE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -60,7 +61,7 @@ use windows_sys::Win32::System::SystemServices::{
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, GetExitCodeProcess, GetProcessMitigationPolicy,
     OpenProcess, OpenProcessToken, OpenThreadToken, PROCESS_QUERY_LIMITED_INFORMATION,
-    ProcessSystemCallDisablePolicy,
+    PROCESS_SYNCHRONIZE, ProcessSystemCallDisablePolicy, WaitForSingleObject,
 };
 
 use crate::{Confinement, PipeClient, Report};
@@ -457,6 +458,26 @@ impl Guard {
     }
 }
 
+/// A process watched through a handle, so that a reused process ID can never
+/// be mistaken for it.
+#[derive(Debug)]
+pub(crate) struct Watched(Handle);
+
+pub(crate) fn watch_process(pid: u32) -> io::Result<Watched> {
+    // SAFETY: opens the process only to wait for its end.
+    let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    Handle::new(raw)
+        .map(Watched)
+        .ok_or_else(io::Error::last_os_error)
+}
+
+impl Watched {
+    pub(crate) fn has_exited(&self) -> bool {
+        // SAFETY: valid process handle; a zero timeout only polls.
+        unsafe { WaitForSingleObject(self.0.0, 0) == WAIT_OBJECT_0 }
+    }
+}
+
 pub(crate) fn process_exists(pid: u32) -> bool {
     let Some(process) = Handle::new(
         // SAFETY: opens the process for a query only.
@@ -503,6 +524,15 @@ fn pipe_client_token(pipe: RawHandle) -> io::Result<Handle> {
     // SAFETY: `pipe` is a connected named pipe server handle owned by the
     // caller for the duration of the call.
     let ok = unsafe { ImpersonateNamedPipeClient(pipe as HANDLE) };
+    if ok == 0 && io::Error::last_os_error().raw_os_error() == Some(ERROR_CANNOT_IMPERSONATE as i32)
+    {
+        // A client that opened the pipe without security flags can be
+        // impersonated only once something has been read from the pipe.
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the client has not sent anything yet",
+        ));
+    }
     check(ok, "ImpersonateNamedPipeClient")?;
     let _revert = Revert;
     let mut raw = null_mut();

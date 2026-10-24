@@ -25,3 +25,4 @@ Short records of decisions that shape the codebase. Each one states the context,
 | [0019](0019-session-agent-channel.md) | The first Session Agent: a Core-owned channel and one synthetic operation (implements part of 0017) |
 | [0020](0020-clipboard-write.md) | The first desktop operation: writing approved text to the clipboard; typing stays closed |
 | [0021](0021-local-inference.md) | A local model brokered by the Core, with no authority (amends 0006 for conversation and a desktop client) |
+| [0022](0022-clipboard-payloads.md) | Clipboard text is held as a temporary payload, never in immutable records (amends 0020 and 0021) |

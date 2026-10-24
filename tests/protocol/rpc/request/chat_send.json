@@ -1,5 +1,5 @@
 {
-  "rpc": 3,
+  "rpc": 4,
   "type": "chat_send",
   "conversation_id": null,
   "text": "Olá Donna,\ntens um minuto?",

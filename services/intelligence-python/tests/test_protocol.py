@@ -102,7 +102,7 @@ def test_protocol_may_not_be_a_boolean_even_though_true_is_an_int() -> None:
     )
 
 
-@pytest.mark.parametrize("version", [0, 1, 3, 99, 2**64 - 1])
+@pytest.mark.parametrize("version", [0, 1, 2, 4, 99, 2**64 - 1])
 def test_another_protocol_version_is_unsupported(version: int) -> None:
     assert_rejected(
         mutated(WELCOME, set_path("protocol", value=version)),
@@ -111,7 +111,7 @@ def test_another_protocol_version_is_unsupported(version: int) -> None:
 
 
 def test_version_is_checked_before_the_schema() -> None:
-    frame = b'{"protocol":3,"type":"something_new","anything":[1,2,3]}'
+    frame = b'{"protocol":4,"type":"something_new","anything":[1,2,3]}'
     assert_rejected(frame, ErrorCode.UNSUPPORTED_PROTOCOL_VERSION)
 
 
@@ -120,7 +120,7 @@ def test_missing_protocol_is_malformed() -> None:
 
 
 def test_the_current_version_is_two() -> None:
-    assert PROTOCOL_VERSION == 2
+    assert PROTOCOL_VERSION == 3
 
 
 # --- frame shape -------------------------------------------------------------------------------
@@ -133,15 +133,15 @@ def test_the_current_version_is_two() -> None:
         b"   ",
         b"not json",
         b"{",
-        b'{"protocol":2,}',
+        b'{"protocol":3,}',
         b"[1,2,3]",
         b'"hello"',
         b"1",
         b"null",
         b"true",
         b"{}",
-        b'{"protocol":2}',
-        b'{"protocol":2,"type":"welcome"}',
+        b'{"protocol":3}',
+        b'{"protocol":3,"type":"welcome"}',
     ],
 )
 def test_frames_that_are_not_messages_are_malformed(frame: bytes) -> None:
@@ -152,7 +152,7 @@ def test_frames_that_are_not_messages_are_malformed(frame: bytes) -> None:
     "frame",
     [
         b"\xff\xfe{}",
-        b'{"protocol":2,"type":"error","x":"\xc3("}',
+        b'{"protocol":3,"type":"error","x":"\xc3("}',
         "{}".encode("utf-16"),
         "{}".encode("utf-32"),
         b"\xef\xbb\xbf" + support.to_frame(ERROR),
@@ -175,13 +175,13 @@ def test_non_finite_numbers_are_not_json(constant: str) -> None:
 @pytest.mark.parametrize("number", ["NaN", "Infinity", "1e999", "-1e999"])
 def test_json_is_checked_before_the_version(number: str) -> None:
     """Numbers JSON cannot represent make the frame malformed even if it is from another version."""
-    frame = b'{"protocol":3,"type":"welcome","extra":' + number.encode() + b"}"
+    frame = b'{"protocol":4,"type":"welcome","extra":' + number.encode() + b"}"
     assert_rejected(frame)
 
 
 def test_deeply_nested_json_is_malformed_not_a_crash() -> None:
     assert_rejected(b"[" * 100_000)
-    assert_rejected(b'{"protocol":2,"type":"error","x":' + b"[" * 100_000)
+    assert_rejected(b'{"protocol":3,"type":"error","x":' + b"[" * 100_000)
 
 
 def test_lone_surrogates_are_malformed() -> None:
@@ -488,19 +488,19 @@ def test_non_ascii_text_survives_decoding() -> None:
 def test_encoding_is_compact_with_protocol_and_type_first() -> None:
     hello = encode_worker_message(Hello("jarvis-worker", "0.2.0"))
     assert hello == (
-        b'{"protocol":2,"type":"hello","worker":"jarvis-worker","worker_version":"0.2.0"}'
+        b'{"protocol":3,"type":"hello","worker":"jarvis-worker","worker_version":"0.2.0"}'
     )
     request = encode_worker_message(
         ToolRequest("req-1", JOB, "filesystem.read_fixture", {"path": "a/b.txt"})
     )
     assert request == (
-        b'{"protocol":2,"type":"tool_request","request_id":"req-1",'
+        b'{"protocol":3,"type":"tool_request","request_id":"req-1",'
         b'"job_id":"' + JOB.encode() + b'",'
         b'"tool":"filesystem.read_fixture","args":{"path":"a/b.txt"}}'
     )
     result = encode_worker_message(JobResult(JOB, JobOutcome.FAILED, "0 call(s)"))
     assert result == (
-        b'{"protocol":2,"type":"job_result","job_id":"' + JOB.encode() + b'",'
+        b'{"protocol":3,"type":"job_result","job_id":"' + JOB.encode() + b'",'
         b'"outcome":"failed","summary":"0 call(s)"}'
     )
 

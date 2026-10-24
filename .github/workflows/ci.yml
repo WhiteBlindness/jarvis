@@ -80,6 +80,42 @@ jobs:
           & $core isolation remove --config $config
           & $core isolation remove --config $config
 
+  desktop:
+    name: Desktop app (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/donna
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/donna/package-lock.json
+      - run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Type check
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      # Also produces the dist folder the Tauri crate embeds.
+      - name: Build frontend
+        run: npm run build
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/donna/src-tauri
+      - name: Format
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
   msrv:
     name: Minimum Rust version
     runs-on: ubuntu-latest

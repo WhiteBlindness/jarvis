@@ -70,6 +70,9 @@ pub struct InferenceConfig {
     /// them until a person deletes them.
     pub retention_days: u32,
     pub load_on_start: bool,
+    /// A warm-up after each load measures generation speed; a GPU model
+    /// below this many tokens per second is reported as slow (0: never).
+    pub slow_below_tokens_per_second: u32,
 }
 
 /// One model file and how to run it.
@@ -301,6 +304,7 @@ struct RawInference {
     reply_timeout_ms: Option<u64>,
     retention_days: Option<u32>,
     load_on_start: Option<bool>,
+    slow_below_tokens_per_second: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -832,6 +836,12 @@ fn inference_config(
             36_500,
         )?,
         load_on_start: raw.load_on_start.unwrap_or(true),
+        slow_below_tokens_per_second: within(
+            "inference.slow_below_tokens_per_second",
+            raw.slow_below_tokens_per_second.unwrap_or(30),
+            0,
+            1000,
+        )?,
     })
 }
 

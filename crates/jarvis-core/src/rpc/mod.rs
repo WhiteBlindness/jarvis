@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jarvis_protocol::{
-    AuditEventKind, DecodeError, HealthReport, JobView, ProtocolVersion, RpcError, RpcErrorCode,
-    RpcRequest, RpcResponse, RpcVersion, WorkerState, decode_rpc_request, encode_rpc_response,
+    ApprovalView, AuditEventKind, DecodeError, HealthReport, JobView, ProtocolVersion, RpcError,
+    RpcErrorCode, RpcRequest, RpcResponse, RpcVersion, WorkerState, decode_rpc_request,
+    encode_rpc_response,
 };
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::sync::Semaphore;
@@ -231,27 +232,14 @@ async fn handle(state: &RpcState, request: RpcRequest, peer: &Peer) -> RpcRespon
     let result = match request {
         RpcRequest::Health {} => health(state).await,
         RpcRequest::SubmitJob { goal } => {
-            if state.hub.worker().state == WorkerState::Failed {
-                Err(RpcError::new(
-                    RpcErrorCode::Unavailable,
-                    "the worker failed and is no longer restarted",
-                ))
-            } else {
-                let client = peer.describe();
-                let submitted = state
-                    .store
-                    .call(move |s| s.submit_job(&goal, &client))
-                    .await;
-                match submitted {
-                    Ok(job) => {
-                        tracing::info!(job = %job.job_id, client = %peer.describe(), "job submitted");
-                        state.hub.jobs.notify_one();
-                        state.hub.changed();
-                        Ok(RpcResponse::Job(job_view(job)))
-                    }
-                    Err(error) => Err(internal(&error)),
-                }
-            }
+            submit(state, peer, move |s, client| s.submit_job(&goal, client)).await
+        }
+        // The text is kept as a temporary payload, never in the job (ADR 0022).
+        RpcRequest::SubmitClipboardJob { text } => {
+            submit(state, peer, move |s, client| {
+                s.submit_clipboard_job(&text, client)
+            })
+            .await
         }
         RpcRequest::GetJob { job_id, wait_ms } => {
             wait_for(state, wait_ms, || {
@@ -282,13 +270,17 @@ async fn handle(state: &RpcState, request: RpcRequest, peer: &Peer) -> RpcRespon
             wait_for(state, wait_ms, || {
                 let store = state.store.clone();
                 async move {
-                    match store.call(Store::pending_approvals).await {
-                        Ok(records) => {
+                    let viewed = store
+                        .call(|s| {
                             let now = now_ms();
-                            let approvals: Vec<_> = records
+                            Ok(s.pending_approvals()?
                                 .iter()
-                                .map(|record| approval::view(record, now))
-                                .collect();
+                                .map(|record| approval::view(record, now, s))
+                                .collect::<Vec<_>>())
+                        })
+                        .await;
+                    match viewed {
+                        Ok(approvals) => {
                             Ok((!approvals.is_empty(), RpcResponse::Approvals { approvals }))
                         }
                         Err(error) => Err(internal(&error)),
@@ -298,8 +290,15 @@ async fn handle(state: &RpcState, request: RpcRequest, peer: &Peer) -> RpcRespon
             .await
         }
         RpcRequest::GetApproval { approval_id } => {
-            match state.store.call(move |s| s.approval(approval_id)).await {
-                Ok(Some(record)) => Ok(RpcResponse::Approval(approval::view(&record, now_ms()))),
+            let viewed = state
+                .store
+                .call(move |s| {
+                    Ok(s.approval(approval_id)?
+                        .map(|record| approval::view(&record, now_ms(), s)))
+                })
+                .await;
+            match viewed {
+                Ok(Some(view)) => Ok(RpcResponse::Approval(view)),
                 Ok(None) => Err(RpcError::new(RpcErrorCode::NotFound, "no such approval")),
                 Err(error) => Err(internal(&error)),
             }
@@ -311,7 +310,12 @@ async fn handle(state: &RpcState, request: RpcRequest, peer: &Peer) -> RpcRespon
             let client = peer.describe();
             let granted = state
                 .store
-                .call(move |s| Ok(s.grant_approval(approval_id, &fingerprint, &client, now_ms())))
+                .call(move |s| {
+                    Ok(
+                        s.grant_approval(approval_id, &fingerprint, &client, now_ms())
+                            .map(|record| approval::view(&record, now_ms(), s)),
+                    )
+                })
                 .await;
             decided(state, approval_id, granted, "approved")
         }
@@ -322,7 +326,10 @@ async fn handle(state: &RpcState, request: RpcRequest, peer: &Peer) -> RpcRespon
             let client = peer.describe();
             let denied = state
                 .store
-                .call(move |s| Ok(s.deny_approval(approval_id, &reason, &client, now_ms())))
+                .call(move |s| {
+                    Ok(s.deny_approval(approval_id, &reason, &client, now_ms())
+                        .map(|record| approval::view(&record, now_ms(), s)))
+                })
                 .await;
             decided(state, approval_id, denied, "denied")
         }
@@ -344,6 +351,33 @@ async fn handle(state: &RpcState, request: RpcRequest, peer: &Peer) -> RpcRespon
         chat => chat_request(state, chat).await,
     };
     result.unwrap_or_else(RpcResponse::Error)
+}
+
+/// Queue a job, unless the worker has failed for good, and wake the session
+/// that waits for one.
+async fn submit<F>(state: &RpcState, peer: &Peer, queue: F) -> Result<RpcResponse, RpcError>
+where
+    F: FnOnce(&Store, &str) -> Result<JobRecord, StoreError> + Send + 'static,
+{
+    if state.hub.worker().state == WorkerState::Failed {
+        return Err(RpcError::new(
+            RpcErrorCode::Unavailable,
+            "the worker failed and is no longer restarted",
+        ));
+    }
+    let client = peer.describe();
+    match state.store.call(move |s| queue(s, &client)).await {
+        Ok(job) => {
+            tracing::info!(job = %job.job_id, client = %peer.describe(), "job submitted");
+            state.hub.jobs.notify_one();
+            state.hub.changed();
+            Ok(RpcResponse::Job(job_view(job)))
+        }
+        Err(error @ StoreError::TooManyPayloads(_)) => {
+            Err(RpcError::new(RpcErrorCode::Unavailable, error.to_string()))
+        }
+        Err(error) => Err(internal(&error)),
+    }
 }
 
 /// The conversation and model operations (ADR 0021). None of them runs a
@@ -394,6 +428,9 @@ async fn chat_request(state: &RpcState, request: RpcRequest) -> Result<RpcRespon
         RpcRequest::SetContextSize { context_size } => {
             RpcResponse::Inference(inference.set_context_size(context_size).await?)
         }
+        RpcRequest::SetRetention { days } => {
+            RpcResponse::Inference(inference.set_retention(days).await?)
+        }
         _ => {
             return Err(RpcError::new(
                 RpcErrorCode::Internal,
@@ -429,16 +466,16 @@ impl From<InferenceError> for RpcError {
 fn decided(
     state: &RpcState,
     approval_id: jarvis_protocol::ApprovalId,
-    result: Result<Result<crate::store::ApprovalRecord, ApprovalError>, StoreError>,
+    result: Result<Result<ApprovalView, ApprovalError>, StoreError>,
     verb: &str,
 ) -> Result<RpcResponse, RpcError> {
     // Whatever happened, the waiting session must look again.
     state.hub.approvals.notify(approval_id);
     state.hub.changed();
     match result {
-        Ok(Ok(record)) => {
+        Ok(Ok(view)) => {
             tracing::info!(approval = %approval_id, "approval {verb}");
-            Ok(RpcResponse::Approval(approval::view(&record, now_ms())))
+            Ok(RpcResponse::Approval(view))
         }
         Ok(Err(error)) => Err(approval_error(&error)),
         Err(error) => Err(internal(&error)),

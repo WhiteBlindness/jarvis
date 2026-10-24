@@ -51,6 +51,27 @@ describe("strings", () => {
     expect(Object.values(pt).join("\n").toLowerCase()).not.toContain("descarreg");
   });
 
+  it("explains a slow graphics card in both languages", () => {
+    expect(translate("pt", "slowBody", { tps: "17.1" })).toBe(
+      "A placa gráfica está lenta (~17.1 tok/s): parte do modelo ficou fora da memória de vídeo. Recarregar pode ajudar; se continuar lenta, fecha aplicações que usem a placa gráfica ou termina a sessão do Windows.",
+    );
+    expect(translate("en", "slowBody", { tps: "17.1" })).toContain("~17.1 tok/s");
+    expect(pt.reloadModel).toBe("Recarregar modelo");
+    expect(pt.retentionKeep).toBe("Manter");
+    expect(pt.clipboardBody).toContain("não fica guardado");
+  });
+
+  it("warns that exported files may sync and keeps the retention confirmation plural-aware", () => {
+    expect(pt.storageBody).toContain("nuvem");
+    expect(en.storageBody).toContain("syncs with the cloud");
+    expect(translate("pt", "retentionConfirmMany", { n: 3, days: 30 })).toBe(
+      "Isto apaga já 3 conversas sem atividade há mais de 30 dias. Continuar?",
+    );
+    expect(translate("pt", "retentionConfirmOne", { n: 1, days: 7 })).toContain("1 conversa sem");
+    expect(translate("pt", "retentionConfirmZero", { days: 7 })).toContain("nada é apagado");
+    expect(translate("en", "retentionConfirmOne", { n: 1, days: 7 })).toContain("1 conversation inactive");
+  });
+
   it("does not claim conversations are kept forever", () => {
     expect(pt.storageBody).toContain("retenção");
     expect(en.storageBody).toContain("retention");

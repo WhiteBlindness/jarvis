@@ -1,4 +1,4 @@
 {
-  "frame": "{\"rpc\":3,\"type\":\"run_command\",\"command\":\"id\"}",
+  "frame": "{\"rpc\":4,\"type\":\"run_command\",\"command\":\"id\"}",
   "error": "malformed_frame"
 }

@@ -85,7 +85,7 @@ pipe = {pipe:?}
 }
 
 /// A reply from a Core of the previous RPC version.
-const OLD_CORE_REPLY: &str = r#"{"rpc":2,"type":"shutting_down"}"#;
+const OLD_CORE_REPLY: &str = r#"{"rpc":3,"type":"shutting_down"}"#;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_cli_tells_a_person_which_versions_disagree() {
@@ -100,7 +100,7 @@ async fn the_cli_tells_a_person_which_versions_disagree() {
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(output.stdout.is_empty());
     assert!(
-        stderr.contains("speaks RPC version 2") && stderr.contains("version 3"),
+        stderr.contains("speaks RPC version 3") && stderr.contains("version 4"),
         "{stderr}"
     );
     assert!(stderr.contains("same build"), "{stderr}");
@@ -115,8 +115,8 @@ async fn the_client_names_both_versions_and_does_not_downgrade() {
         matches!(
             error,
             ClientError::VersionMismatch {
-                found: 2,
-                expected: 3
+                found: 3,
+                expected: 4
             }
         ),
         "{error:?}"
@@ -129,8 +129,8 @@ async fn the_client_names_both_versions_and_does_not_downgrade() {
 #[tokio::test(flavor = "multi_thread")]
 async fn decoding_stays_strict_at_the_right_version() {
     for reply in [
-        r#"{"rpc":3,"type":"shutting_down","extra":true}"#,
-        r#"{"rpc":3,"type":"something_new"}"#,
+        r#"{"rpc":4,"type":"shutting_down","extra":true}"#,
+        r#"{"rpc":4,"type":"something_new"}"#,
         r#"{"type":"shutting_down"}"#,
     ] {
         let core = stand_in_core(reply);
@@ -145,7 +145,7 @@ async fn decoding_stays_strict_at_the_right_version() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reply_of_the_right_version_is_accepted() {
-    let core = stand_in_core(r#"{"rpc":3,"type":"shutting_down"}"#);
+    let core = stand_in_core(r#"{"rpc":4,"type":"shutting_down"}"#);
     let mut client = Client::connect(&core.endpoint).await.unwrap();
     let reply = client.call(&RpcRequest::Health {}).await.unwrap();
     assert_eq!(reply, jarvis_protocol::RpcResponse::ShuttingDown {});

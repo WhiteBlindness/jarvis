@@ -22,7 +22,7 @@ use crate::text::{check_plain, check_visible};
 fn visible_line(kind: &str, value: &str, min: usize, max: usize) -> Result<(), String> {
     check_visible(kind, value, min, max, false)
 }
-use crate::{ApprovalId, Label};
+use crate::{ApprovalId, Fingerprint, Label, PayloadId};
 
 macro_rules! visible_text {
     ($(#[$doc:meta])* $name:ident, $kind:literal, min = $min:expr, max = $max:expr, check = $check:expr) => {
@@ -132,11 +132,16 @@ pub struct CaptureWindowArgs {
 pub struct ReadClipboardTextArgs {}
 
 /// Arguments of `desktop.write_clipboard_text`: replace the clipboard's
-/// content with this text, exactly as given: a line end stays `\n`.
+/// content with the text held under `payload_id`, exactly as stored: a line
+/// end stays `\n`. The request names the text and binds it by its SHA-256;
+/// it never carries the text, so neither the worker nor the task record
+/// holds it (ADR 0022). The Core resolves the payload, checks that its
+/// SHA-256 is `sha256`, and refuses otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WriteClipboardTextArgs {
-    pub text: ClipboardText,
+    pub payload_id: PayloadId,
+    pub sha256: Fingerprint,
 }
 
 /// Arguments of `desktop.type_text`: type text into one picked window. No

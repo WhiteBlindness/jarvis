@@ -11,9 +11,9 @@ use jarvis_core::rpc::client::Client;
 use jarvis_core::store::Store;
 use jarvis_core::{daemon, isolation};
 use jarvis_protocol::{
-    ApprovalId, ApprovalStatus, ApprovalView, ChatLanguage, ChatText, ConversationId, Fingerprint,
-    Goal, GovernorPhase, GovernorReason, GovernorView, HealthReport, JobId, JobStatus, JobView,
-    MessageStatus, RpcError, RpcRequest, RpcResponse, Summary, TaskId,
+    ApprovalId, ApprovalStatus, ApprovalView, ChatLanguage, ChatText, ClipboardText,
+    ConversationId, Fingerprint, Goal, GovernorPhase, GovernorReason, GovernorView, HealthReport,
+    JobId, JobStatus, JobView, MessageStatus, RpcError, RpcRequest, RpcResponse, Summary, TaskId,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -54,6 +54,12 @@ enum Command {
         config: ConfigArg,
         #[arg(long, value_enum, default_value_t = LogFormat::Text)]
         log_format: LogFormat,
+        /// Stop, as on Ctrl+C, when the process with this ID exits. The
+        /// desktop app passes its own ID when it starts the Core, so that a
+        /// Core it started never outlives it; a Core started any other way
+        /// is not affected.
+        #[arg(long, value_name = "PID")]
+        exit_with: Option<u32>,
     },
     /// Show the health of the running Core and its worker.
     Health {
@@ -68,6 +74,23 @@ enum Command {
         config: ConfigArg,
         /// What the worker should do, in one line.
         goal: String,
+        /// Wait until the job has finished.
+        #[arg(long)]
+        wait: bool,
+        /// Longest time to wait with `--wait`.
+        #[arg(long, default_value = "10m")]
+        timeout: humantime::Duration,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Queue a job that copies this text to the clipboard once you approve
+    /// it (ADR 0022). The text is held by the Core only until the job ends
+    /// and is never written into the job.
+    Clipboard {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// The text to copy: up to 1024 characters of plain text.
+        text: String,
         /// Wait until the job has finished.
         #[arg(long)]
         wait: bool,
@@ -232,9 +255,13 @@ const POLL: Duration = Duration::from_secs(55);
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Serve { config, log_format } => {
+        Command::Serve {
+            config,
+            log_format,
+            exit_with,
+        } => {
             init_logging(log_format);
-            let result = serve(&config.config);
+            let result = serve(&config.config, exit_with);
             if let Err(error) = &result {
                 // The log is where an operator of the Core looks.
                 tracing::error!("{error:#}");
@@ -287,12 +314,27 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 }
 
 /// Returns false if the worker exhausted its restart budget.
-fn serve(config_path: &Path) -> anyhow::Result<bool> {
+fn serve(config_path: &Path, exit_with: Option<u32>) -> anyhow::Result<bool> {
     let config = Config::load(config_path)?;
+    // Opened before anything starts: a parent that is already gone means
+    // nobody is waiting for this Core.
+    let parent = exit_with
+        .map(|pid| {
+            let watched = jarvis_sandbox::WatchedProcess::new(pid)
+                .with_context(|| format!("process {pid} (--exit-with) cannot be watched"))?;
+            if watched.has_exited() {
+                bail!("process {pid} (--exit-with) has already exited");
+            }
+            Ok(watched)
+        })
+        .transpose()?;
     let runtime = runtime()?;
     let outcome = runtime.block_on(async {
         let shutdown = CancellationToken::new();
         let signal = tokio::spawn(cancel_on_signal(shutdown.clone()));
+        if let Some(parent) = parent {
+            tokio::spawn(cancel_when_exited(parent, shutdown.clone()));
+        }
         let result = daemon::serve(&config, shutdown, |endpoint| {
             // The line tests and scripts wait for. Clients can connect now.
             let mut stdout = std::io::stdout().lock();
@@ -308,6 +350,22 @@ fn serve(config_path: &Path) -> anyhow::Result<bool> {
     // process alive: dropping a runtime waits for blocking threads.
     runtime.shutdown_timeout(Duration::from_secs(5));
     outcome
+}
+
+/// Stop the Core once the process it was told to follow has exited.
+async fn cancel_when_exited(parent: jarvis_sandbox::WatchedProcess, shutdown: CancellationToken) {
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+        if parent.has_exited() {
+            tracing::info!("the process this Core follows (--exit-with) has exited; stopping");
+            shutdown.cancel();
+            return;
+        }
+    }
 }
 
 fn isolation(command: IsolationCommand) -> anyhow::Result<bool> {
@@ -429,6 +487,13 @@ fn client_command(command: Command) -> anyhow::Result<bool> {
                 timeout,
                 json,
             } => submit(&config.config, goal, wait.then_some(*timeout), json).await,
+            Command::Clipboard {
+                config,
+                text,
+                wait,
+                timeout,
+                json,
+            } => clipboard(&config.config, text, wait.then_some(*timeout), json).await,
             Command::Chat {
                 config,
                 message,
@@ -710,8 +775,35 @@ async fn submit(
     json: bool,
 ) -> anyhow::Result<bool> {
     let goal = Goal::try_from(goal).map_err(|error| anyhow::anyhow!("invalid goal: {error}"))?;
+    queue(config_path, &RpcRequest::SubmitJob { goal }, wait, json).await
+}
+
+async fn clipboard(
+    config_path: &Path,
+    text: String,
+    wait: Option<Duration>,
+    json: bool,
+) -> anyhow::Result<bool> {
+    let text = ClipboardText::try_from(text)
+        .map_err(|error| anyhow::anyhow!("invalid clipboard text: {error}"))?;
+    queue(
+        config_path,
+        &RpcRequest::SubmitClipboardJob { text },
+        wait,
+        json,
+    )
+    .await
+}
+
+/// Send a request that queues a job, and optionally wait for it to finish.
+async fn queue(
+    config_path: &Path,
+    request: &RpcRequest,
+    wait: Option<Duration>,
+    json: bool,
+) -> anyhow::Result<bool> {
     let mut client = connect(config_path).await?;
-    let job = expect_job(client.call(&RpcRequest::SubmitJob { goal }).await?)?;
+    let job = expect_job(client.call(request).await?)?;
     let Some(timeout) = wait else {
         print_job(&job, json)?;
         return Ok(true);

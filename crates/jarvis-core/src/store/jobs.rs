@@ -6,7 +6,8 @@ use jarvis_protocol::{
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::{
-    JobStep, Store, StoreError, TASK_COLUMNS, TaskRecord, count, insert_event, now, parse, raw_task,
+    JobStep, Store, StoreError, TASK_COLUMNS, TaskRecord, count, insert_event, now, parse,
+    payloads, raw_task,
 };
 
 /// A job as stored.
@@ -73,23 +74,16 @@ impl Store {
     pub fn submit_job(&self, goal: &Goal, client: &str) -> Result<JobRecord, StoreError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
-        let job_id = JobId::new();
-        let at = now();
-        tx.execute(
-            "INSERT INTO jobs (job_id, goal, submitted_by, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'queued', ?4, ?4)",
-            params![job_id.to_string(), goal.as_str(), client, at],
-        )?;
+        let job = insert_job(&tx, goal, client)?;
         insert_event(
             &tx,
             None,
             None,
             &AuditEventKind::JobSubmitted {
-                job_id,
+                job_id: job.job_id,
                 client: client.to_owned(),
             },
         )?;
-        let job = load(&tx, job_id)?.ok_or(StoreError::Corrupt("job vanished".into()))?;
         tx.commit()?;
         Ok(job)
     }
@@ -148,8 +142,11 @@ impl Store {
             JobStatus::Failed | JobStatus::Interrupted => uncertain_task(&tx, job_id)?,
             _ => None,
         };
-        close(&tx, job_id, status, summary, uncertain, session_id)?;
+        let had_payload = close(&tx, job_id, status, summary, uncertain, session_id)?;
         tx.commit()?;
+        if had_payload {
+            payloads::scrub(&conn);
+        }
         Ok(())
     }
 
@@ -166,8 +163,11 @@ impl Store {
     ) -> Result<JobStatus, StoreError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
-        let status = settle(&tx, job_id, max_attempts, session_id, reason)?;
+        let (status, had_payload) = settle(&tx, job_id, max_attempts, session_id, reason)?;
         tx.commit()?;
+        if had_payload {
+            payloads::scrub(&conn);
+        }
         Ok(status)
     }
 
@@ -259,6 +259,22 @@ impl Store {
     }
 }
 
+/// Insert a queued job. The caller records `job_submitted` in the same
+/// transaction.
+pub(super) fn insert_job(
+    tx: &Transaction<'_>,
+    goal: &Goal,
+    client: &str,
+) -> Result<JobRecord, StoreError> {
+    let job_id = JobId::new();
+    tx.execute(
+        "INSERT INTO jobs (job_id, goal, submitted_by, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'queued', ?4, ?4)",
+        params![job_id.to_string(), goal.as_str(), client, now()],
+    )?;
+    load(tx, job_id)?.ok_or(StoreError::Corrupt("job vanished".into()))
+}
+
 fn load(tx: &Transaction<'_>, job_id: JobId) -> Result<Option<JobRecord>, StoreError> {
     tx.query_row(
         &format!("{JOB_COLUMNS} WHERE job_id = ?1"),
@@ -271,8 +287,12 @@ fn load(tx: &Transaction<'_>, job_id: JobId) -> Result<Option<JobRecord>, StoreE
 }
 
 /// Start-up recovery for jobs: queued jobs stay as they are, and every job
-/// found running is settled like one whose session just ended.
-pub(super) fn settle_running(tx: &Transaction<'_>, max_attempts: u32) -> Result<u32, StoreError> {
+/// found running is settled like one whose session just ended. Returns how
+/// many were settled, and whether any of them lost a payload.
+pub(super) fn settle_running(
+    tx: &Transaction<'_>,
+    max_attempts: u32,
+) -> Result<(u32, bool), StoreError> {
     let running: Vec<String> = {
         let mut statement = tx.prepare(
             "SELECT job_id FROM jobs WHERE status = 'running' ORDER BY created_at, job_id",
@@ -280,11 +300,12 @@ pub(super) fn settle_running(tx: &Transaction<'_>, max_attempts: u32) -> Result<
         let rows = statement.query_map([], |row| row.get(0))?;
         rows.collect::<Result<_, _>>()?
     };
+    let mut had_payload = false;
     for job_id in &running {
         let reason = "the Core restarted while the job was running";
-        settle(tx, parse(job_id)?, max_attempts, None, reason)?;
+        had_payload |= settle(tx, parse(job_id)?, max_attempts, None, reason)?.1;
     }
-    Ok(count(running.len()))
+    Ok((count(running.len()), had_payload))
 }
 
 /// Decide what becomes of a running job whose worker or Core stopped. The one
@@ -298,14 +319,16 @@ pub(super) fn settle_running(tx: &Transaction<'_>, max_attempts: u32) -> Result<
 ///   job left over from before migration 0003): it has no ledger of steps, so
 ///   it cannot be resumed safely and ends `interrupted`.
 /// - The job has been claimed `max_attempts` times: `interrupted`.
-/// - Otherwise it goes back to the queue.
+/// - Otherwise it goes back to the queue, with its payload (ADR 0022).
+///
+/// Returns the job's new status and whether closing it deleted a payload.
 fn settle(
     tx: &Transaction<'_>,
     job_id: JobId,
     max_attempts: u32,
     session_id: Option<SessionId>,
     reason: &str,
-) -> Result<JobStatus, StoreError> {
+) -> Result<(JobStatus, bool), StoreError> {
     let current: Option<(String, u32)> = tx
         .query_row(
             "SELECT status, attempts FROM jobs WHERE job_id = ?1",
@@ -337,10 +360,10 @@ fn settle(
                 reason: reason.to_owned(),
             },
         )?;
-        return Ok(JobStatus::Queued);
+        return Ok((JobStatus::Queued, false));
     };
     let summary = Summary::lossy(&summary);
-    close(
+    let had_payload = close(
         tx,
         job_id,
         JobStatus::Interrupted,
@@ -348,7 +371,7 @@ fn settle(
         uncertain,
         session_id,
     )?;
-    Ok(JobStatus::Interrupted)
+    Ok((JobStatus::Interrupted, had_payload))
 }
 
 /// A task of the job that started executing and whose outcome is not known.
@@ -398,7 +421,9 @@ fn set_status(
 
 /// End a running job in `status`. The one place that does it: the status
 /// change, then `job_quarantined` when `uncertain` names a task that may have
-/// acted without a recorded result, then `job_finished`.
+/// acted without a recorded result, then `job_finished`. The job's clipboard
+/// payload, if it has one, is deleted in the same transaction (ADR 0022);
+/// the result says whether there was one, so the caller can scrub the log.
 fn close(
     tx: &Transaction<'_>,
     job_id: JobId,
@@ -406,8 +431,9 @@ fn close(
     summary: Option<&Summary>,
     uncertain: Option<TaskId>,
     session_id: Option<SessionId>,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     set_status(tx, job_id, status, summary)?;
+    let had_payload = payloads::delete_for_job(tx, job_id)?;
     if let Some(task_id) = uncertain {
         insert_event(
             tx,
@@ -422,7 +448,7 @@ fn close(
         None,
         &AuditEventKind::JobFinished { job_id, status },
     )?;
-    Ok(())
+    Ok(had_payload)
 }
 
 /// Put a task in the job's ledger. Runs inside the transaction that creates

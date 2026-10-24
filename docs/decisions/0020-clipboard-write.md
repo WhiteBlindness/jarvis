@@ -1,6 +1,6 @@
 # 0020. The first desktop operation: writing approved text to the clipboard
 
-**Status:** Accepted. Makes `desktop.write_clipboard_text` performable through the Session Agent of ADR 0019. The other desktop operations of ADR 0017, including typing, stay closed; the reasons for typing are recorded below.
+**Status:** Accepted. Makes `desktop.write_clipboard_text` performable through the Session Agent of ADR 0019. The other desktop operations of ADR 0017, including typing, stay closed; the reasons for typing are recorded below. Amended by ADR 0022: the request names the text by a payload and its SHA-256 instead of carrying it, so the text is no longer kept in the job or the task.
 
 ## Context
 

@@ -17,9 +17,9 @@ use jarvis_core::session::{SessionContext, SessionEnd, SessionError, SessionRepo
 use jarvis_core::session_agent::{Launched, Launcher, ProcessLauncher, SessionAgent};
 use jarvis_core::store::{ApprovalError, ApprovalRecord, Store, now_ms};
 use jarvis_protocol::{
-    AgentReport, ApprovalStatus, AuditEventKind, Capability, ClipboardWritten, CoreMessage,
-    ErrorCode, Fingerprint, Goal, JobId, JobStatus, PolicyDecision, Summary, TaskStatus, ToolCall,
-    ToolOutcome, ToolResult, decode_core_message,
+    AgentReport, ApprovalStatus, AuditEventKind, Capability, ClipboardText, ClipboardWritten,
+    CoreMessage, ErrorCode, Fingerprint, Goal, JobId, JobStatus, PolicyDecision, Summary,
+    TaskStatus, ToolCall, ToolOutcome, ToolResult, decode_core_message,
 };
 use jarvis_tools::{FixtureRoot, ToolExecutor, ToolFuture, Toolbox, WorkspaceRoot};
 use serde_json::{Value, json};
@@ -174,7 +174,7 @@ impl Harness {
     }
 
     async fn hello(&mut self) {
-        self.send(json!({"protocol": 2, "type": "hello", "worker": "test", "worker_version": "1"}))
+        self.send(json!({"protocol": 3, "type": "hello", "worker": "test", "worker_version": "1"}))
             .await;
         assert!(matches!(self.recv().await, CoreMessage::Welcome(_)));
     }
@@ -201,6 +201,27 @@ impl Harness {
         self.job("test").await;
     }
 
+    /// Queue a clipboard job as a client would and wait for the Core to hand
+    /// it over. Returns the arguments a planner derives from its goal.
+    async fn clipboard_job(&mut self, text: &str) -> Value {
+        let text = ClipboardText::try_from(text.to_owned()).unwrap();
+        let submitted = self
+            .store
+            .submit_clipboard_job(&text, "test client")
+            .unwrap();
+        self.hub.jobs.notify_one();
+        match self.recv().await {
+            CoreMessage::Job(job) => {
+                assert_eq!(job.job_id, submitted.job_id);
+                self.job = Some(job.job_id);
+                let rest = job.goal.as_str().strip_prefix("copy payload:").unwrap();
+                let (payload_id, sha256) = rest.split_once(':').unwrap();
+                json!({"payload_id": payload_id, "sha256": sha256})
+            }
+            other => panic!("expected a job, got {other:?}"),
+        }
+    }
+
     fn job_id(&self) -> JobId {
         self.job.expect("no job")
     }
@@ -208,7 +229,7 @@ impl Harness {
     async fn send_request(&mut self, id: &str, tool: &str, args: Value) {
         let job_id = self.job_id();
         self.send(json!({
-            "protocol": 2, "type": "tool_request", "request_id": id, "job_id": job_id,
+            "protocol": 3, "type": "tool_request", "request_id": id, "job_id": job_id,
             "tool": tool, "args": args
         }))
         .await;
@@ -235,7 +256,7 @@ impl Harness {
     async fn finish_job(&mut self, outcome: &str, summary: &str) {
         let job_id = self.job.take().expect("no job");
         self.send(json!({
-            "protocol": 2, "type": "job_result", "job_id": job_id,
+            "protocol": 3, "type": "job_result", "job_id": job_id,
             "outcome": outcome, "summary": summary
         }))
         .await;
@@ -431,20 +452,20 @@ async fn requests_and_results_must_belong_to_the_current_job() {
     let stranger = JobId::new();
     // No job yet.
     h.send(
-        json!({"protocol": 2, "type": "tool_request", "request_id": "r1",
+        json!({"protocol": 3, "type": "tool_request", "request_id": "r1",
         "job_id": stranger, "tool": "system.info", "args": {}}),
     )
     .await;
     h.expect_error(ErrorCode::UnexpectedMessage, false).await;
     h.job("test").await;
     h.send(
-        json!({"protocol": 2, "type": "tool_request", "request_id": "r2",
+        json!({"protocol": 3, "type": "tool_request", "request_id": "r2",
         "job_id": stranger, "tool": "system.info", "args": {}}),
     )
     .await;
     h.expect_error(ErrorCode::UnexpectedMessage, false).await;
     h.send(
-        json!({"protocol": 2, "type": "job_result", "job_id": stranger,
+        json!({"protocol": 3, "type": "job_result", "job_id": stranger,
         "outcome": "completed", "summary": ""}),
     )
     .await;
@@ -552,10 +573,10 @@ async fn malformed_frames_are_answered_and_session_continues() {
         &b"not json"[..],
         b"[1, 2, 3]",
         b"{}",
-        br#"{"protocol":2,"type":"shell","command":"id"}"#,
-        br#"{"protocol":2,"type":"tool_request","request_id":"r1","tool":"system.info","args":{}}"#,
-        br#"{"protocol":2,"type":"job","job_id":"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b","goal":"x"}"#,
-        br#"{"protocol":2,"type":"job_result","job_id":"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b","outcome":"approved","summary":""}"#,
+        br#"{"protocol":3,"type":"shell","command":"id"}"#,
+        br#"{"protocol":3,"type":"tool_request","request_id":"r1","tool":"system.info","args":{}}"#,
+        br#"{"protocol":3,"type":"job","job_id":"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b","goal":"x"}"#,
+        br#"{"protocol":3,"type":"job_result","job_id":"01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b","outcome":"approved","summary":""}"#,
         b"\xff\xfe\xfd",
     ] {
         h.send_raw(frame).await;
@@ -789,7 +810,7 @@ async fn duplicate_request_id_is_rejected() {
 
 #[tokio::test]
 async fn another_protocol_version_closes_the_session() {
-    for version in [1, 3] {
+    for version in [1, 2, 4] {
         let mut h = Harness::start(Options::default());
         h.send(json!({"protocol": version, "type": "hello", "worker": "w", "worker_version": "9"}))
             .await;
@@ -809,7 +830,7 @@ async fn version_change_mid_session_closes_session() {
     h.ready().await;
     let job = h.job_id();
     h.send(json!({
-        "protocol": 3, "type": "tool_request", "request_id": "r1", "job_id": job,
+        "protocol": 4, "type": "tool_request", "request_id": "r1", "job_id": job,
         "tool": "system.info", "args": {}
     }))
     .await;
@@ -829,7 +850,7 @@ async fn version_change_mid_session_closes_session() {
 async fn request_before_hello_is_fatal() {
     let mut h = Harness::start(Options::default());
     h.send(json!({
-        "protocol": 2, "type": "tool_request", "request_id": "r1", "job_id": JobId::new(),
+        "protocol": 3, "type": "tool_request", "request_id": "r1", "job_id": JobId::new(),
         "tool": "system.info", "args": {}
     }))
     .await;
@@ -844,7 +865,7 @@ async fn request_before_hello_is_fatal() {
 async fn second_hello_is_unexpected() {
     let mut h = Harness::start(Options::default());
     h.hello().await;
-    h.send(json!({"protocol": 2, "type": "hello", "worker": "again", "worker_version": "1"}))
+    h.send(json!({"protocol": 3, "type": "hello", "worker": "again", "worker_version": "1"}))
         .await;
     h.expect_error(ErrorCode::UnexpectedMessage, false).await;
     h.finish().await;
@@ -865,7 +886,7 @@ async fn worker_cannot_smuggle_authority() {
     h.ready().await;
     let job = h.job_id();
     let base = json!({
-        "protocol": 2, "type": "tool_request", "request_id": "r1", "job_id": job,
+        "protocol": 3, "type": "tool_request", "request_id": "r1", "job_id": job,
         "tool": "workspace.write_file", "args": write_args("a.txt", "x")
     });
     for (key, value) in [
@@ -938,7 +959,7 @@ async fn oversized_frame_is_rejected_and_session_continues() {
     let mut h = Harness::start(Options::default());
     h.ready().await;
     let huge = format!(
-        r#"{{"protocol":2,"type":"tool_request","request_id":"r1","job_id":"{}","tool":"system.info","args":{{"pad":"{}"}}}}"#,
+        r#"{{"protocol":3,"type":"tool_request","request_id":"r1","job_id":"{}","tool":"system.info","args":{{"pad":"{}"}}}}"#,
         h.job_id(),
         "x".repeat(Limits::default().max_frame_bytes)
     );
@@ -1078,7 +1099,7 @@ async fn worker_text_in_errors_is_escaped() {
         stored.message
     );
 
-    let mut frame = json!({"protocol": 2, "type": "tool_request", "request_id": "r2",
+    let mut frame = json!({"protocol": 3, "type": "tool_request", "request_id": "r2",
         "job_id": h.job_id(), "tool": "system.info", "args": {}});
     frame[hostile] = json!(1);
     h.send(frame).await;
@@ -1728,14 +1749,20 @@ fn clipboard_options(agent: Option<Arc<SessionAgent>>) -> Options {
 /// what the person is shown must be all of it, with layout made visible.
 const CLIPBOARD_TEXT: &str = "Demo: hello\n\tfrom the Session Agent \\ caf\u{e9} \u{20000}";
 
-/// Request a clipboard write and approve it after checking what the person
-/// is shown.
-async fn approved_clipboard_write(h: &mut Harness, id: &str, text: &str) -> ToolOutcome {
-    h.send_request(id, "desktop.write_clipboard_text", json!({ "text": text }))
+/// Request a clipboard write with the arguments a planner derives from a
+/// clipboard job (`Harness::clipboard_job`) and approve it after checking
+/// what the person is shown.
+async fn approved_clipboard_write(
+    h: &mut Harness,
+    id: &str,
+    args: Value,
+    text: &str,
+) -> ToolOutcome {
+    h.send_request(id, "desktop.write_clipboard_text", args)
         .await;
     let approval = h.pending_approval().await;
     assert_eq!(approval.capabilities, [Capability::DesktopClipboardWrite]);
-    let shown = jarvis_core::approval::view(&approval, now_ms());
+    let shown = jarvis_core::approval::view(&approval, now_ms(), &h.store);
     assert!(shown.arguments["action"].contains("clipboard"), "{shown:?}");
     assert_eq!(
         shown.arguments["text"],
@@ -1753,8 +1780,9 @@ async fn approved_clipboard_write(h: &mut Harness, id: &str, text: &str) -> Tool
 async fn an_approved_clipboard_write_is_shown_in_full_and_sent_once() {
     let (agent, launches, performs) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
     let mut h = Harness::start(clipboard_options(Some(agent)));
-    h.ready().await;
-    let outcome = approved_clipboard_write(&mut h, "c1", CLIPBOARD_TEXT).await;
+    h.hello().await;
+    let args = h.clipboard_job(CLIPBOARD_TEXT).await;
+    let outcome = approved_clipboard_write(&mut h, "c1", args, CLIPBOARD_TEXT).await;
     let ToolOutcome::Completed {
         result: ToolResult::AgentReceipt(receipt),
     } = outcome
@@ -1793,8 +1821,9 @@ async fn an_approved_clipboard_write_is_shown_in_full_and_sent_once() {
 async fn a_busy_clipboard_is_refused_and_never_retried() {
     let (agent, _, performs) = fake_agent(Fake::ClipboardBusy, Duration::from_secs(5), 4);
     let mut h = Harness::start(clipboard_options(Some(agent)));
-    h.ready().await;
-    let outcome = approved_clipboard_write(&mut h, "c1", "hello").await;
+    h.hello().await;
+    let args = h.clipboard_job("hello").await;
+    let outcome = approved_clipboard_write(&mut h, "c1", args, "hello").await;
     let ToolOutcome::Failed { error } = outcome else {
         panic!("expected a failure, got {outcome:?}");
     };
@@ -1811,8 +1840,9 @@ async fn an_unconfirmed_clipboard_write_fails_closed() {
     for behaviour in [Fake::ClipboardFault, Fake::ClipboardWrongLength] {
         let (agent, launches, performs) = fake_agent(behaviour, Duration::from_secs(5), 4);
         let mut h = Harness::start(clipboard_options(Some(agent)));
-        h.ready().await;
-        let outcome = approved_clipboard_write(&mut h, "c1", "hello").await;
+        h.hello().await;
+        let args = h.clipboard_job("hello").await;
+        let outcome = approved_clipboard_write(&mut h, "c1", args, "hello").await;
         let ToolOutcome::Failed { error } = outcome else {
             panic!("{behaviour:?}: expected a failure, got {outcome:?}");
         };
@@ -1857,14 +1887,27 @@ async fn other_desktop_operations_stay_closed_with_clipboard_writes_enabled() {
         let outcome = h.request(id, tool, args).await;
         assert!(matches!(outcome, ToolOutcome::Denied { .. }), "{outcome:?}");
     }
+    let payload = jarvis_protocol::PayloadId::new();
+    let sha256 = "ab".repeat(32);
     for (id, args) in [
         ("x1", json!({"text": ""})),
-        ("x2", json!({"text": "a\rb"})),
-        ("x3", json!({"text": "x".repeat(1025)})),
-        ("x4", json!({"text": "pay\u{202E}lap"})),
-        ("x6", json!({"text": "line\u{2028}break"})),
-        ("x7", json!({"text": "tag\u{E0041}"})),
-        ("x5", json!({"text": "hi", "target": 1})),
+        ("x2", json!({"text": "hello"})),
+        ("x3", json!({"payload_id": payload})),
+        ("x4", json!({"sha256": sha256})),
+        (
+            "x5",
+            json!({"payload_id": payload, "sha256": sha256, "text": "hi"}),
+        ),
+        (
+            "x6",
+            json!({"payload_id": payload, "sha256": sha256, "target": 1}),
+        ),
+        ("x7", json!({"payload_id": "not-a-uuid", "sha256": sha256})),
+        (
+            "x8",
+            json!({"payload_id": payload, "sha256": "AB".repeat(32)}),
+        ),
+        ("x9", json!({"payload_id": payload, "sha256": "ab"})),
     ] {
         let outcome = h.request(id, "desktop.write_clipboard_text", args).await;
         assert!(
@@ -1872,6 +1915,356 @@ async fn other_desktop_operations_stay_closed_with_clipboard_writes_enabled() {
             "{outcome:?}"
         );
     }
+    let (_, store, _) = h.finish().await;
+    assert!(store.pending_approvals().unwrap().is_empty());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
+// --- clipboard payloads (ADR 0022) --------------------------------------------------------------
+
+/// A text no other part of a test can contain.
+const CANARY: &str = "canary-4e1b7a90-clipboard";
+
+/// Every value of every table except `payloads`, read through a second
+/// connection to the same file.
+fn immutable_records(path: &std::path::Path) -> String {
+    use rusqlite::types::ValueRef;
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let tables: Vec<String> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table'
+                 AND name NOT LIKE 'sqlite_%' AND name <> 'payloads'",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let mut dump = String::new();
+    for table in tables {
+        let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        let columns = statement.column_count();
+        let mut rows = statement.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            for column in 0..columns {
+                match row.get_ref(column).unwrap() {
+                    ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                        dump.push_str(&String::from_utf8_lossy(bytes));
+                    }
+                    ValueRef::Integer(value) => dump.push_str(&value.to_string()),
+                    ValueRef::Real(value) => dump.push_str(&value.to_string()),
+                    ValueRef::Null => {}
+                }
+                dump.push('|');
+            }
+            dump.push('\n');
+        }
+    }
+    dump
+}
+
+/// Whether `needle` is anywhere in the database file or its log.
+fn on_disk(dir: &std::path::Path, needle: &str) -> bool {
+    ["jarvis.db", "jarvis.db-wal"].iter().any(|name| {
+        std::fs::read(dir.join(name)).is_ok_and(|bytes| {
+            bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())
+        })
+    })
+}
+
+fn payload_rows(dir: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(dir.join("jarvis.db"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM payloads", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// Wait until the store shows the job as ended.
+async fn job_ends(store: &Store, job: JobId) -> JobStatus {
+    for _ in 0..500 {
+        let status = store.job(job).unwrap().unwrap().status;
+        if status.is_terminal() {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the job did not end");
+}
+
+#[tokio::test]
+async fn an_approved_clipboard_text_never_enters_the_immutable_records() {
+    let (agent, _, performs) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.hello().await;
+    let text = format!("hello {CANARY}");
+    let args = h.clipboard_job(&text).await;
+    let path = h.dir.path().join("jarvis.db");
+    // Queued and running: the job and its goal name the text, never hold it.
+    assert!(!immutable_records(&path).contains(CANARY));
+
+    h.send_request("c1", "desktop.write_clipboard_text", args)
+        .await;
+    let approval = h.pending_approval().await;
+    // While a person decides, the text is shown but is in no record.
+    let shown = jarvis_core::approval::view(&approval, now_ms(), &h.store);
+    assert_eq!(shown.arguments["text"], text);
+    assert!(!immutable_records(&path).contains(CANARY));
+    assert!(
+        on_disk(h.dir.path(), CANARY),
+        "the payload holds it meanwhile"
+    );
+    h.grant(&approval, &approval.fingerprint).unwrap();
+    let outcome = h.response("c1").await;
+    assert!(
+        matches!(outcome, ToolOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(performs.load(Ordering::SeqCst), 1);
+
+    // Executed, the text is still in no record; the payload goes when the
+    // job does.
+    assert!(!immutable_records(&path).contains(CANARY));
+    let job = h.job_id();
+    h.finish_job("completed", "copied").await;
+    assert_eq!(job_ends(&h.store, job).await, JobStatus::Completed);
+    assert_eq!(payload_rows(h.dir.path()), 0);
+    assert!(!immutable_records(&path).contains(CANARY));
+    assert!(
+        !on_disk(h.dir.path(), CANARY),
+        "the text is in neither the database file nor its log"
+    );
+    // After the job, the approval view says so.
+    let later = h.store.approval(approval.approval_id).unwrap().unwrap();
+    let shown = jarvis_core::approval::view(&later, now_ms(), &h.store);
+    assert_eq!(shown.arguments["text"], "the text is no longer kept");
+    assert_eq!(shown.arguments["sha256"].len(), 64);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn the_payload_goes_with_its_job_when_the_request_is_declined_or_fails() {
+    // Declined by a person.
+    let (agent, _, performs) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.hello().await;
+    let args = h.clipboard_job(&format!("declined {CANARY}")).await;
+    h.send_request("c1", "desktop.write_clipboard_text", args)
+        .await;
+    let approval = h.pending_approval().await;
+    h.deny(&approval, "no").unwrap();
+    assert!(matches!(
+        h.response("c1").await,
+        ToolOutcome::Declined { .. }
+    ));
+    assert_eq!(payload_rows(h.dir.path()), 1, "kept until the job ends");
+    let job = h.job_id();
+    h.finish_job("failed", "declined").await;
+    assert_eq!(job_ends(&h.store, job).await, JobStatus::Failed);
+    assert_eq!(payload_rows(h.dir.path()), 0);
+    assert!(!on_disk(h.dir.path(), CANARY));
+    assert_eq!(performs.load(Ordering::SeqCst), 0);
+    h.finish().await;
+
+    // The approval expires.
+    let (agent, _, performs) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut options = clipboard_options(Some(agent));
+    options.approval_ttl = Duration::from_millis(100);
+    let mut h = Harness::start(options);
+    h.hello().await;
+    let args = h.clipboard_job(&format!("expired {CANARY}")).await;
+    let outcome = h.request("c1", "desktop.write_clipboard_text", args).await;
+    assert!(
+        matches!(outcome, ToolOutcome::Expired { .. }),
+        "{outcome:?}"
+    );
+    let job = h.job_id();
+    h.finish_job("failed", "expired").await;
+    assert_eq!(job_ends(&h.store, job).await, JobStatus::Failed);
+    assert_eq!(payload_rows(h.dir.path()), 0);
+    assert!(!on_disk(h.dir.path(), CANARY));
+    assert_eq!(performs.load(Ordering::SeqCst), 0);
+    h.finish().await;
+
+    // The Session Agent reports a failure.
+    let (agent, _, _) = fake_agent(Fake::ClipboardBusy, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.hello().await;
+    let args = h.clipboard_job(&format!("busy {CANARY}")).await;
+    let outcome = approved_clipboard_write(&mut h, "c1", args, &format!("busy {CANARY}")).await;
+    assert!(matches!(outcome, ToolOutcome::Failed { .. }), "{outcome:?}");
+    let job = h.job_id();
+    h.finish_job("failed", "busy").await;
+    assert_eq!(job_ends(&h.store, job).await, JobStatus::Failed);
+    assert_eq!(payload_rows(h.dir.path()), 0);
+    assert!(!on_disk(h.dir.path(), CANARY));
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_job_ended_by_its_time_limit_loses_its_payload() {
+    let (agent, _, _) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut options = clipboard_options(Some(agent));
+    options.job_timeout = Duration::from_millis(300);
+    let mut h = Harness::start(options);
+    h.hello().await;
+    let _args = h.clipboard_job(&format!("slow {CANARY}")).await;
+    let job = h.job_id();
+    let session = h.session;
+    let report = tokio::time::timeout(Duration::from_secs(10), session)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.end, SessionEnd::JobTimedOut(job));
+    assert_eq!(h.store.job(job).unwrap().unwrap().status, JobStatus::Failed);
+    assert_eq!(payload_rows(h.dir.path()), 0);
+    assert!(!on_disk(h.dir.path(), CANARY));
+}
+
+#[tokio::test]
+async fn a_job_cut_short_keeps_its_payload_for_the_next_attempt() {
+    let (agent, _, performs) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.hello().await;
+    let text = format!("again {CANARY}");
+    let args = h.clipboard_job(&text).await;
+    let job = h.job_id();
+    let dir = h.dir.path().to_path_buf();
+    // The worker goes away before asking for anything: the job goes back to
+    // the queue with its text.
+    let (report, store, _) = h.finish().await;
+    assert_eq!(report.end, SessionEnd::WorkerClosed);
+    assert_eq!(store.job(job).unwrap().unwrap().status, JobStatus::Queued);
+    let payload_id: jarvis_protocol::PayloadId =
+        args["payload_id"].as_str().unwrap().parse().unwrap();
+    let kept = store.payload(payload_id).unwrap().unwrap();
+    assert_eq!(kept.text, text);
+    assert_eq!(kept.job_id, job);
+    assert_eq!(performs.load(Ordering::SeqCst), 0);
+    let _ = dir;
+}
+
+#[tokio::test]
+async fn a_changed_payload_is_refused_before_the_approval_is_used() {
+    let (agent, launches, performs) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.hello().await;
+    let args = h.clipboard_job("the text the person approved").await;
+    h.send_request("c1", "desktop.write_clipboard_text", args)
+        .await;
+    let approval = h.pending_approval().await;
+    // A same-user process edits the stored text after the request was made.
+    rusqlite::Connection::open(h.dir.path().join("jarvis.db"))
+        .unwrap()
+        .execute("UPDATE payloads SET text = 'a different text'", [])
+        .unwrap();
+    let shown = jarvis_core::approval::view(&approval, now_ms(), &h.store);
+    assert!(shown.arguments["text"].contains("changed"), "{shown:?}");
+    assert!(shown.arguments["text"].contains("refuse"), "{shown:?}");
+    assert!(!shown.arguments.values().any(|v| v.contains("different")));
+    h.grant(&approval, &approval.fingerprint).unwrap();
+    let outcome = h.response("c1").await;
+    assert!(
+        matches!(outcome, ToolOutcome::Expired { .. }),
+        "{outcome:?}"
+    );
+
+    // Nothing was consumed, started or sent.
+    assert_eq!(h.approval_status(&approval), ApprovalStatus::Expired);
+    assert_eq!(performs.load(Ordering::SeqCst), 0);
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    let (_, store, calls) = h.finish().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let kinds = Harness::task_kinds(&store);
+    assert!(!kinds.contains(&"approval_consumed"), "{kinds:?}");
+    assert!(!kinds.contains(&"execution_started"), "{kinds:?}");
+    assert!(!kinds.contains(&"session_agent_dispatched"), "{kinds:?}");
+}
+
+#[tokio::test]
+async fn a_missing_payload_is_refused_before_the_approval_is_used() {
+    let (agent, launches, performs) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.hello().await;
+    let args = h.clipboard_job("gone before it was used").await;
+    h.send_request("c1", "desktop.write_clipboard_text", args)
+        .await;
+    let approval = h.pending_approval().await;
+    rusqlite::Connection::open(h.dir.path().join("jarvis.db"))
+        .unwrap()
+        .execute("DELETE FROM payloads", [])
+        .unwrap();
+    let shown = jarvis_core::approval::view(&approval, now_ms(), &h.store);
+    assert_eq!(shown.arguments["text"], "the text is no longer kept");
+    assert_eq!(shown.arguments["sha256"].len(), 64);
+    h.grant(&approval, &approval.fingerprint).unwrap();
+    let outcome = h.response("c1").await;
+    assert!(
+        matches!(outcome, ToolOutcome::Expired { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(h.approval_status(&approval), ApprovalStatus::Expired);
+    assert_eq!(performs.load(Ordering::SeqCst), 0);
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    let (_, store, _) = h.finish().await;
+    assert!(!Harness::task_kinds(&store).contains(&"approval_consumed"));
+}
+
+#[tokio::test]
+async fn a_worker_cannot_name_the_payload_of_another_job() {
+    let (agent, launches, performs) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.hello().await;
+    h.job("an unrelated job").await;
+    // Another client's clipboard job waits in the queue.
+    let other = h
+        .store
+        .submit_clipboard_job(
+            &ClipboardText::try_from(format!("someone else's {CANARY}")).unwrap(),
+            "other client",
+        )
+        .unwrap();
+    let rest = other.goal.as_str().strip_prefix("copy payload:").unwrap();
+    let (payload_id, sha256) = rest.split_once(':').unwrap();
+    let stolen = json!({"payload_id": payload_id, "sha256": sha256});
+    h.send_request("c1", "desktop.write_clipboard_text", stolen)
+        .await;
+    let approval = h.pending_approval().await;
+    let shown = jarvis_core::approval::view(&approval, now_ms(), &h.store);
+    assert_eq!(shown.arguments["text"], "the text is no longer kept");
+    assert!(!shown.arguments.values().any(|value| value.contains(CANARY)));
+    h.grant(&approval, &approval.fingerprint).unwrap();
+    let outcome = h.response("c1").await;
+    assert!(
+        matches!(outcome, ToolOutcome::Expired { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(performs.load(Ordering::SeqCst), 0);
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn the_old_argument_shape_with_text_is_rejected() {
+    let (agent, launches, _) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.ready().await;
+    let outcome = h
+        .request(
+            "c1",
+            "desktop.write_clipboard_text",
+            json!({"text": format!("old {CANARY}")}),
+        )
+        .await;
+    assert!(
+        matches!(outcome, ToolOutcome::Rejected { .. }),
+        "{outcome:?}"
+    );
     let (_, store, _) = h.finish().await;
     assert!(store.pending_approvals().unwrap().is_empty());
     assert_eq!(launches.load(Ordering::SeqCst), 0);
@@ -1899,7 +2292,7 @@ async fn approved_healthcheck(h: &mut Harness, id: &str, label: &str) -> ToolOut
         .await;
     let approval = h.pending_approval().await;
     assert_eq!(approval.capabilities, [Capability::SessionAgentHealthcheck]);
-    let shown = jarvis_core::approval::view(&approval, now_ms());
+    let shown = jarvis_core::approval::view(&approval, now_ms(), &h.store);
     assert!(
         shown.arguments["action"].contains("health check"),
         "{shown:?}"
@@ -2018,7 +2411,11 @@ async fn desktop_operations_are_denied_and_never_reach_the_agent() {
     for (id, tool, args) in [
         ("d1", "desktop.capture_window", json!({"target": 1})),
         ("d2", "desktop.read_clipboard_text", json!({})),
-        ("d3", "desktop.write_clipboard_text", json!({"text": "hi"})),
+        (
+            "d3",
+            "desktop.write_clipboard_text",
+            json!({"payload_id": jarvis_protocol::PayloadId::new(), "sha256": "ab".repeat(32)}),
+        ),
         (
             "d4",
             "desktop.type_text",

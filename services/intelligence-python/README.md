@@ -20,7 +20,8 @@ person simply takes longer to answer; the worker never sees or handles approvals
 The stub planner understands these phrases, in order of appearance: a topic word (`system`,
 `runtime`, `machine`, `environment`) asks for `system.info`; `read <path>` asks for
 `filesystem.read_fixture`; `write <path>: <text>` asks for `workspace.write_file` with the rest of
-the goal as content; `copy "<text>"` asks for `desktop.write_clipboard_text` (single-line text; the Core re-checks it).
+the goal as content; `copy payload:<id>:<sha256>` asks for `desktop.write_clipboard_text` for a text the Core holds under that
+identifier (the worker never sees the text; the Core checks it against the SHA-256).
 
 Frames go to stdout, logs go to stderr. Exit code `0` means the Core closed the session while the
 worker was idle, `2` is a usage error and `3` is a session or protocol failure.

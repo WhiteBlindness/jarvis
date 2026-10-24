@@ -17,7 +17,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PACKAGE_ROOT / "src"
 PROTOCOL_DIR = Path(__file__).resolve().parents[3] / "tests" / "protocol"
 
-PROTOCOL = 2
+PROTOCOL = 3
 SESSION_ID = "01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b"
 TASK_ID = "01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c"
 JOB_ID = "01928f5e-7c3c-7b30-9c4d-5e6f7a8b9c0d"
@@ -74,7 +74,7 @@ def system_info_result() -> dict[str, Any]:
         "arch": "x86_64",
         "logical_cpus": 8,
         "core_version": "0.2.0",
-        "protocol_version": 2,
+        "protocol_version": 3,
         "core_uptime_ms": 42,
     }
 

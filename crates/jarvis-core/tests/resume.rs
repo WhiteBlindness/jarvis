@@ -17,8 +17,9 @@ use jarvis_core::policy::Policy;
 use jarvis_core::session::{SessionContext, SessionEnd, SessionError, SessionReport, run_session};
 use jarvis_core::store::{ApprovalError, ApprovalRecord, Store, now_ms};
 use jarvis_protocol::{
-    ApprovalStatus, AuditEventKind, Capability, CoreMessage, ErrorCode, Goal, JobId, JobStatus,
-    PolicyDecision, TaskId, TaskStatus, ToolCall, ToolOutcome, ToolResult, decode_core_message,
+    ApprovalStatus, AuditEventKind, Capability, ClipboardText, CoreMessage, ErrorCode, Goal, JobId,
+    JobStatus, PolicyDecision, TaskId, TaskStatus, ToolCall, ToolOutcome, ToolResult,
+    decode_core_message,
 };
 use jarvis_tools::{FixtureRoot, ToolExecutor, ToolFuture, Toolbox, WorkspaceRoot};
 use serde_json::{Value, json};
@@ -166,7 +167,7 @@ impl Env {
             job: None,
         };
         harness
-            .send(json!({"protocol": 2, "type": "hello", "worker": "test", "worker_version": "1"}))
+            .send(json!({"protocol": 3, "type": "hello", "worker": "test", "worker_version": "1"}))
             .await;
         assert!(matches!(harness.recv().await, CoreMessage::Welcome(_)));
         harness
@@ -213,7 +214,7 @@ impl Harness {
     async fn send_request(&mut self, id: &str, tool: &str, args: Value) {
         let job_id = self.job.expect("no job");
         self.send(json!({
-            "protocol": 2, "type": "tool_request", "request_id": id, "job_id": job_id,
+            "protocol": 3, "type": "tool_request", "request_id": id, "job_id": job_id,
             "tool": tool, "args": args
         }))
         .await;
@@ -706,6 +707,71 @@ async fn a_completed_write_is_replayed_without_a_new_approval() {
     assert_eq!(env.executions(), 1, "the file was written exactly once");
     assert_eq!(env.workspace_file("a.txt").as_deref(), Some("x"));
     h.worker_exits().await;
+}
+
+#[tokio::test]
+async fn a_requeued_clipboard_job_resumes_with_its_text() {
+    let env = Env::new();
+    let text = "resume me: \"quoted\" text";
+    let submitted = env
+        .store
+        .submit_clipboard_job(&ClipboardText::try_from(text.to_owned()).unwrap(), "client")
+        .unwrap();
+    let job = submitted.job_id;
+    let rest = submitted
+        .goal
+        .as_str()
+        .strip_prefix("copy payload:")
+        .unwrap();
+    let (payload_id, sha256) = rest.split_once(':').unwrap();
+    let args = json!({"payload_id": payload_id, "sha256": sha256});
+    let payload = |env: &Env| env.store.payload(payload_id.parse().unwrap()).unwrap();
+
+    // The first worker goes away before asking for anything.
+    let mut h = env.session(Options::default()).await;
+    h.takes(job).await;
+    h.worker_exits().await;
+    assert_eq!(env.job(job).0, JobStatus::Queued);
+    assert_eq!(
+        payload(&env).unwrap().text,
+        text,
+        "kept for the next attempt"
+    );
+
+    // The next one is handed the same job, asks, and the person is shown
+    // the text.
+    let mut options = Options::default();
+    options.policy.push((
+        Capability::DesktopClipboardWrite,
+        PolicyDecision::RequireConfirmation,
+    ));
+    let mut h = env.session(options).await;
+    h.takes(job).await;
+    h.send_request("c1", "desktop.write_clipboard_text", args)
+        .await;
+    let approval = h.pending_approval().await;
+    let shown = jarvis_core::approval::view(&approval, now_ms(), &env.store);
+    assert_eq!(
+        shown.arguments["text"],
+        jarvis_core::approval::display_safe(text, usize::MAX)
+    );
+
+    // It is lost again while the person decides: the approval lapses, the
+    // job is requeued and still has its text.
+    h.worker_exits().await;
+    assert_eq!(env.job(job).0, JobStatus::Queued);
+    assert_eq!(payload(&env).unwrap().text, text);
+    assert_eq!(env.executions(), 0);
+
+    // Once the job ends, so does the text.
+    env.store
+        .claim_next_job(jarvis_protocol::SessionId::new())
+        .unwrap()
+        .unwrap();
+    env.store
+        .finish_job(job, JobStatus::Failed, None, None)
+        .unwrap();
+    assert!(payload(&env).is_none());
 }
 
 // --- how a session ends -------------------------------------------------------------------------

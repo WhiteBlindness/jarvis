@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "preact/hooks";
 import type { StringKey } from "../lib/i18n";
-import { loadModel, setState, t, unloadModel, useStore } from "../lib/store";
+import { loadModel, reloadModel, setState, t, unloadModel, useStore } from "../lib/store";
 import type { InferenceView } from "../lib/types";
 import { BellIcon, CloseIcon, GearIcon, SidebarIcon } from "./Icons";
 
@@ -23,7 +23,8 @@ function pillInfo(inference: InferenceView | null): PillInfo {
     disabled: ["stateDisabled", "idle"],
   };
   const [key, tone] = map[inference.state];
-  return { label: t(key), tone };
+  // A slow-but-working model gets the amber dot.
+  return { label: t(key), tone: tone === "ok" && inference.slow ? "paused" : tone };
 }
 
 const tokensPerSecond = (x10: number): string => (x10 / 10).toFixed(1);
@@ -172,6 +173,16 @@ function ModelPanel() {
                 </dd>
               </>
             )}
+            {inference.warmup_tokens_per_second_x10 !== null && (
+              <>
+                <dt>{t("warmupSpeed")}</dt>
+                <dd>
+                  {t("tokensPerSecond", {
+                    n: tokensPerSecond(inference.warmup_tokens_per_second_x10),
+                  })}
+                </dd>
+              </>
+            )}
             {inference.load_ms !== null && (
               <>
                 <dt>{t("modelLoadTime")}</dt>
@@ -200,6 +211,20 @@ function ModelPanel() {
 export function ModelNotice({ inference }: { inference: InferenceView }) {
   const s = useStore();
   const game = s.health?.governor.process ?? null;
+  if (inference.slow && (inference.state === "ready" || inference.state === "generating")) {
+    const tps = tokensPerSecond(inference.warmup_tokens_per_second_x10 ?? 0);
+    return (
+      <div class="notice notice-paused" role="status">
+        <strong>{t("slowTitle")}</strong>
+        <p>{t("slowBody", { tps })}</p>
+        <div class="actions">
+          <button type="button" class="btn" onClick={() => void reloadModel()}>
+            {t("reloadModel")}
+          </button>
+        </div>
+      </div>
+    );
+  }
   switch (inference.state) {
     case "failed":
       return (

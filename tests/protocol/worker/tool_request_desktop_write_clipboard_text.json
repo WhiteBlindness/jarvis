@@ -1,10 +1,11 @@
 {
-  "protocol": 2,
+  "protocol": 3,
   "type": "tool_request",
   "request_id": "req-0008",
   "job_id": "01928f5e-7c3a-7d10-9a2b-3c4d5e6f7a8b",
   "tool": "desktop.write_clipboard_text",
   "args": {
-    "text": "Demo: hello from the Session Agent"
+    "payload_id": "01928f5e-7c4a-7b30-8c1d-2e3f4a5b6c7d",
+    "sha256": "5d41402abc4b2a76b9719d911017c592a5d41402abc4b2a76b9719d911017c59"
   }
 }

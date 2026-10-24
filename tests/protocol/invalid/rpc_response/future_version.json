@@ -1,4 +1,4 @@
 {
-  "frame": "{\"rpc\":4,\"type\":\"health\",\"ok\":true,\"core_version\":\"0.2.0\",\"worker_protocol\":2,\"rpc_protocol\":2,\"uptime_ms\":1200,\"worker\":{\"state\":\"idle\",\"pid\":4242,\"restarts\":0,\"containment\":\"process group\"},\"governor\":{\"state\":\"off\",\"reason\":null,\"process\":null,\"held_ms\":null,\"overdue\":false},\"queued_jobs\":0,\"pending_approvals\":1}",
+  "frame": "{\"rpc\":5,\"type\":\"health\",\"ok\":true,\"core_version\":\"0.2.0\",\"worker_protocol\":3,\"rpc_protocol\":3,\"uptime_ms\":1200,\"worker\":{\"state\":\"idle\",\"pid\":4242,\"restarts\":0,\"containment\":\"process group\"},\"governor\":{\"state\":\"off\",\"reason\":null,\"process\":null,\"held_ms\":null,\"overdue\":false},\"queued_jobs\":0,\"pending_approvals\":1}",
   "error": "unsupported_protocol_version"
 }

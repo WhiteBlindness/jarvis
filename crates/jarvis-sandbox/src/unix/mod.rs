@@ -493,6 +493,26 @@ fn parent_of(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// A process watched by its ID. Unlike Windows there is no handle here, so a
+/// reused ID could look alive; the watcher is the parent's child, so the ID
+/// is not reused before the watcher notices the exit in practice.
+#[derive(Debug)]
+pub(crate) struct Watched(u32);
+
+pub(crate) fn watch_process(pid: u32) -> io::Result<Watched> {
+    if process_exists(pid) {
+        Ok(Watched(pid))
+    } else {
+        Err(io::Error::from(io::ErrorKind::NotFound))
+    }
+}
+
+impl Watched {
+    pub(crate) fn has_exited(&self) -> bool {
+        !process_exists(self.0)
+    }
+}
+
 pub(crate) fn process_exists(pid: u32) -> bool {
     // SAFETY: signal 0 performs only the existence and permission check.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };

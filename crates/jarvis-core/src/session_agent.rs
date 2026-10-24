@@ -31,7 +31,7 @@ pub mod serve;
 
 use std::collections::BTreeMap;
 
-use jarvis_protocol::{AgentOperation, ApprovalId, MAX_GRANT_TTL_MS, ToolCall};
+use jarvis_protocol::{AgentOperation, ApprovalId, ClipboardText, MAX_GRANT_TTL_MS, ToolCall};
 
 use crate::approval;
 use crate::policy::required_capabilities;
@@ -123,6 +123,8 @@ pub enum Refusal {
     ApprovalReused,
     #[error("the Session Agent is not available")]
     Unavailable,
+    #[error("the text of the request is no longer available or was changed")]
+    PayloadUnavailable,
 }
 
 impl Refusal {
@@ -142,19 +144,25 @@ impl Refusal {
             Self::TooManyGrants => "too_many_grants",
             Self::ApprovalReused => "approval_reused",
             Self::Unavailable => "unavailable",
+            Self::PayloadUnavailable => "payload_unavailable",
         }
     }
 }
 
-/// The agent operation that performs `call`, if there is one.
-pub fn operation_for(call: &ToolCall) -> Result<AgentOperation, Refusal> {
+/// The agent operation that performs `call`, if there is one. A clipboard
+/// write names its text by payload (ADR 0022); `text` is that payload as the
+/// Core resolved and verified it, and without it there is no operation.
+pub fn operation_for(
+    call: &ToolCall,
+    text: Option<&ClipboardText>,
+) -> Result<AgentOperation, Refusal> {
     match call {
         ToolCall::SessionAgentHealthcheck(args) => Ok(AgentOperation::Healthcheck {
             label: args.label.clone(),
         }),
-        ToolCall::WriteClipboardText(args) => Ok(AgentOperation::WriteClipboardText {
-            text: args.text.clone(),
-        }),
+        ToolCall::WriteClipboardText(_) => text
+            .map(|text| AgentOperation::WriteClipboardText { text: text.clone() })
+            .ok_or(Refusal::PayloadUnavailable),
         ToolCall::CaptureWindow(_) | ToolCall::ReadClipboardText(_) | ToolCall::TypeText(_) => {
             Err(Refusal::NotAvailable)
         }
@@ -204,8 +212,13 @@ impl Grants {
 
     /// Whether a grant for `call` could be issued now. Checked before an
     /// approval is consumed, so that a refusal never uses one up.
-    pub fn check(&self, call: &ToolCall, now_ms: u64) -> Result<(), Refusal> {
-        operation_for(call)?;
+    pub fn check(
+        &self,
+        call: &ToolCall,
+        text: Option<&ClipboardText>,
+        now_ms: u64,
+    ) -> Result<(), Refusal> {
+        operation_for(call, text)?;
         if now_ms < self.latest_ms {
             return Err(Refusal::ClockWentBack);
         }
@@ -221,6 +234,7 @@ impl Grants {
         &mut self,
         consumed: ConsumedApproval,
         call: &ToolCall,
+        text: Option<&ClipboardText>,
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<GrantId, Refusal> {
@@ -228,7 +242,7 @@ impl Grants {
             return Err(Refusal::InvalidLifetime);
         }
         self.observe(now_ms)?;
-        let operation = operation_for(call)?;
+        let operation = operation_for(call, text)?;
         let expected = approval::fingerprint(
             consumed.task_id(),
             consumed.request_id(),
@@ -318,7 +332,7 @@ impl Grants {
 #[cfg(test)]
 mod tests {
     use jarvis_protocol::{
-        AgentLabel, Capability, CaptureWindowArgs, ClipboardText, HealthcheckArgs,
+        AgentLabel, Capability, CaptureWindowArgs, ClipboardText, HealthcheckArgs, PayloadId,
         ReadClipboardTextArgs, RelativePath, RequestId, TaskId, TypeTextArgs, TypedText,
         WindowTarget, WriteClipboardTextArgs, WriteFileArgs,
     };
@@ -346,7 +360,7 @@ mod tests {
 
     fn issue(grants: &mut Grants, call: &ToolCall, now_ms: u64) -> GrantId {
         grants
-            .issue(consumed_for(call), call, now_ms, 5_000)
+            .issue(consumed_for(call), call, None, now_ms, 5_000)
             .unwrap()
     }
 
@@ -355,7 +369,7 @@ mod tests {
         let mut grants = Grants::default();
         // Approved: "a". Asked: "b".
         assert_eq!(
-            grants.issue(consumed_for(&check("a")), &check("b"), 0, 5_000),
+            grants.issue(consumed_for(&check("a")), &check("b"), None, 0, 5_000),
             Err(Refusal::NotApproved)
         );
         // An approval for a different tool is not consent either.
@@ -364,7 +378,7 @@ mod tests {
             content: "hi".to_owned(),
         });
         assert_eq!(
-            grants.issue(consumed_for(&write), &check("a"), 0, 5_000),
+            grants.issue(consumed_for(&write), &check("a"), None, 0, 5_000),
             Err(Refusal::NotApproved)
         );
         // The capabilities are bound too.
@@ -374,7 +388,7 @@ mod tests {
         let other_caps =
             ConsumedApproval::for_tests(ApprovalId::new(), task, request_id(), fingerprint, 0);
         assert_eq!(
-            grants.issue(other_caps, &check("a"), 0, 5_000),
+            grants.issue(other_caps, &check("a"), None, 0, 5_000),
             Err(Refusal::NotApproved)
         );
     }
@@ -391,38 +405,57 @@ mod tests {
         });
         let mut grants = Grants::default();
         for call in [&capture, &read, &typing] {
-            assert_eq!(grants.check(call, 0), Err(Refusal::NotAvailable));
+            assert_eq!(grants.check(call, None, 0), Err(Refusal::NotAvailable));
             assert_eq!(
-                grants.issue(consumed_for(call), call, 0, 5_000),
+                grants.issue(consumed_for(call), call, None, 0, 5_000),
                 Err(Refusal::NotAvailable)
             );
         }
-        // Writing the clipboard has an operation, carrying the exact text.
+        // Writing the clipboard has an operation, carrying the exact text the
+        // Core resolved for the payload the request names (ADR 0022).
+        let text = ClipboardText::try_from("hello\nworld".to_owned()).unwrap();
         let clipboard = ToolCall::WriteClipboardText(WriteClipboardTextArgs {
-            text: ClipboardText::try_from("hello\nworld".to_owned()).unwrap(),
+            payload_id: PayloadId::new(),
+            sha256: crate::store::text_sha256(text.as_str()),
         });
-        assert_eq!(grants.check(&clipboard, 0), Ok(()));
-        let id = issue(&mut grants, &clipboard, 0);
+        assert_eq!(grants.check(&clipboard, Some(&text), 0), Ok(()));
+        let id = grants
+            .issue(consumed_for(&clipboard), &clipboard, Some(&text), 0, 5_000)
+            .unwrap();
         let authorization = grants.authorize(id, &clipboard, 1).unwrap();
         assert_eq!(
             authorization.operation(),
-            &AgentOperation::WriteClipboardText {
-                text: ClipboardText::try_from("hello\nworld".to_owned()).unwrap()
-            }
+            &AgentOperation::WriteClipboardText { text: text.clone() }
         );
         let other = ToolCall::WriteClipboardText(WriteClipboardTextArgs {
-            text: ClipboardText::try_from("hello world".to_owned()).unwrap(),
+            payload_id: PayloadId::new(),
+            sha256: crate::store::text_sha256("hello world"),
         });
-        let id = issue(&mut grants, &clipboard, 2);
+        let id = grants
+            .issue(consumed_for(&clipboard), &clipboard, Some(&text), 2, 5_000)
+            .unwrap();
         assert_eq!(
             grants.authorize(id, &other, 3).map(|_| ()),
             Err(Refusal::ScopeMismatch)
+        );
+        // Without a resolved text there is nothing to send: no check passes
+        // and no grant is issued.
+        assert_eq!(
+            grants.check(&clipboard, None, 4),
+            Err(Refusal::PayloadUnavailable)
+        );
+        assert_eq!(
+            grants.issue(consumed_for(&clipboard), &clipboard, None, 4, 5_000),
+            Err(Refusal::PayloadUnavailable)
         );
         let write = ToolCall::WriteFile(WriteFileArgs {
             path: RelativePath::try_from("a.txt".to_owned()).unwrap(),
             content: String::new(),
         });
-        assert_eq!(grants.check(&write, 0), Err(Refusal::NotAnAgentOperation));
+        assert_eq!(
+            grants.check(&write, None, 0),
+            Err(Refusal::NotAnAgentOperation)
+        );
     }
 
     #[test]
@@ -453,11 +486,11 @@ mod tests {
             consumed.task_id(),
             consumed.fingerprint().clone(),
         );
-        grants.issue(consumed, &call, 0, 5_000).unwrap();
+        grants.issue(consumed, &call, None, 0, 5_000).unwrap();
         // The store never makes a second one; this is the defence behind it.
         let twin = ConsumedApproval::for_tests(approval, task, request_id(), fingerprint, 0);
         assert_eq!(
-            grants.issue(twin, &call, 0, 5_000),
+            grants.issue(twin, &call, None, 0, 5_000),
             Err(Refusal::ApprovalReused)
         );
     }
@@ -515,7 +548,7 @@ mod tests {
             Some(Refusal::ClockWentBack)
         );
         assert_eq!(
-            grants.check(&check("b"), 10_001),
+            grants.check(&check("b"), None, 10_001),
             Err(Refusal::ClockWentBack)
         );
         // A large jump forward expires the grant; it never extends it.
@@ -533,20 +566,23 @@ mod tests {
         let mut grants = Grants::default();
         for ttl in [0, MAX_GRANT_TTL_MS + 1] {
             assert_eq!(
-                grants.issue(consumed_for(&check("a")), &check("a"), 0, ttl),
+                grants.issue(consumed_for(&check("a")), &check("a"), None, 0, ttl),
                 Err(Refusal::InvalidLifetime)
             );
         }
         for _ in 0..MAX_LIVE_GRANTS {
             issue(&mut grants, &check("a"), 0);
         }
-        assert_eq!(grants.check(&check("a"), 0), Err(Refusal::TooManyGrants));
         assert_eq!(
-            grants.issue(consumed_for(&check("a")), &check("a"), 0, 5_000),
+            grants.check(&check("a"), None, 0),
+            Err(Refusal::TooManyGrants)
+        );
+        assert_eq!(
+            grants.issue(consumed_for(&check("a")), &check("a"), None, 0, 5_000),
             Err(Refusal::TooManyGrants)
         );
         // Expired grants no longer count as live.
-        assert!(grants.check(&check("a"), 5_000).is_ok());
+        assert!(grants.check(&check("a"), None, 5_000).is_ok());
         for i in 0..(MAX_TRACKED_GRANTS as u64 * 2) {
             let id = issue(&mut grants, &check("a"), 5_000 + i);
             grants.authorize(id, &check("a"), 5_000 + i).unwrap();

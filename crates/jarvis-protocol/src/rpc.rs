@@ -8,7 +8,7 @@
 //! request being approved.
 //!
 //! ```json
-//! {"rpc":3,"type":"approve","approval_id":"…","fingerprint":"…"}
+//! {"rpc":4,"type":"approve","approval_id":"…","fingerprint":"…"}
 //! ```
 
 use std::collections::BTreeMap;
@@ -16,6 +16,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::ClipboardText;
 use crate::chat::{
     ChatDelta, ChatLanguage, ChatText, ChatTurn, ConversationSummary, ConversationView,
     InferenceView, SearchQuery,
@@ -34,7 +35,7 @@ use crate::{
 pub struct RpcVersion(pub u32);
 
 impl RpcVersion {
-    pub const CURRENT: Self = Self(3);
+    pub const CURRENT: Self = Self(4);
 }
 
 impl fmt::Display for RpcVersion {
@@ -134,6 +135,18 @@ pub enum RpcRequest {
     /// reloaded.
     SetContextSize {
         context_size: u32,
+    },
+    /// Delete conversations not updated for this many days (one of
+    /// `RETENTION_DAYS`; 0 keeps them until a person deletes them). Applies
+    /// at once and is remembered across restarts.
+    SetRetention {
+        days: u32,
+    },
+    /// Queue a job that copies this text to the clipboard once a person
+    /// approves it (ADR 0022). The text is held by the Core as a temporary
+    /// payload and never written into the job's goal; the reply is the job.
+    SubmitClipboardJob {
+        text: ClipboardText,
     },
 }
 
@@ -409,37 +422,37 @@ mod tests {
             fingerprint: Fingerprint::from_digest(&[7; 32]),
         };
         let bytes = encode_rpc_request(&request).unwrap();
-        assert!(bytes.starts_with(br#"{"rpc":3,"type":"approve""#));
+        assert!(bytes.starts_with(br#"{"rpc":4,"type":"approve""#));
         assert_eq!(decode_rpc_request(&bytes).unwrap(), request);
         let health = encode_rpc_request(&RpcRequest::Health {}).unwrap();
-        assert_eq!(health, br#"{"rpc":3,"type":"health"}"#);
+        assert_eq!(health, br#"{"rpc":4,"type":"health"}"#);
     }
 
     #[test]
     fn requests_are_strict() {
         for value in [
-            json!({"rpc": 3, "type": "health", "extra": true}),
-            json!({"rpc": 3, "type": "run_command", "command": "id"}),
-            json!({"rpc": 3, "type": "submit_job"}),
-            json!({"rpc": 3, "type": "submit_job", "goal": ""}),
-            json!({"rpc": 3, "type": "submit_job", "goal": "a\nb"}),
-            json!({"rpc": 3, "type": "get_job", "job_id": JobId::new()}),
-            json!({"rpc": 3, "type": "approve", "approval_id": ApprovalId::new()}),
-            json!({"rpc": 3, "type": "approve", "approval_id": ApprovalId::new(),
+            json!({"rpc": 4, "type": "health", "extra": true}),
+            json!({"rpc": 4, "type": "run_command", "command": "id"}),
+            json!({"rpc": 4, "type": "submit_job"}),
+            json!({"rpc": 4, "type": "submit_job", "goal": ""}),
+            json!({"rpc": 4, "type": "submit_job", "goal": "a\nb"}),
+            json!({"rpc": 4, "type": "get_job", "job_id": JobId::new()}),
+            json!({"rpc": 4, "type": "approve", "approval_id": ApprovalId::new()}),
+            json!({"rpc": 4, "type": "approve", "approval_id": ApprovalId::new(),
                    "fingerprint": "abc"}),
-            json!({"rpc": 3, "type": "approve", "approval_id": ApprovalId::new(),
+            json!({"rpc": 4, "type": "approve", "approval_id": ApprovalId::new(),
                    "fingerprint": "a".repeat(64), "approved": true}),
             json!({"protocol": 2, "type": "health"}),
         ] {
             let error = decode_rpc_request(&frame(value.clone())).unwrap_err();
             assert_eq!(error.code(), crate::ErrorCode::MalformedFrame, "{value}");
         }
-        for old in [1, 2, 4] {
+        for old in [1, 2, 3, 5] {
             let error =
                 decode_rpc_request(&frame(json!({"rpc": old, "type": "health"}))).unwrap_err();
             assert!(matches!(
                 error,
-                DecodeError::UnsupportedVersion { found, expected: 3, .. } if found == old
+                DecodeError::UnsupportedVersion { found, expected: 4, .. } if found == old
             ));
         }
     }

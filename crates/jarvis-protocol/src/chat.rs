@@ -91,7 +91,7 @@ impl From<SearchQuery> for String {
 
 /// Text the model proposed for the clipboard, already checked by the Core:
 /// one line of 1 to 1024 characters from the clipboard allowlist, so it can
-/// be submitted unchanged as the goal `copy "<text>"`. A proposal is only a
+/// be submitted unchanged with `submit_clipboard_job` (ADR 0022). A proposal is only a
 /// suggestion shown to a person; it carries no authority.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -294,10 +294,24 @@ pub struct InferenceView {
     pub load_ms: Option<u64>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub last_stats: Option<TurnStats>,
+    /// Conversations not updated for this many days are deleted; 0 keeps
+    /// them until a person deletes them.
+    pub retention_days: u32,
+    /// Generation speed measured by a short warm-up after the last load, in
+    /// tenths of a token per second.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub warmup_tokens_per_second_x10: Option<u32>,
+    /// The warm-up ran clearly slower than a GPU should (for example because
+    /// the system moved part of the model out of video memory).
+    pub slow: bool,
 }
 
 /// Context sizes a client may choose.
 pub const CONTEXT_SIZES: [u32; 4] = [4096, 8192, 16384, 32768];
+
+/// Retention periods a client may choose, in days; 0 keeps conversations
+/// until a person deletes them.
+pub const RETENTION_DAYS: [u32; 5] = [0, 7, 30, 90, 365];
 
 #[cfg(test)]
 mod tests {

@@ -37,7 +37,7 @@ from jarvis_worker.protocol import (
 if TYPE_CHECKING:
     from _typeshed import ReadableBuffer
 
-HELLO = b'{"protocol":2,"type":"hello","worker":"jarvis-worker","worker_version":"0.2.0"}\n'
+HELLO = b'{"protocol":3,"type":"hello","worker":"jarvis-worker","worker_version":"0.2.0"}\n'
 JOB = support.to_line(support.job("system"))
 
 
@@ -98,7 +98,7 @@ def test_handshake_rejects_invalid_labels_without_writing() -> None:
 def test_a_fatal_error_during_the_handshake_raises_session_error() -> None:
     reply = support.to_line(
         {
-            "protocol": 2,
+            "protocol": 3,
             "type": "error",
             "request_id": None,
             "error": {"code": "unsupported_protocol_version", "message": "speak 1"},
@@ -230,7 +230,7 @@ def test_finish_reports_the_job_and_frees_the_client_for_the_next() -> None:
     client.finish(JobOutcome.COMPLETED, "0 call(s)")
     frame = support.check_worker_frame(writer.getvalue())
     assert frame == {
-        "protocol": 2,
+        "protocol": 3,
         "type": "job_result",
         "job_id": support.JOB_ID,
         "outcome": "completed",
@@ -260,7 +260,7 @@ def test_call_sends_a_request_and_returns_the_matching_response() -> None:
     assert isinstance(response.outcome.result, SystemInfo)
     assert response.outcome.result.os == "linux"
     assert writer.getvalue() == (
-        b'{"protocol":2,"type":"tool_request","request_id":"req-0001",'
+        b'{"protocol":3,"type":"tool_request","request_id":"req-0001",'
         b'"job_id":"' + support.JOB_ID.encode() + b'","tool":"system.info","args":{}}\n'
     )
 

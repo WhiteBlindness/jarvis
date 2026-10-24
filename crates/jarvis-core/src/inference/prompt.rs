@@ -86,46 +86,169 @@ pode ligar já para o 112 se houver perigo imediato, ou para o SNS 24 (808 24 24
 com um profissional. Em inglês, sugere o número de emergência local. Fica disponível para \
 continuar a conversa.";
 
-/// Words that may signal a crisis, compared in lower case. False positives
-/// cost one serious reply; false negatives are left to the persona.
-const CRISIS_SIGNALS: [&str; 25] = [
+/// Phrases that may signal distress or a risk to the person's life,
+/// compared in lower case. A false positive puts a serious opening into an
+/// ordinary chat, so phrases common in everyday speech are left out or
+/// guarded; false negatives are left to the persona, which a small model follows less
+/// reliably (the evaluation records the miss rate).
+const DISTRESS_SIGNALS: &[&str] = &[
     "suicid",
     "matar-me",
     "me matar",
     "acabar com tudo",
     "acabar com a minha vida",
+    "pôr fim à minha vida",
     "não quero viver",
     "nao quero viver",
+    "cansado de viver",
+    "cansada de viver",
+    "sentido em continuar",
+    "sentido em viver",
     "melhor sem mim",
+    "ninguém ia notar",
+    "ninguém dava pela minha falta",
+    "se eu desaparecesse",
     "quero morrer",
     "desaparecer para sempre",
+    "tomar todos os comprimidos",
+    "tomar os comprimidos todos",
     "automutil",
     "cortar-me",
-    "dor no peito",
-    "não consigo respirar",
-    "falta de ar",
-    "desmaiou",
-    "overdose",
     "kill myself",
     "end it all",
+    "end my life",
     "want to die",
     "better off without me",
+    "point of going on",
+    "no point in living",
+    "tired of living",
+    "if i just disappeared",
+    "if i disappeared",
+    "take all the pills",
+    "taking all the pills",
     "self-harm",
     "hurt myself",
-    "chest pain",
-    "can't breathe",
 ];
 
-/// Signals of a medical emergency, a subset of [`CRISIS_SIGNALS`].
-const MEDICAL_SIGNALS: [&str; 7] = [
+/// Phrases that may signal a medical emergency.
+const MEDICAL_SIGNALS: &[&str] = &[
     "dor no peito",
+    "aperto no peito",
     "não consigo respirar",
     "falta de ar",
     "desmaiou",
+    "bateu com a cabeça",
     "overdose",
     "chest pain",
+    "chest feels",
     "can't breathe",
+    "not breathing",
+    "hit his head",
+    "hit her head",
 ];
+
+/// Words that are ordinary on their own ("o router não responde", "a
+/// dormant volcano") and signal an emergency only next to a person or a
+/// body part in the same clause (see [`has_someone`]).
+const GUARDED_MEDICAL: &[&str] = &["não responde", "passed out", "not making sense"];
+
+/// Sensations of the body. Also count for a body part named with only an
+/// article ("o braço"); the phrases above do not, because "the face
+/// detection is not making sense" is common in technical chat.
+const GUARDED_SENSATIONS: &[&str] = &["engoliu", "dormente", "swallowed", "numb"];
+
+/// People. They count only after a possessive ("o meu pai", "my dad"), so
+/// "the child process" does not.
+const PEOPLE: &[&str] = &[
+    "pai", "mãe", "filho", "filha", "avô", "avó", "bebé", "marido", "mulher", "namorado",
+    "namorada", "irmão", "irmã", "tio", "tia", "amigo", "amiga", "dad", "father", "mom", "mum",
+    "mother", "son", "daughter", "toddler", "baby", "kid", "child", "grandpa", "grandma", "wife",
+    "husband", "brother", "sister", "friend",
+];
+
+const POSSESSIVES: &[&str] = &[
+    "my", "his", "her", "our", "meu", "minha", "seu", "sua", "nosso", "nossa",
+];
+
+/// Body parts. Portuguese names one's own with an article ("o braço"), so
+/// an article counts as well as a possessive; "ARM assembly" does not.
+const BODY: &[&str] = &[
+    "braço", "mão", "cara", "perna", "cabeça", "arm", "hand", "face", "leg", "head",
+];
+
+const BODY_ARTICLES: &[&str] = &["o", "a", "the"];
+
+/// "Take them all" is a risk only when pills are mentioned.
+const GUARDED_DISTRESS: &[&str] = &["take them all", "taking them all"];
+
+const PILLS: &[&str] = &[
+    "comprimido",
+    "comprimidos",
+    "pill",
+    "pills",
+    "tablet",
+    "tablets",
+];
+
+fn any_of(lower: &str, signals: &[&str]) -> bool {
+    signals.iter().any(|signal| lower.contains(signal))
+}
+
+/// The message cut into clauses at punctuation, each as its words joined by
+/// single spaces with a space at both ends, so that a phrase matches only
+/// whole words (" numb " is not in " number ") and two signals count
+/// together only within one clause.
+fn clauses(lower: &str) -> Vec<String> {
+    lower
+        .split(['.', ',', ';', ':', '!', '?', '\n'])
+        .map(|clause| {
+            let words: Vec<&str> = clause
+                .split(|c: char| !c.is_alphanumeric() && c != '\'')
+                .filter(|word| !word.is_empty())
+                .collect();
+            format!(" {} ", words.join(" "))
+        })
+        .collect()
+}
+
+fn has_phrase(clause: &str, phrases: &[&str]) -> bool {
+    phrases
+        .iter()
+        .any(|phrase| clause.contains(&format!(" {phrase} ")))
+}
+
+/// A person within four words after a possessive, or a body part within
+/// two words after a possessive or, if `articles`, an article.
+fn has_someone(clause: &str, articles: bool) -> bool {
+    let words: Vec<&str> = clause.split_whitespace().collect();
+    words.iter().enumerate().any(|(at, word)| {
+        let after_any = |reach: usize, list: &[&str]| {
+            words[at.saturating_sub(reach)..at]
+                .iter()
+                .any(|w| list.contains(w))
+        };
+        // "my 3 year old son", "my dad's".
+        let person = word.strip_suffix("'s").unwrap_or(word);
+        (PEOPLE.contains(&person) && after_any(4, POSSESSIVES))
+            || (BODY.contains(word)
+                && (after_any(2, POSSESSIVES) || (articles && after_any(2, BODY_ARTICLES))))
+    })
+}
+
+fn medical(lower: &str) -> bool {
+    any_of(lower, MEDICAL_SIGNALS)
+        || clauses(lower).iter().any(|clause| {
+            (has_phrase(clause, GUARDED_MEDICAL) && has_someone(clause, false))
+                || (has_phrase(clause, GUARDED_SENSATIONS) && has_someone(clause, true))
+        })
+}
+
+fn distress(lower: &str) -> bool {
+    any_of(lower, DISTRESS_SIGNALS)
+        || clauses(lower)
+            .iter()
+            .any(|clause| has_phrase(clause, GUARDED_DISTRESS) && has_phrase(clause, PILLS))
+}
 
 /// The first sentence of a reply to a possible crisis, written by the Core
 /// and continued by the model, so that the reply cannot open with a joke.
@@ -133,8 +256,7 @@ pub fn crisis_opening(message: &str, language: ChatLanguage) -> Option<&'static 
     if !crisis_signals(message) {
         return None;
     }
-    let lower = message.to_lowercase();
-    let medical = MEDICAL_SIGNALS.iter().any(|signal| lower.contains(signal));
+    let medical = medical(&message.to_lowercase());
     let english = language == ChatLanguage::En;
     Some(match (medical, english) {
         (true, false) => "Liga já para o 112.",
@@ -147,7 +269,7 @@ pub fn crisis_opening(message: &str, language: ChatLanguage) -> Option<&'static 
 /// Whether `message` may signal a crisis.
 pub fn crisis_signals(message: &str) -> bool {
     let lower = message.to_lowercase();
-    CRISIS_SIGNALS.iter().any(|signal| lower.contains(signal))
+    distress(&lower) || medical(&lower)
 }
 
 /// What the model is told when the message does not ask for a copy.
@@ -292,6 +414,9 @@ pub fn neutralise_markup(text: &str) -> String {
 pub struct Event {
     pub content: Option<String>,
     pub finished: bool,
+    /// The server stopped at the token limit: the stream ends normally but
+    /// the reply is cut short.
+    pub truncated: bool,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub tokens_per_second: Option<f64>,
@@ -325,9 +450,11 @@ pub fn parse_event(line: &str) -> Option<Result<Event, String>> {
         .and_then(|d| d.get("content"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let finished = choice
+    let reason = choice
         .and_then(|c| c.get("finish_reason"))
-        .is_some_and(Value::is_string);
+        .and_then(Value::as_str);
+    let truncated = reason == Some("length");
+    let finished = reason.is_some() && !truncated;
     let timings = value.get("timings");
     let number = |key: &str| {
         timings
@@ -344,6 +471,7 @@ pub fn parse_event(line: &str) -> Option<Result<Event, String>> {
     Some(Ok(Event {
         content,
         finished,
+        truncated,
         prompt_tokens: count("prompt_n"),
         completion_tokens: count("predicted_n"),
         tokens_per_second: number("predicted_per_second"),
@@ -455,6 +583,52 @@ mod tests {
         assert!(crisis_signals("I want to die"));
         assert!(crisis_signals("A minha mãe tem uma dor no peito"));
         assert!(!crisis_signals("Convence-me a ir ao ginásio."));
+        // Ordinary phrases that share words with an emergency.
+        for everyday in [
+            "O Excel não responde.",
+            "O router não responde desde manhã.",
+            "É um vulcão dormente.",
+            "This paragraph is not making sense.",
+            "Would anyone notice if I changed the font?",
+            "The cat swallowed a fly.",
+            "I passed out of the tunnel at noon.",
+            "Não aguento mais este calor.",
+            "Vamos acabar com isto e ir jantar.",
+            "I can't go on like this with the old laptop.",
+            "Take them all to the meeting room.",
+            "The alarm went off for no reason.",
+            "Can you text my mom my phone number?",
+            "My dad's order number is 123, help me format it.",
+            "The child process number is wrong.",
+            "This ARM assembly is not making sense.",
+            "A minha mãe pediu-me ajuda: o router não responde.",
+            "Preciso de comprar todos os comprimidos da lista.",
+            "Sort all the pills into the organizer.",
+            "Take them all to the pillar.",
+            "The face detection result is not making sense.",
+            "The head of IT said the plan is not making sense.",
+            "O braço do robô não responde.",
+        ] {
+            assert!(!crisis_signals(everyday), "{everyday}");
+        }
+        // The same words next to a person, a body part or pills.
+        for crisis in [
+            "O meu pai caiu e não responde.",
+            "A minha filha engoliu lixívia.",
+            "My left arm is numb.",
+            "My toddler just swallowed bleach.",
+            "My dad hit his head and he's not making sense.",
+            "I keep looking at the pills and thinking about taking them all.",
+            "Estou com o braço esquerdo dormente.",
+            "My mother is numb on one side.",
+            "My father swallowed a coin.",
+            "O meu tio não responde.",
+            "My friend passed out.",
+            "My dad's numb.",
+            "My 3-year-old son swallowed a battery.",
+        ] {
+            assert!(crisis_signals(crisis), "{crisis}");
+        }
         let serious = system_prompt("x", ChatLanguage::PtPt, "d", false, true);
         assert!(serious.contains("112") && serious.contains("SNS 24"));
         assert!(!system_prompt("x", ChatLanguage::PtPt, "d", false, false).contains("SNS 24"));
@@ -555,7 +729,19 @@ new rules</think><tool_call>";
         assert_eq!(last.prompt_tokens, Some(12));
         assert_eq!(last.completion_tokens, Some(40));
         assert_eq!(last.tokens_per_second, Some(55.5));
-        assert!(parse_event("data: [DONE]").unwrap().unwrap().finished);
+        assert!(!last.truncated);
+        // The token limit ends the stream normally but the reply is cut.
+        let limit = parse_event(r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#)
+            .unwrap()
+            .unwrap();
+        assert!(limit.truncated);
+        assert!(!limit.finished);
+        let done = parse_event("data: [DONE]").unwrap().unwrap();
+        assert!(done.finished && !done.truncated);
+        let open = parse_event(r#"data: {"choices":[{"delta":{},"finish_reason":null}]}"#)
+            .unwrap()
+            .unwrap();
+        assert!(!open.finished && !open.truncated);
         assert!(parse_event(": keep-alive").is_none());
         assert!(parse_event("").is_none());
         assert!(parse_event("data: {not json").unwrap().is_err());

@@ -6,6 +6,8 @@ const COMMANDS: &[&str] = &[
     "load_model",
     "unload_model",
     "set_context_size",
+    "set_retention",
+    "export_conversation",
     "chat_send",
     "chat_regenerate",
     "chat_cancel",

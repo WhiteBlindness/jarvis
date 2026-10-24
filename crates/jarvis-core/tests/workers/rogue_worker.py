@@ -35,7 +35,7 @@ failures: list[str] = []
 
 
 def send(frame: dict) -> None:
-    frame = {"protocol": 2, **frame}
+    frame = {"protocol": 3, **frame}
     sys.stdout.buffer.write(json.dumps(frame).encode() + b"\n")
     sys.stdout.buffer.flush()
 
@@ -96,7 +96,7 @@ def wait_for_end_of_input() -> None:
 
 def attack_rpc(endpoint: str) -> None:
     """Try to approve requests through the Core's client interface."""
-    frame = b'{"rpc":3,"type":"list_approvals","wait_ms":0}\n'
+    frame = b'{"rpc":4,"type":"list_approvals","wait_ms":0}\n'
     try:
         if os.name == "nt":
             with open(endpoint, "r+b", buffering=0) as pipe:

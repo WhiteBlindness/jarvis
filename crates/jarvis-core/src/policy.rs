@@ -93,8 +93,8 @@ pub(crate) mod tests {
     /// One call of every tool, in the order of `ToolCall::NAMES`' sources.
     pub(crate) fn one_of_each() -> Vec<ToolCall> {
         use jarvis_protocol::{
-            AgentLabel, CaptureWindowArgs, ClipboardText, HealthcheckArgs, ReadClipboardTextArgs,
-            TypeTextArgs, TypedText, WindowTarget, WriteClipboardTextArgs,
+            AgentLabel, CaptureWindowArgs, Fingerprint, HealthcheckArgs, PayloadId,
+            ReadClipboardTextArgs, TypeTextArgs, TypedText, WindowTarget, WriteClipboardTextArgs,
         };
         vec![
             ToolCall::SystemInfo(SystemInfoArgs {}),
@@ -113,7 +113,8 @@ pub(crate) mod tests {
             }),
             ToolCall::ReadClipboardText(ReadClipboardTextArgs {}),
             ToolCall::WriteClipboardText(WriteClipboardTextArgs {
-                text: ClipboardText::try_from("hello".to_owned()).unwrap(),
+                payload_id: PayloadId::new(),
+                sha256: Fingerprint::from_digest(&[7; 32]),
             }),
             ToolCall::TypeText(TypeTextArgs {
                 target: WindowTarget(7),

@@ -259,6 +259,26 @@ pub fn process_exists(pid: u32) -> bool {
     platform::process_exists(pid)
 }
 
+/// A process another one outlives only as long as it should: the Core
+/// watches the desktop app that started it and stops when the app has gone.
+/// On Windows this holds a handle to the process, so a later process that
+/// reuses the ID is never mistaken for it.
+#[derive(Debug)]
+pub struct WatchedProcess {
+    inner: platform::Watched,
+}
+
+impl WatchedProcess {
+    /// Start watching `pid`; fails if no such process can be opened.
+    pub fn new(pid: u32) -> io::Result<Self> {
+        platform::watch_process(pid).map(|inner| Self { inner })
+    }
+
+    pub fn has_exited(&self) -> bool {
+        self.inner.has_exited()
+    }
+}
+
 /// What [`spawn`] would use on this machine, for `isolation status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -318,7 +338,10 @@ pub enum PipeClient {
 /// Read the token of the client connected to a named pipe server handle, by
 /// impersonating the client for the duration of the call. Fails when the
 /// token cannot be read, for example when the client connected at anonymous
-/// impersonation level, so the caller can fail closed.
+/// impersonation level, so the caller can fail closed. Fails with
+/// [`io::ErrorKind::WouldBlock`] when the client opened the pipe without
+/// security flags and has not sent anything yet; the caller may wait for
+/// its first bytes and ask again.
 #[cfg(windows)]
 pub fn inspect_pipe_client(pipe: std::os::windows::io::RawHandle) -> io::Result<PipeClient> {
     windows::inspect_pipe_client(pipe)

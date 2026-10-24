@@ -1,0 +1,4 @@
+{
+  "frame": "{\"rpc\":4,\"type\":\"submit_clipboard_job\",\"text\":\"x\",\"goal\":\"copy \\\"x\\\"\"}",
+  "error": "malformed_frame"
+}

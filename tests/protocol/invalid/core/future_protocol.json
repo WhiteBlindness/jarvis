@@ -1,4 +1,4 @@
 {
-  "frame": "{\"protocol\":3,\"type\":\"welcome\"}",
+  "frame": "{\"protocol\":4,\"type\":\"welcome\"}",
   "error": "unsupported_protocol_version"
 }

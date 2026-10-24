@@ -72,6 +72,12 @@ export interface InferenceView {
   last_error: string | null;
   load_ms: number | null;
   last_stats: TurnStats | null;
+  /** Conversations older than this many days are deleted; 0 keeps them. */
+  retention_days: number;
+  /** Speed measured by a short warm-up after each load (tenths of tokens per second). */
+  warmup_tokens_per_second_x10: number | null;
+  /** A GPU model measured below the configured floor. */
+  slow: boolean;
 }
 
 export interface GovernorView {

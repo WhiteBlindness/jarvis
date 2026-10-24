@@ -65,7 +65,7 @@ __all__ = [
     "validate_uuid",
 ]
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 TOOL_SYSTEM_INFO = "system.info"
 TOOL_READ_FIXTURE = "filesystem.read_fixture"

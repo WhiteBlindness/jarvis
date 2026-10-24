@@ -33,12 +33,12 @@ pub use capability::{ActionClass, Capability, UnknownCapability};
 pub use chat::{
     CONTEXT_SIZES, ChatDelta, ChatLanguage, ChatRole, ChatText, ChatTurn, ClipboardProposal,
     ConversationSummary, ConversationView, InferenceState, InferenceView, MessageStatus,
-    MessageView, ModelProfile, SearchQuery, TurnStats,
+    MessageView, ModelProfile, RETENTION_DAYS, SearchQuery, TurnStats,
 };
 pub use error::{ErrorCode, WireError};
 pub use ids::{
-    ApprovalId, ConversationId, Fingerprint, InvalidId, JobId, MessageId, RequestId, SessionId,
-    TaskId, ToolName,
+    ApprovalId, ConversationId, Fingerprint, InvalidId, JobId, MessageId, PayloadId, RequestId,
+    SessionId, TaskId, ToolName,
 };
 pub use message::{
     CoreMessage, DecodeError, ErrorMessage, Hello, JobAssignment, JobOutcome, JobResult, Label,
@@ -65,7 +65,7 @@ pub use tools::{
 pub struct ProtocolVersion(pub u32);
 
 impl ProtocolVersion {
-    pub const CURRENT: Self = Self(2);
+    pub const CURRENT: Self = Self(3);
 }
 
 impl std::fmt::Display for ProtocolVersion {

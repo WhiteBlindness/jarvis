@@ -1,5 +1,5 @@
 {
-  "rpc": 3,
+  "rpc": 4,
   "type": "list_approvals",
   "wait_ms": 30000
 }

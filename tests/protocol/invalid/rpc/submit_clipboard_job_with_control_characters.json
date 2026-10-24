@@ -1,0 +1,4 @@
+{
+  "frame": "{\"rpc\":4,\"type\":\"submit_clipboard_job\",\"text\":\"x\u001b[2J\"}",
+  "error": "malformed_frame"
+}
